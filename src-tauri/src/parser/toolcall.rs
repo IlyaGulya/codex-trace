@@ -406,9 +406,54 @@ impl ToolCallBuilder {
         });
     }
 
+    /// Backfill patch_success and patch_changes onto an already-finalized PatchApply call.
+    /// Used for Codex v0.129.0+ where file changes arrive via an apply_patch_end turn item
+    /// (PR #20540) after custom_tool_call_output has already finalized the call. Also used
+    /// when patch_apply_end event arrives late in sessions where both event and turn-item
+    /// paths coexist (PR #20463 made ApplyPatchEnd explicitly stored in limited history mode).
+    pub fn backfill_patch_result(
+        &mut self,
+        call_id: &str,
+        success: Option<bool>,
+        changes: Option<Value>,
+    ) {
+        if let Some(tc) = self
+            .finalized
+            .iter_mut()
+            .find(|tc| tc.call_id == call_id && tc.kind == ToolKind::PatchApply)
+        {
+            if success.is_some() {
+                tc.patch_success = success;
+            }
+            if changes.is_some() {
+                tc.patch_changes = changes;
+            }
+        }
+    }
+
     /// Finalize with patch_apply_end event.
     pub fn finalize_patch(&mut self, event_type: &str, payload: &Value) {
         let call_id = str_field(payload, "call_id");
+
+        let patch_success = payload.get("success").and_then(|v| v.as_bool());
+        let patch_changes = payload.get("changes").cloned();
+        let stdout = payload
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Codex v0.129.0 (PR #20463) now explicitly stores ApplyPatchEnd in limited history
+        // mode, so a patch_apply_end event_msg may arrive for a call that was already
+        // finalized by custom_tool_call_output. Backfill rather than create a duplicate.
+        if self
+            .finalized
+            .iter()
+            .any(|tc| tc.call_id == call_id && tc.kind == ToolKind::PatchApply)
+        {
+            self.backfill_patch_result(&call_id, patch_success, patch_changes);
+            return;
+        }
+
         let pending = self
             .pending
             .remove(&call_id)
@@ -418,13 +463,6 @@ impl ToolCallBuilder {
                 input_text: None,
                 namespace: None,
             });
-
-        let patch_success = payload.get("success").and_then(|v| v.as_bool());
-        let patch_changes = payload.get("changes").cloned();
-        let stdout = payload
-            .get("stdout")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
 
         self.finalized.push(ToolCall {
             call_id,

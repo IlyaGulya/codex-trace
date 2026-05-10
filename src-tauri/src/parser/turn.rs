@@ -631,6 +631,16 @@ fn handle_response_item(
             builder.finalize_custom_tool_output(&call_id, &output, exit_code);
         }
 
+        // Codex v0.129.0 (PR #20540): apply_patch file changes moved from the
+        // patch_apply_end event_msg into this turn item. Backfill the result onto the
+        // PatchApply call that custom_tool_call_output already finalized.
+        "apply_patch_end" => {
+            let call_id = str_field(payload, "call_id");
+            let success = payload.get("success").and_then(|v| v.as_bool());
+            let changes = payload.get("changes").cloned();
+            builder.backfill_patch_result(&call_id, success, changes);
+        }
+
         _ => {}
     }
 }
@@ -1128,5 +1138,94 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert!(turns[0].tool_calls.is_empty());
+    }
+
+    // Codex v0.129.0 (PR #20540): apply_patch file changes moved from patch_apply_end
+    // event into an apply_patch_end response_item (turn item). The PatchApply call is
+    // finalized by custom_tool_call_output (exit_code, output) and the file changes are
+    // backfilled by the subsequent apply_patch_end turn item.
+    #[test]
+    fn apply_patch_end_turn_item_backfills_file_changes_onto_finalized_call() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"v0129","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/main.rs\n..."}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch","output":"{\"output\":\"Applied patch successfully\",\"metadata\":{\"exit_code\":0}}"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"response_item","payload":{"type":"apply_patch_end","call_id":"call_patch","success":true,"changes":[{"path":"src/main.rs","type":"modified"}]}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746614405.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::PatchApply);
+        assert_eq!(tc.name, "apply_patch");
+        assert_eq!(tc.status, "completed");
+        assert_eq!(tc.patch_success, Some(true));
+        let changes = tc
+            .patch_changes
+            .as_ref()
+            .expect("patch_changes should be set");
+        assert!(changes.is_array());
+        assert_eq!(changes.as_array().unwrap().len(), 1);
+        assert_eq!(changes[0]["path"], "src/main.rs");
+        assert_eq!(changes[0]["type"], "modified");
+    }
+
+    // Codex v0.129.0 (PR #20463): ApplyPatchEnd is now explicitly stored in limited
+    // history mode, so a patch_apply_end event_msg may coexist with custom_tool_call_output
+    // in the same session. Verify we get exactly one PatchApply entry (no duplicate) and
+    // that patch_changes are backfilled from the event rather than lost.
+    #[test]
+    fn patch_apply_end_event_after_custom_tool_call_output_does_not_create_duplicate() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"v0129b","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n..."}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch","output":"{\"output\":\"Patch applied\",\"metadata\":{\"exit_code\":0}}"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch","success":true,"changes":[{"path":"lib.rs","type":"modified"}],"status":"completed"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746614405.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        // Must have exactly one tool call — no duplicate from the event.
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::PatchApply);
+        assert_eq!(tc.patch_success, Some(true));
+        let changes = tc
+            .patch_changes
+            .as_ref()
+            .expect("patch_changes backfilled from event");
+        assert_eq!(changes[0]["path"], "lib.rs");
+    }
+
+    // Old-format sessions (pre-v0.129.0): custom_tool_call + patch_apply_end event with no
+    // custom_tool_call_output. The event still finalizes the call normally.
+    #[test]
+    fn patch_apply_end_event_finalizes_pending_call_in_old_format() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-01-01T10:00:00Z","type":"session_meta","payload":{"id":"old-fmt","timestamp":"2026-01-01T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-01-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-01-01T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_old","name":"apply_patch","input":"*** Begin Patch\n..."}}"#,
+            r#"{"timestamp":"2026-01-01T10:00:03Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_old","success":true,"changes":[{"path":"old.rs","type":"created"}],"stdout":"Applied 1 hunk","status":"completed"}}"#,
+            r#"{"timestamp":"2026-01-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1735725604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::PatchApply);
+        assert_eq!(tc.name, "apply_patch");
+        assert_eq!(tc.patch_success, Some(true));
+        assert_eq!(tc.output.as_deref(), Some("Applied 1 hunk"));
+        let changes = tc.patch_changes.as_ref().expect("patch_changes from event");
+        assert_eq!(changes[0]["path"], "old.rs");
     }
 }
