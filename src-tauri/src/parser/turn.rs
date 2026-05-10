@@ -576,7 +576,20 @@ fn handle_response_item(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            builder.add_function_call(call_id, name, arguments_str, namespace);
+            // v0.130.0+ (PR #21454): string-keyed MCP tool maps removed; function_call
+            // entries now carry tool_id: { server, tool } instead of a flat namespace string.
+            // Store the server directly to avoid parse_mcp_namespace misinterpreting it.
+            let mcp_server_direct = if namespace.is_none() {
+                payload
+                    .get("tool_id")
+                    .and_then(|tid| tid.get("server"))
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+            builder.add_function_call(call_id, name, arguments_str, namespace, mcp_server_direct);
         }
 
         "function_call_output" => {
@@ -1273,5 +1286,75 @@ mod tests {
             turns[2].has_compaction,
             "turn-3 has_compaction set from compacted entry"
         );
+    }
+
+    // Codex v0.130.0 (PR #21454): string-keyed MCP tool maps removed.
+    // function_call entries for MCP tools now carry tool_id: { server, tool }
+    // instead of a flat namespace string. Verify the tool is still classified as McpTool.
+    #[test]
+    fn function_call_with_tool_id_classified_as_mcp_tool() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"s-v130","timestamp":"2026-05-08T10:00:00Z","cli_version":"0.130.0"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"mcp-tc1","name":"get_pr_info","tool_id":{"server":"github","tool":"get_pr_info"},"arguments":"{\"pr_number\":42}"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"mcp-tc1","output":"PR #42: Fix the bug"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.call_id, "mcp-tc1");
+        assert_eq!(tool.name, "get_pr_info");
+        assert_eq!(tool.mcp_server.as_deref(), Some("github"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("get_pr_info"));
+        assert_eq!(tool.output.as_deref(), Some("PR #42: Fix the bug"));
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn function_call_with_tool_id_multi_segment_server() {
+        // tool_id.server may contain __ separators (e.g. "codex_apps__slack")
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"s-v130b","timestamp":"2026-05-08T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"mcp-tc2","name":"post_message","tool_id":{"server":"codex_apps__slack","tool":"post_message"},"arguments":"{\"channel\":\"general\",\"text\":\"hello\"}"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"mcp-tc2","output":"ok"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("codex_apps__slack"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("post_message"));
+    }
+
+    #[test]
+    fn function_call_namespace_still_works_without_tool_id() {
+        // Pre-v0.130.0 sessions with namespace field must continue to work unchanged.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"s-pre130","timestamp":"2026-05-08T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"mcp-old1","name":"_get_pr_info","namespace":"mcp__codex_apps__github","arguments":"{\"pr_number\":7}"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"mcp-old1","output":"PR #7"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("codex_apps__github"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("github_get_pr_info"));
+        assert_eq!(tool.output.as_deref(), Some("PR #7"));
     }
 }

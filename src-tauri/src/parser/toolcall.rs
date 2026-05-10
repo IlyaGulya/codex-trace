@@ -49,6 +49,8 @@ pub struct PendingCall {
     pub input_text: Option<String>,
     /// Raw namespace from the function_call payload (e.g. "mcp__codex_apps__github").
     pub namespace: Option<String>,
+    /// v0.130.0+: direct MCP server name from tool_id.server (bypasses namespace parsing).
+    pub mcp_server: Option<String>,
 }
 
 /// Builder that collects function_call / custom_tool_call entries and finalizes
@@ -77,6 +79,7 @@ impl ToolCallBuilder {
         name: String,
         arguments_str: &str,
         namespace: Option<String>,
+        mcp_server_direct: Option<String>,
     ) {
         let arguments = serde_json::from_str(arguments_str).unwrap_or(Value::Null);
         self.pending.insert(
@@ -86,6 +89,7 @@ impl ToolCallBuilder {
                 arguments,
                 input_text: None,
                 namespace,
+                mcp_server: mcp_server_direct,
             },
         );
     }
@@ -99,6 +103,7 @@ impl ToolCallBuilder {
                 arguments: Value::Object(serde_json::Map::new()),
                 input_text: input,
                 namespace: None,
+                mcp_server: None,
             },
         );
     }
@@ -225,14 +230,23 @@ impl ToolCallBuilder {
                 return;
             }
 
-            let (kind, mcp_server, mcp_tool) = match &pending.namespace {
-                Some(ns) if ns.starts_with("mcp__") => {
-                    let (server, tool) = parse_mcp_namespace(ns, &pending.name);
-                    (ToolKind::McpTool, server, tool)
+            // v0.130.0+: direct mcp_server from tool_id takes precedence over namespace parsing.
+            let (kind, mcp_server, mcp_tool) = if let Some(ref server) = pending.mcp_server {
+                (
+                    ToolKind::McpTool,
+                    Some(server.clone()),
+                    Some(pending.name.clone()),
+                )
+            } else {
+                match &pending.namespace {
+                    Some(ns) if ns.starts_with("mcp__") => {
+                        let (server, tool) = parse_mcp_namespace(ns, &pending.name);
+                        (ToolKind::McpTool, server, tool)
+                    }
+                    _ if pending.name == "wait_agent" => (ToolKind::WaitAgent, None, None),
+                    _ if pending.name == "close_agent" => (ToolKind::CloseAgent, None, None),
+                    _ => (ToolKind::Unknown, None, None),
                 }
-                _ if pending.name == "wait_agent" => (ToolKind::WaitAgent, None, None),
-                _ if pending.name == "close_agent" => (ToolKind::CloseAgent, None, None),
-                _ => (ToolKind::Unknown, None, None),
             };
             self.finalized.push(ToolCall {
                 call_id: call_id.to_string(),
@@ -299,6 +313,7 @@ impl ToolCallBuilder {
                 arguments: Value::Null,
                 input_text: None,
                 namespace: None,
+                mcp_server: None,
             });
 
         let command: Option<Vec<String>> = payload
@@ -359,6 +374,7 @@ impl ToolCallBuilder {
                 arguments: Value::Null,
                 input_text: None,
                 namespace: None,
+                mcp_server: None,
             });
 
         // Extract server + tool from invocation field, then namespace, then name.
@@ -462,6 +478,7 @@ impl ToolCallBuilder {
                 arguments: Value::Null,
                 input_text: None,
                 namespace: None,
+                mcp_server: None,
             });
 
         self.finalized.push(ToolCall {
@@ -619,6 +636,7 @@ impl ToolCallBuilder {
                 arguments: Value::Null,
                 input_text: None,
                 namespace: None,
+                mcp_server: None,
             });
         let output = ["output", "aggregated_output", "stdout"]
             .iter()
