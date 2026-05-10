@@ -1228,4 +1228,50 @@ mod tests {
         let changes = tc.patch_changes.as_ref().expect("patch_changes from event");
         assert_eq!(changes[0]["path"], "old.rs");
     }
+
+    // Codex v0.129.0 (PRs #20502/#20682): persist_extended_history disabled; app-server
+    // always returns a limited history window. codex-trace reads JSONL session files from
+    // disk — it never fetches history from the app-server — so all turns recorded in the
+    // rollout file are available regardless of the server-side history window. When Codex
+    // compacts context in response to the limited window it writes a `compacted` entry,
+    // which codex-trace detects via has_compaction. No turns are silently dropped.
+    #[test]
+    fn v0129_persist_extended_history_disabled_all_turns_captured_compaction_flagged() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"long-session","timestamp":"2026-05-07T10:00:00Z","cli_version":"0.129.0"}}"#,
+            // Turn 1
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746597610.0}}"#,
+            // Turn 2
+            r#"{"timestamp":"2026-05-07T10:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-05-07T10:01:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1746597670.0}}"#,
+            // Turn 3 — Codex hits the limited history window and compacts context mid-turn.
+            // The compacted entry records that history was summarised; all three turns are
+            // still fully present in the JSONL file and captured by codex-trace.
+            r#"{"timestamp":"2026-05-07T10:02:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}"#,
+            r#"{"timestamp":"2026-05-07T10:02:01Z","type":"compacted","payload":{"summary":"Summarised previous turns due to history window limit"}}"#,
+            r#"{"timestamp":"2026-05-07T10:02:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3","completed_at":1746597730.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        // All three turns must be present — no silent truncation even though
+        // the app-server only returned a limited history window to Codex CLI.
+        assert_eq!(
+            turns.len(),
+            3,
+            "all turns captured despite app-server history limit"
+        );
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[1].status, TurnStatus::Complete);
+        assert_eq!(turns[2].status, TurnStatus::Complete);
+
+        // Compaction is correctly attributed to turn-3 (where the compacted entry appeared).
+        assert!(!turns[0].has_compaction);
+        assert!(!turns[1].has_compaction);
+        assert!(
+            turns[2].has_compaction,
+            "turn-3 has_compaction set from compacted entry"
+        );
+    }
 }
