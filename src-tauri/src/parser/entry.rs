@@ -298,4 +298,32 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.128.0");
     }
+
+    #[test]
+    fn codex_v0_130_0_startup_banner_change_does_not_affect_session_parsing() {
+        // Codex v0.130.0 (PR #21683) removed "research preview" from the `codex exec`
+        // startup banner. Session JSONL files at ~/.codex/sessions/ contain structured
+        // data, not banner text — so this UI change has no effect on parsing. Verify
+        // that all standard entry types from a v0.130.0 session parse correctly.
+        let lines = [
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"v0130-session","timestamp":"2026-05-08T10:00:00Z","cwd":"/tmp","cli_version":"0.130.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746700804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.130.0");
+    }
 }

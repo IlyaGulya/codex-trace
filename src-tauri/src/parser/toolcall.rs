@@ -962,7 +962,7 @@ fn extract_mcp_output(payload: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mcp_namespace;
+    use super::{parse_exec_function_output, parse_mcp_namespace};
 
     #[test]
     fn namespace_with_tool_prefix_keeps_full_namespace_as_server() {
@@ -996,5 +996,32 @@ mod tests {
         let (server, tool) = parse_mcp_namespace("other__ns__tool", "fn_name");
         assert_eq!(server, None);
         assert_eq!(tool, None);
+    }
+
+    #[test]
+    fn exec_output_parsing_unaffected_by_codex_v0_130_0_banner_change() {
+        // Codex v0.130.0 (PR #21683) removed "research preview" from the `codex exec`
+        // startup banner. codex-trace must not pattern-match on banner wording — only
+        // stable structural markers (Output:, exit code, wall time, session id) are used.
+        let old_banner = "Codex - a coding agent (research preview)\nOutput:\nhello\nExit code: 0\nWall time: 0.5s\n";
+        let new_banner = "Codex - a coding agent\nOutput:\nhello\nExit code: 0\nWall time: 0.5s\n";
+
+        let old = parse_exec_function_output(old_banner);
+        let new = parse_exec_function_output(new_banner);
+
+        assert_eq!(
+            old.status, new.status,
+            "status differs between banner formats"
+        );
+        assert_eq!(old.exit_code, new.exit_code);
+        assert_eq!(old.duration_secs, new.duration_secs);
+        let old_out = old.output.unwrap_or_default();
+        let new_out = new.output.unwrap_or_default();
+        assert!(old_out.contains("hello"), "old banner output missing hello");
+        assert!(new_out.contains("hello"), "new banner output missing hello");
+        assert!(
+            !old_out.contains("research preview"),
+            "banner text leaked into output"
+        );
     }
 }
