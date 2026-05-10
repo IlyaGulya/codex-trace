@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::entry::RawEntry;
+use super::entry::{extract_session_id, RawEntry};
 use super::toolcall::ToolKind;
 use super::turn::{build_turns, CodexTurn, TokenInfo, TurnStatus};
 
@@ -224,11 +224,14 @@ fn session_file_id(path: &Path) -> Option<String> {
         let line = line.ok()?;
         let entry = RawEntry::parse(&line)?;
         match entry.entry_type.as_str() {
-            "session_meta" => entry
-                .payload
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(|id| id.to_string()),
+            "session_meta" => {
+                let id = extract_session_id(&entry.payload);
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id)
+                }
+            }
             "session_meta_root" => entry
                 .raw
                 .get("id")
@@ -240,7 +243,7 @@ fn session_file_id(path: &Path) -> Option<String> {
 }
 
 fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Value) {
-    session.id = str_field(payload, "id");
+    session.id = extract_session_id(payload);
     session.timestamp = str_field(payload, "timestamp");
     session.cwd = opt_str(payload, "cwd");
     session.originator = opt_str(payload, "originator");
@@ -316,6 +319,48 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn parse_session_reads_id_from_session_id_field() {
+        // v0.129.0+ PR #20437: session_id field in session_meta payload
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-07T00-00-00-newsessid.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"session_id":"new-sess-id","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576002.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "new-sess-id");
+    }
+
+    #[test]
+    fn parse_session_reads_id_from_thread_session_id() {
+        // v0.129.0+ PR #21336: sessionId moved onto Thread object
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-07T00-01-00-threadsessid.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:01:00Z","type":"session_meta","payload":{"thread":{"sessionId":"thread-sess-id"},"timestamp":"2026-05-07T00:01:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-05-07T00:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-07T00:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576062.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "thread-sess-id");
+    }
 
     #[test]
     fn default_sessions_dir_exists() {

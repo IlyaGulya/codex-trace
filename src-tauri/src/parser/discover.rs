@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
-use super::entry::RawEntry;
+use super::entry::{extract_session_id, RawEntry};
 use super::spawn::parse_spawn_agent_output;
 
 /// Lightweight session info for the picker list.
@@ -141,7 +141,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         ai_title,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
-            let id = str_field(payload, "id");
+            let id = extract_session_id(payload);
             let start_time = str_field(payload, "timestamp");
             let cwd = opt_str(payload, "cwd");
             let originator = opt_str(payload, "originator");
@@ -465,6 +465,50 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn discover_sessions_reads_id_from_session_id_field() {
+        // v0.129.0+ PR #20437: session_id field in session_meta payload
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-07T00-00-00-newsessid.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"session_id":"new-sess-id","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576002.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions.iter().find(|s| s.id == "new-sess-id").unwrap();
+        assert_eq!(session.id, "new-sess-id");
+    }
+
+    #[test]
+    fn discover_sessions_reads_id_from_thread_session_id() {
+        // v0.129.0+ PR #21336: sessionId moved onto Thread object
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-07T00-01-00-threadsessid.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:01:00Z","type":"session_meta","payload":{"thread":{"sessionId":"thread-sess-id"},"timestamp":"2026-05-07T00:01:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-05-07T00:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-07T00:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576062.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions.iter().find(|s| s.id == "thread-sess-id").unwrap();
+        assert_eq!(session.id, "thread-sess-id");
+    }
 
     #[test]
     fn date_group_from_path_test() {

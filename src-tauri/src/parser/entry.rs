@@ -74,6 +74,34 @@ pub fn event_msg_type(payload: &Value) -> Option<&str> {
     payload.get("type").and_then(|t| t.as_str())
 }
 
+/// Extract the session ID from a session_meta payload.
+///
+/// Tries paths in version order for forward compatibility:
+/// 1. `id` — all pre-v0.129.0 sessions
+/// 2. `session_id` — v0.129.0+ (PR #20437)
+/// 3. `thread.sessionId` — v0.129.0+ v2 API path (PR #21336)
+pub fn extract_session_id(payload: &Value) -> String {
+    payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            payload
+                .get("thread")
+                .and_then(|t| t.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
 /// Parse an ISO timestamp string to Unix seconds (u64).
 pub fn parse_timestamp_secs(ts: &str) -> Option<u64> {
     use chrono::DateTime;
@@ -84,6 +112,45 @@ pub fn parse_timestamp_secs(ts: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_session_id_reads_id_field() {
+        let v: Value =
+            serde_json::from_str(r#"{"id":"abc-123","timestamp":"2026-05-07T00:00:00Z"}"#).unwrap();
+        assert_eq!(extract_session_id(&v), "abc-123");
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_session_id_field() {
+        // v0.129.0+ PR #20437: session_id field added alongside or instead of id
+        let v: Value =
+            serde_json::from_str(r#"{"session_id":"sess-456","timestamp":"2026-05-07T00:00:00Z"}"#)
+                .unwrap();
+        assert_eq!(extract_session_id(&v), "sess-456");
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_thread_session_id() {
+        // v0.129.0+ PR #21336: sessionId moved onto Thread object in v2 API
+        let v: Value = serde_json::from_str(
+            r#"{"thread":{"sessionId":"thread-789"},"timestamp":"2026-05-07T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_session_id(&v), "thread-789");
+    }
+
+    #[test]
+    fn extract_session_id_prefers_id_over_session_id() {
+        let v: Value =
+            serde_json::from_str(r#"{"id":"primary","session_id":"secondary"}"#).unwrap();
+        assert_eq!(extract_session_id(&v), "primary");
+    }
+
+    #[test]
+    fn extract_session_id_returns_empty_when_absent() {
+        let v: Value = serde_json::from_str(r#"{"timestamp":"2026-05-07T00:00:00Z"}"#).unwrap();
+        assert_eq!(extract_session_id(&v), "");
+    }
 
     #[test]
     fn parse_new_session_meta() {
