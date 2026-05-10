@@ -654,6 +654,52 @@ fn handle_response_item(
             builder.backfill_patch_result(&call_id, success, changes);
         }
 
+        // Codex v0.129.0 (PR #20677): MCP tool calls are now emitted as first-class
+        // response_item turn entries with dedicated types instead of reusing function_call
+        // with an mcp__ namespace. Wire them into the existing ToolCallBuilder paths so
+        // they are classified correctly as McpTool rather than silently discarded.
+        "mcp_tool_call" => {
+            let call_id = str_field(payload, "call_id");
+            let server = payload.get("server").and_then(|v| v.as_str()).unwrap_or("");
+            let tool = payload.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            // Use the tool name directly; namespace carries the server for McpTool classification.
+            let name = if !tool.is_empty() {
+                tool.to_string()
+            } else {
+                str_field(payload, "name")
+            };
+            let namespace = if !server.is_empty() {
+                Some(format!("mcp__{server}"))
+            } else {
+                payload
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+            // arguments may be a JSON object (not a string) in the new format.
+            let arguments_str = match payload.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
+                None => "{}".to_string(),
+            };
+            builder.add_function_call(call_id, name, &arguments_str, namespace, None);
+        }
+
+        "mcp_tool_call_output" => {
+            let call_id = str_field(payload, "call_id");
+            // output may be a content array [{"type":"text","text":"..."}] or a plain string.
+            let output = match payload.get("output") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            };
+            builder.add_function_call_output(&call_id, &output);
+        }
+
         _ => {}
     }
 }
@@ -1112,6 +1158,89 @@ mod tests {
         assert_eq!(turns[1].turn_id, "turn-2");
         assert_eq!(turns[2].turn_id, "turn-3");
         assert!(turns.iter().all(|t| t.status == TurnStatus::Complete));
+    }
+
+    // Codex v0.129.0 (PR #20677): mcp_tool_call + mcp_tool_call_output are now emitted
+    // as first-class response_item turn entries. Verify they are classified as McpTool.
+    #[test]
+    fn mcp_tool_call_turn_items_classified_as_mcp_tool() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"s-mcp","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"get_pr_info","arguments":{"pr_number":42}}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":[{"type":"text","text":"PR #42: Fix the bug"}]}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746612004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.call_id, "mcp-1");
+        assert_eq!(tool.name, "get_pr_info");
+        assert_eq!(tool.mcp_server.as_deref(), Some("github"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("get_pr_info"));
+        assert_eq!(tool.output.as_deref(), Some("PR #42: Fix the bug"));
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn mcp_tool_call_turn_items_with_string_output() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"s-mcp2","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-2","server":"jira","tool":"create_issue","arguments":{"summary":"Fix login"}}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-2","output":"Issue created: PROJ-123"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746612004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.name, "create_issue");
+        assert_eq!(tool.mcp_server.as_deref(), Some("jira"));
+        assert_eq!(tool.output.as_deref(), Some("Issue created: PROJ-123"));
+    }
+
+    #[test]
+    fn mcp_tool_call_turn_items_with_stringified_arguments() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"s-mcp3","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-3","server":"slack","tool":"post_message","arguments":"{\"channel\":\"general\",\"text\":\"hello\"}"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-3","output":"ok"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746612004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("slack"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("post_message"));
+    }
+
+    #[test]
+    fn unknown_response_item_types_are_silently_skipped() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"s-ri","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"future_unknown_item_type_v999","call_id":"x","data":"whatever"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746612003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 0);
     }
 
     #[test]
