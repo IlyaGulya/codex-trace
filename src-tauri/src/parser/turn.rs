@@ -1066,4 +1066,28 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, TurnStatus::Complete);
     }
+
+    // Codex v0.129.0 (PR #20471) removed `item/fileChange` and `outputDelta` notification
+    // events from the app-server event stream. codex-trace is unaffected because it reads
+    // JSONL session files from disk — it never connects to the Codex app-server. Even if
+    // these types appeared as event_msg entries in older JSONL files, they would be silently
+    // dropped by the wildcard arm, and file-change data is already read from patch_apply_end
+    // events via patch_changes. This test guards against regressions that would re-introduce
+    // a dependency on these removed notification types.
+    #[test]
+    fn v0129_removed_item_file_change_and_output_delta_events_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0129","timestamp":"2026-05-07T10:00:00Z","cli_version":"0.129.0"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"event_msg","payload":{"type":"item/fileChange","path":"/tmp/foo.txt","action":"modified"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"event_msg","payload":{"type":"outputDelta","delta":"partial output text"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746604804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
 }
