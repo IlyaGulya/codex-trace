@@ -270,6 +270,19 @@ mod tests {
         assert_eq!(e.entry_type, "response_item");
     }
 
+    // Codex v0.130.0 (PR #21683): "research preview" text removed from startup banner.
+    // codex-trace reads version from session_meta.payload.cli_version — not from any
+    // banner text output by `codex exec`. This test confirms v0.130.0 sessions parse
+    // correctly and that version detection is unaffected by the banner wording change.
+    #[test]
+    fn v0130_startup_banner_research_preview_removal_does_not_affect_version_detection() {
+        let line = r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"v0130-session","timestamp":"2026-05-08T10:00:00Z","cwd":"/tmp","cli_version":"0.130.0","model_provider":"openai"}}"#;
+        let e = RawEntry::parse(line).unwrap();
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["cli_version"], "0.130.0");
+        assert_eq!(e.payload["id"], "v0130-session");
+    }
+
     #[test]
     fn log_db_log_writer_refactor_does_not_affect_jsonl_session_parser() {
         // Codex v0.128.0 PRs #19234/#19959 refactored the internal log DB into a
