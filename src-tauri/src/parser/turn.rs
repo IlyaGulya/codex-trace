@@ -1052,6 +1052,45 @@ mod tests {
         assert_eq!(turns[0].status, TurnStatus::Cancelled);
     }
 
+    // Codex v0.130.0 (PR #21566): multi-page thread completeness.
+    // The thread turns endpoint now paginates large threads and writes "unloaded"
+    // stub entries as placeholders between pages.  build_turns must ignore all
+    // non-full stubs so every real turn is present in the parsed output.
+    #[test]
+    fn multi_page_thread_all_turns_present_stubs_ignored() {
+        let entries = entries(&[
+            // session header
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"long-session","timestamp":"2026-05-08T10:00:00Z"}}"#,
+            // page 1 — turn 1 (full entries, no view_mode = legacy compat)
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","turn_start_timestamp":1746691201.0}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746691202.0}}"#,
+            // unloaded stub that would appear between pages (view_mode:unloaded) — must be skipped
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"event_msg","view_mode":"unloaded","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            // summary stub — also must be skipped
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","view_mode":"summary","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            // page 2 — turn 2 (full view_mode explicit)
+            r#"{"timestamp":"2026-05-08T10:00:05Z","type":"event_msg","view_mode":"full","payload":{"type":"task_started","turn_id":"turn-2","turn_start_timestamp":1746691205.0}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:06Z","type":"event_msg","view_mode":"full","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1746691206.0}}"#,
+            // page 3 — turn 3 (legacy, no view_mode)
+            r#"{"timestamp":"2026-05-08T10:00:07Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3","turn_start_timestamp":1746691207.0}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3","completed_at":1746691208.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        // All three real turns must be present; stubs must not create phantom turns
+        assert_eq!(
+            turns.len(),
+            3,
+            "expected exactly 3 complete turns, got {}",
+            turns.len()
+        );
+        assert_eq!(turns[0].turn_id, "turn-1");
+        assert_eq!(turns[1].turn_id, "turn-2");
+        assert_eq!(turns[2].turn_id, "turn-3");
+        assert!(turns.iter().all(|t| t.status == TurnStatus::Complete));
+    }
+
     #[test]
     fn unknown_event_types_are_ignored_gracefully() {
         let entries = entries(&[

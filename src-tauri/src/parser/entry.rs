@@ -20,6 +20,18 @@ impl RawEntry {
             return None;
         }
 
+        // Skip non-full view mode entries (Codex v0.130.0+, PR #21566).
+        // The thread turns endpoint now exposes three view modes: "unloaded"
+        // (metadata-only stub), "summary" (partial), and "full" (complete).
+        // Only absent (legacy) or "full" entries carry complete turn data;
+        // any other view_mode is a placeholder and must be skipped so callers
+        // never receive silently truncated turn content.
+        if let Some(vm) = v.get("view_mode").and_then(|t| t.as_str()) {
+            if vm != "full" {
+                return None;
+            }
+        }
+
         let entry_type = detect_entry_type(&v);
         let timestamp = v
             .get("timestamp")
@@ -157,6 +169,38 @@ mod tests {
         let e = RawEntry::parse(line).unwrap();
         assert_eq!(e.entry_type, "session_meta");
         assert_eq!(e.payload["permission_profile"], "full-auto");
+    }
+
+    // Codex v0.130.0 (PR #21566): thread turns endpoint now exposes three view
+    // modes. "unloaded" and "summary" entries are placeholders / partial stubs;
+    // only absent (legacy) or "full" entries contain complete turn data.
+
+    #[test]
+    fn view_mode_unloaded_returns_none() {
+        let line = r#"{"timestamp":"2026-05-08T10:00:00Z","type":"response_item","view_mode":"unloaded","payload":{"type":"function_call","name":"exec_command","call_id":"c1"}}"#;
+        assert!(RawEntry::parse(line).is_none());
+    }
+
+    #[test]
+    fn view_mode_summary_returns_none() {
+        let line = r#"{"timestamp":"2026-05-08T10:00:00Z","type":"response_item","view_mode":"summary","payload":{"type":"message","role":"assistant","content":"partial"}}"#;
+        assert!(RawEntry::parse(line).is_none());
+    }
+
+    #[test]
+    fn view_mode_full_is_parsed_normally() {
+        let line = r#"{"timestamp":"2026-05-08T10:00:00Z","type":"response_item","view_mode":"full","payload":{"type":"function_call","name":"exec_command","call_id":"c2"}}"#;
+        let e = RawEntry::parse(line).expect("view_mode:full must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["name"], "exec_command");
+    }
+
+    #[test]
+    fn absent_view_mode_is_parsed_normally() {
+        // Legacy entries (pre-v0.130.0) have no view_mode field; they must still parse.
+        let line = r#"{"timestamp":"2026-05-08T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"hello"}}"#;
+        let e = RawEntry::parse(line).expect("legacy entry without view_mode must parse");
+        assert_eq!(e.entry_type, "response_item");
     }
 
     #[test]
