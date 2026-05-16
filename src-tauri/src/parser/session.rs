@@ -34,6 +34,9 @@ pub struct CodexSession {
     pub spawned_worker_ids: Vec<String>,
     pub path: String,
     pub ai_title: Option<String>,
+    /// true when the session was started via `codex remote-control` (Codex v0.130.0+, PR #21424).
+    /// Detected from originator == "remote-control" or source == "remote-control" in session_meta.
+    pub is_headless: bool,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -77,6 +80,7 @@ fn parse_session_inner(
         spawned_worker_ids: Vec::new(),
         path: path.to_string_lossy().to_string(),
         ai_title: None,
+        is_headless: false,
     };
 
     // Parse session_meta from first matching entry
@@ -255,6 +259,18 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // Codex v0.130.0 (PR #21424): `codex remote-control` starts headless app-server sessions.
+    // Detected from originator == "remote-control" or source == "remote-control".
+    session.is_headless = payload
+        .get("originator")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "remote-control")
+        .unwrap_or(false)
+        || payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "remote-control")
+            .unwrap_or(false);
 
     if let Some(git) = payload.get("git") {
         session.git = Some(GitInfo {
@@ -536,6 +552,74 @@ mod tests {
         let session = parse_session(&path).unwrap();
         // session_end overrides the ongoing turn — session must not appear live
         assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.130.0 (PR #21424): `codex remote-control` starts headless app-server sessions.
+
+    #[test]
+    fn parse_session_detects_headless_via_originator() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-08T10-00-00-headless.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"headless-session","timestamp":"2026-05-08T10:00:00Z","originator":"remote-control","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-08T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert!(
+            session.is_headless,
+            "originator:remote-control must set is_headless"
+        );
+        assert_eq!(session.id, "headless-session");
+        assert_eq!(session.turns.len(), 1);
+    }
+
+    #[test]
+    fn parse_session_detects_headless_via_source_string() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-08T10-01-00-headless2.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-08T10:01:00Z","type":"session_meta","payload":{"id":"headless-session-2","timestamp":"2026-05-08T10:01:00Z","source":"remote-control","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-05-08T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-08T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698462.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert!(
+            session.is_headless,
+            "source:remote-control must set is_headless"
+        );
+    }
+
+    #[test]
+    fn parse_session_regular_exec_session_is_not_headless() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-08T10-02-00-exec.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-08T10:02:00Z","type":"session_meta","payload":{"id":"exec-session","timestamp":"2026-05-08T10:02:00Z","source":"exec","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-05-08T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-08T10:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698522.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert!(!session.is_headless, "exec session must not be headless");
     }
 
     #[test]

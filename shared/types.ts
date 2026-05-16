@@ -100,6 +100,8 @@ export interface CodexSession {
   spawned_worker_ids: string[];
   ai_title: string | null;
   path: string;
+  /** true when the session was started via `codex remote-control` (Codex v0.130.0+) */
+  is_headless: boolean;
 }
 
 export interface CodexSessionInfo {
@@ -125,6 +127,8 @@ export interface CodexSessionInfo {
   spawned_worker_ids: string[];
   date_group: string;
   ai_title: string | null;
+  /** true when the session was started via `codex remote-control` (Codex v0.130.0+) */
+  is_headless: boolean;
 }
 
 export interface SettingsResponse {

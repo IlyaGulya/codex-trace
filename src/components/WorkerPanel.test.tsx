@@ -75,6 +75,7 @@ function makeSession(toolCalls: CodexToolCall[]): CodexSession {
     spawned_worker_ids: [],
     path: "/tmp/worker.jsonl",
     ai_title: null,
+    is_headless: false,
   };
 }
 

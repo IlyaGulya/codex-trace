@@ -34,6 +34,9 @@ pub struct CodexSessionInfo {
     pub date_group: String,
     /// Optional AI-generated title from external agent sessions (Codex v0.128.0+)
     pub ai_title: Option<String>,
+    /// true when the session was started via `codex remote-control` (Codex v0.130.0+, PR #21424).
+    /// Detected from originator == "remote-control" or source == "remote-control" in session_meta.
+    pub is_headless: bool,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -136,6 +139,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         git_branch,
         _instructions,
         is_external_worker,
+        is_headless,
         worker_nickname,
         worker_role,
         ai_title,
@@ -157,6 +161,18 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .get("source")
                 .and_then(|s| s.get("subagent"))
                 .is_some();
+            // Codex v0.130.0 (PR #21424): `codex remote-control` starts headless app-server
+            // sessions. The originator or source field is set to "remote-control" for these.
+            let is_headless = payload
+                .get("originator")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "remote-control")
+                .unwrap_or(false)
+                || payload
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "remote-control")
+                    .unwrap_or(false);
             let (worker_nickname, worker_role) = worker_metadata(payload);
             let ai_title = payload
                 .get("ai-title")
@@ -172,6 +188,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 git_branch,
                 instructions,
                 is_external_worker,
+                is_headless,
                 worker_nickname,
                 worker_role,
                 ai_title,
@@ -186,7 +203,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             (
-                id, start_time, None, None, None, git_branch, None, false, None, None, None,
+                id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
             )
         }
         _ => return None,
@@ -405,6 +422,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         is_ongoing,
         is_external_worker,
         is_inline_worker: false, // set by discover_sessions second pass
+        is_headless,
         worker_nickname,
         worker_role,
         spawned_worker_ids,
@@ -723,6 +741,109 @@ mod tests {
             .find(|s| s.id == "endmarker-session")
             .unwrap();
         assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.130.0 (PR #21424): `codex remote-control` starts headless app-server sessions.
+    // Sessions initiated this way carry originator == "remote-control" in session_meta.
+
+    #[test]
+    fn discover_sessions_detects_remote_control_via_originator() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/08");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-08T10-00-00-headless.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"headless-session","timestamp":"2026-05-08T10:00:00Z","originator":"remote-control","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-08T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "headless-session")
+            .unwrap();
+        assert!(
+            session.is_headless,
+            "originator:remote-control must set is_headless"
+        );
+        assert!(!session.is_external_worker);
+    }
+
+    #[test]
+    fn discover_sessions_detects_remote_control_via_source_string() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/08");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-08T10-01-00-headless2.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-08T10:01:00Z","type":"session_meta","payload":{"id":"headless-session-2","timestamp":"2026-05-08T10:01:00Z","source":"remote-control","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-05-08T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-08T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698462.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "headless-session-2")
+            .unwrap();
+        assert!(
+            session.is_headless,
+            "source:remote-control must set is_headless"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_regular_session_is_not_headless() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/08");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-08T10-02-00-regular.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-08T10:02:00Z","type":"session_meta","payload":{"id":"regular-session","timestamp":"2026-05-08T10:02:00Z","source":"exec","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-05-08T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-08T10:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698522.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions.iter().find(|s| s.id == "regular-session").unwrap();
+        assert!(!session.is_headless, "exec session must not be headless");
+    }
+
+    #[test]
+    fn discover_sessions_subagent_source_is_not_headless() {
+        // source.subagent (object) must not be confused with source == "remote-control" (string).
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/08");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-08T10-03-00-subagent.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-08T10:03:00Z","type":"session_meta","payload":{"id":"subagent-session","timestamp":"2026-05-08T10:03:00Z","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}}}}"#,
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "subagent-session")
+            .unwrap();
+        assert!(!session.is_headless, "subagent source must not be headless");
+        assert!(
+            session.is_external_worker,
+            "subagent source must be external_worker"
+        );
     }
 
     #[test]
