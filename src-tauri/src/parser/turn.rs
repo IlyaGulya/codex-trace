@@ -1465,6 +1465,31 @@ mod tests {
         assert_eq!(tool.mcp_tool.as_deref(), Some("post_message"));
     }
 
+    // Codex v0.129.0 (PR #21170): experimental `list_dir` tool removed.
+    // Sessions captured before v0.129.0 may contain `list_dir` function_call entries.
+    // These must parse correctly as Unknown tool calls — not crash, not be silently dropped.
+    // Do not add assertions that `list_dir` must exist in new sessions.
+    #[test]
+    fn list_dir_tool_from_pre_v0129_session_parsed_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2025-01-01T10:00:00Z","type":"session_meta","payload":{"id":"old-sess","timestamp":"2025-01-01T10:00:00Z"}}"#,
+            r#"{"timestamp":"2025-01-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2025-01-01T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"list_dir","arguments":"{\"path\":\"/workspace\"}","call_id":"call_list"}}"#,
+            r#"{"timestamp":"2025-01-01T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_list","output":"file1.txt\nfile2.txt\n"}}"#,
+            r#"{"timestamp":"2025-01-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1735725604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.name, "list_dir");
+        assert_eq!(tool.kind, ToolKind::Unknown);
+        assert_eq!(tool.output.as_deref(), Some("file1.txt\nfile2.txt\n"));
+        assert_eq!(tool.status, "completed");
+    }
+
     #[test]
     fn function_call_namespace_still_works_without_tool_id() {
         // Pre-v0.130.0 sessions with namespace field must continue to work unchanged.
