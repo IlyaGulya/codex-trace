@@ -1486,4 +1486,34 @@ mod tests {
         assert_eq!(tool.mcp_tool.as_deref(), Some("github_get_pr_info"));
         assert_eq!(tool.output.as_deref(), Some("PR #7"));
     }
+
+    // Codex v0.129.0 (PR #21034): /approvals retired; /autoreview renamed to /approve.
+    // codex-trace stores user_message verbatim — no pattern matching on command names —
+    // so the legacy /autoreview and the new /approve are captured identically, and
+    // /approvals entries from older sessions parse without errors or special treatment.
+    #[test]
+    fn slash_command_rename_autoreview_to_approve_stored_verbatim() {
+        let make_entries = |cmd: &str| -> Vec<RawEntry> {
+            let user_msg_line = format!(
+                r#"{{"timestamp":"2026-05-07T10:00:02Z","type":"event_msg","payload":{{"type":"user_message","message":"{cmd}"}}}}"#
+            );
+            entries(&[
+                r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"s-cmd","timestamp":"2026-05-07T10:00:00Z","cli_version":"0.129.0"}}"#,
+                r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                &user_msg_line,
+                r#"{"timestamp":"2026-05-07T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746604803.0}}"#,
+            ])
+        };
+
+        for cmd in &["/autoreview", "/approve", "/approvals"] {
+            let turns = build_turns(&make_entries(cmd));
+            assert_eq!(turns.len(), 1, "expected 1 turn for command {cmd}");
+            assert_eq!(
+                turns[0].user_message.as_deref(),
+                Some(*cmd),
+                "user_message must equal the raw command string for {cmd}"
+            );
+            assert_eq!(turns[0].status, TurnStatus::Complete);
+        }
+    }
 }
