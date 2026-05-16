@@ -339,4 +339,21 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.130.0");
     }
+
+    // Codex v0.130.0 (PR #21356): built-in MCPs promoted to first-class runtime servers.
+    // After this change a session_meta may include extra MCP server metadata fields
+    // (e.g. an mcp_servers list with is_builtin flags). The parser must not panic on
+    // these extra fields — they are simply ignored by the loosely-typed RawEntry model.
+    #[test]
+    fn v0130_session_meta_with_builtin_mcp_server_metadata_does_not_panic() {
+        // session_meta carrying an mcp_servers list that includes built-in entries.
+        // This extra field is irrelevant to codex-trace's parsing but must not crash it.
+        let line = r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"v0130-mcp-meta","timestamp":"2026-05-08T10:00:00Z","cwd":"/tmp","cli_version":"0.130.0","mcp_servers":[{"name":"computer_use","is_builtin":true,"status":"connected"},{"name":"github","is_builtin":false,"status":"connected"}]}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with mcp_servers must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0130-mcp-meta");
+        assert_eq!(e.payload["cli_version"], "0.130.0");
+        // The mcp_servers field is accessible via the payload but not required for parsing.
+        assert!(e.payload.get("mcp_servers").is_some());
+    }
 }

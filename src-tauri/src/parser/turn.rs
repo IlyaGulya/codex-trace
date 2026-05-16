@@ -1541,4 +1541,100 @@ mod tests {
             assert_eq!(turns[0].status, TurnStatus::Complete);
         }
     }
+
+    // Codex v0.130.0 (PR #21356): built-in MCPs promoted to first-class runtime servers.
+    // After this change built-in servers (e.g. computer_use) appear in session logs with
+    // the same event structure and tool_id fields as user-configured MCP servers.
+    // codex-trace must parse them identically — no origin-based filtering or exclusion.
+
+    #[test]
+    fn builtin_mcp_via_tool_id_classified_as_mcp_tool() {
+        // Built-in server "computer_use" arriving via v0.130.0 tool_id format.
+        // It must be treated identically to a user-configured server.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"s-builtin-v130","timestamp":"2026-05-08T10:00:00Z","cli_version":"0.130.0"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"builtin-1","name":"screenshot","tool_id":{"server":"computer_use","tool":"screenshot"},"arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"builtin-1","output":"screenshot taken"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.call_id, "builtin-1");
+        assert_eq!(tool.name, "screenshot");
+        assert_eq!(tool.mcp_server.as_deref(), Some("computer_use"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("screenshot"));
+        assert_eq!(tool.output.as_deref(), Some("screenshot taken"));
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn builtin_mcp_via_mcp_tool_call_response_item_classified_correctly() {
+        // Built-in server "computer_use" arriving via v0.129.0+ mcp_tool_call response_item.
+        // PR #21356 promotes built-in MCPs so they emit the same mcp_tool_call entries
+        // as user-configured servers. The parser must not exclude them.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"s-builtin-mcp","timestamp":"2026-05-08T10:00:00Z","cli_version":"0.130.0"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"builtin-mcp-1","server":"computer_use","tool":"click","arguments":{"x":100,"y":200}}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"builtin-mcp-1","output":[{"type":"text","text":"clicked at (100,200)"}]}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.call_id, "builtin-mcp-1");
+        assert_eq!(tool.name, "click");
+        assert_eq!(tool.mcp_server.as_deref(), Some("computer_use"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("click"));
+        assert_eq!(tool.output.as_deref(), Some("clicked at (100,200)"));
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn builtin_mcp_and_user_mcp_in_same_session_both_classified() {
+        // A session with both a built-in server (computer_use) and a user-configured server
+        // (github) in the same turn. Both must be classified as McpTool with correct server names.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-08T10:00:00Z","type":"session_meta","payload":{"id":"s-mixed-mcp","timestamp":"2026-05-08T10:00:00Z","cli_version":"0.130.0"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"builtin-c1","name":"screenshot","tool_id":{"server":"computer_use","tool":"screenshot"},"arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"builtin-c1","output":"screenshot.png"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"user-c1","name":"get_pr_info","tool_id":{"server":"github","tool":"get_pr_info"},"arguments":"{\"pr_number\":1}"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"user-c1","output":"PR #1 info"}}"#,
+            r#"{"timestamp":"2026-05-08T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746698406.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 2);
+
+        let builtin_tool = turns[0]
+            .tool_calls
+            .iter()
+            .find(|t| t.call_id == "builtin-c1")
+            .expect("built-in tool call missing");
+        assert_eq!(builtin_tool.kind, ToolKind::McpTool);
+        assert_eq!(builtin_tool.mcp_server.as_deref(), Some("computer_use"));
+        assert_eq!(builtin_tool.mcp_tool.as_deref(), Some("screenshot"));
+
+        let user_tool = turns[0]
+            .tool_calls
+            .iter()
+            .find(|t| t.call_id == "user-c1")
+            .expect("user-configured tool call missing");
+        assert_eq!(user_tool.kind, ToolKind::McpTool);
+        assert_eq!(user_tool.mcp_server.as_deref(), Some("github"));
+        assert_eq!(user_tool.mcp_tool.as_deref(), Some("get_pr_info"));
+    }
 }
