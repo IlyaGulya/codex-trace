@@ -994,6 +994,64 @@ mod tests {
         assert_eq!(tool.status, "completed");
     }
 
+    // Codex v0.132.0 (PR #22706): the legacy shell output formatting paths were removed.
+    // function_call_output for exec_command now contains the raw command output only —
+    // no "Chunk ID:", "Wall time:", "Process exited with code N", "Output:" markers.
+    // The parser must preserve the full raw output and not attempt marker-based extraction.
+    #[test]
+    fn function_call_output_v0132_plain_text_no_legacy_markers() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-session","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello world\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            // v0.132.0: raw output only — no "Chunk ID", "Wall time", "Process exited", "Output:" markers
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec","output":"hello world\n"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.name, "exec_command");
+        // Raw output must be preserved in full — no marker stripping
+        assert_eq!(tool.output.as_deref(), Some("hello world\n"));
+        // No exit code extractable from plain text — None is correct
+        assert_eq!(tool.exit_code, None);
+        assert_eq!(tool.status, "completed");
+    }
+
+    // Codex v0.132.0 (PR #22706): exec_command_end events no longer include formatted_output.
+    // When both function_call_output (plain text, no markers) and exec_command_end (with
+    // aggregated_output) are present, the exec_command_end structured fields take precedence.
+    #[test]
+    fn exec_command_end_v0132_structured_output_and_exit_code() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-end-session","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls /nonexistent\",\"workdir\":\"/tmp\"}","call_id":"call_ls"}}"#,
+            // v0.132.0: exec_command_end carries aggregated_output + structured exit_code + duration
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_ls","aggregated_output":"ls: /nonexistent: No such file or directory\n","exit_code":1,"status":"failed","duration":{"secs":0,"nanos":5000000}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("ls: /nonexistent: No such file or directory\n")
+        );
+        assert_eq!(tool.exit_code, Some(1));
+        assert_eq!(tool.status, "failed");
+        assert!(tool.duration_secs.is_some());
+    }
+
     #[test]
     fn links_spawn_agent_from_collab_spawn_end_event() {
         let entries = entries(&[
