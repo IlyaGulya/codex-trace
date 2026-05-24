@@ -463,7 +463,13 @@ fn handle_event_msg(
                 // Record collab spawn metadata
                 if let Some(turn) = turns.get_mut(tid) {
                     let call_id = str_field(payload, "call_id");
-                    let new_thread_id = str_field(payload, "new_thread_id");
+                    // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
+                    let new_thread_id = payload
+                        .get("new_thread_id")
+                        .or_else(|| payload.get("new_session_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let agent_nickname = str_field(payload, "new_agent_nickname");
                     let agent_role = str_field(payload, "new_agent_role");
                     let model = payload
@@ -1636,5 +1642,28 @@ mod tests {
         assert_eq!(user_tool.kind, ToolKind::McpTool);
         assert_eq!(user_tool.mcp_server.as_deref(), Some("github"));
         assert_eq!(user_tool.mcp_tool.as_deref(), Some("get_pr_info"));
+    }
+
+    // Codex v0.131.0 (PR #22268): collab_agent_spawn_end event payload field renamed
+    // new_thread_id → new_session_id. Verify the parser reads new_session_id as a fallback.
+    #[test]
+    fn links_spawn_agent_from_collab_spawn_end_with_new_session_id() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"parent-sess","timestamp":"2026-05-18T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Do work\"}","call_id":"call_spawn_v131"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:03Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"call_spawn_v131","sender_session_id":"parent-sess","new_session_id":"worker-sess-v131","new_agent_nickname":"Turing","new_agent_role":"worker","prompt":"Do work","status":"pending_init"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn_v131","output":"{\"agent_id\":\"worker-sess-v131\",\"nickname\":\"Turing\"}"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562405.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].collab_spawns.len(), 1);
+        assert_eq!(turns[0].collab_spawns[0].new_thread_id, "worker-sess-v131");
+        assert_eq!(turns[0].collab_spawns[0].agent_nickname, "Turing");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].kind, ToolKind::SpawnAgent);
     }
 }
