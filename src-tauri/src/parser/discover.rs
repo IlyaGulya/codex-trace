@@ -870,4 +870,70 @@ mod tests {
 
         assert_eq!(session.total_tokens, Some(1800));
     }
+
+    // Codex v0.131.0 (PRs #22594, #22647, #22724): profile-v2 layered config format.
+    //
+    // codex-trace reads only JSONL session files — never Codex TOML config files. The
+    // profile-v2 changes affect what appears in session_meta: a `profile` field may name
+    // the active profile; `instructions_file` is gone from config so instructions arrive
+    // via `base_instructions.text` or are absent entirely. The discover scanner must handle
+    // both cases without panicking.
+
+    #[test]
+    fn discover_sessions_v0131_profile_v2_session_discovered_correctly() {
+        // session_meta with profile-v2 `profile` field: discover scanner must not panic
+        // and must populate cli_version correctly from the payload.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-18T10-00-00-profilev2.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"v0131-disc-profile","timestamp":"2026-05-18T10:00:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai","profile":"work","base_instructions":{"text":"You are helpful."}}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0131-disc-profile")
+            .unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn discover_sessions_v0131_no_instructions_discovered_correctly() {
+        // sessions from v0.131.0 without instructions (instructions_file removed) must be
+        // discovered and indexed normally — the absent field has no effect on discovery.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-18T10-01-00-noinstr.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:01:00Z","type":"session_meta","payload":{"id":"v0131-disc-noinstr","timestamp":"2026-05-18T10:01:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562462.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0131-disc-noinstr")
+            .unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
+    }
 }

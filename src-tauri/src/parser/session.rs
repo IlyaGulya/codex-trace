@@ -644,4 +644,97 @@ mod tests {
         assert_eq!(session.turns.len(), 1);
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.131.0 (PRs #22594, #22647, #22724): profile-v2 layered config format.
+    //
+    // codex-trace reads JSONL session files, not Codex CLI TOML config files. The profile-v2
+    // changes alter what Codex writes into session_meta: a `profile` field may appear naming
+    // the active profile, and instructions now come via `base_instructions.text` from the
+    // profile's system_prompt (the `instructions_file` config key is gone from Codex config).
+    // All cases below must parse without panics and produce correct field values.
+
+    #[test]
+    fn v0131_profile_v2_session_parses_correctly() {
+        // session_meta from v0.131.0 with --profile-v2 active: carries `profile` field and
+        // instructions sourced from the profile's system_prompt via base_instructions.text.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-18T10-00-00-profilev2.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"v0131-profile-v2","timestamp":"2026-05-18T10:00:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0131-profile-v2");
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        // Instructions arrive from base_instructions.text (profile system_prompt).
+        assert_eq!(
+            session.instructions.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0131_session_without_instructions_file_parses_correctly() {
+        // v0.131.0 removed `instructions_file` from the Codex config (PR #22724). Sessions
+        // started without a profile providing instructions will have no `instructions` or
+        // `base_instructions` in session_meta. The parser must return None, not panic.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-18T10-01-00-noinstr.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:01:00Z","type":"session_meta","payload":{"id":"v0131-no-instructions","timestamp":"2026-05-18T10:01:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562462.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0131-no-instructions");
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        // instructions_file is gone — no instructions in this session.
+        assert!(session.instructions.is_none());
+        assert_eq!(session.turns.len(), 1);
+    }
+
+    #[test]
+    fn v0131_legacy_profiles_section_absent_does_not_affect_session_parsing() {
+        // PR #22647: Codex now rejects legacy [profiles] TOML when profile-v2 is active.
+        // codex-trace reads only JSONL session files — it never touches Codex TOML config.
+        // This test confirms standard v0.131.0 session files parse correctly regardless of
+        // which config format the CLI was configured with.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-18T10-02-00-v0131.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:02:00Z","type":"session_meta","payload":{"id":"v0131-standard","timestamp":"2026-05-18T10:02:00Z","cwd":"/workspace","cli_version":"0.131.0","model_provider":"openai","profile":"default"}}"#,
+                r#"{"timestamp":"2026-05-18T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+                r#"{"timestamp":"2026-05-18T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/workspace"}}"#,
+                r#"{"timestamp":"2026-05-18T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562524.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0131-standard");
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
 }
