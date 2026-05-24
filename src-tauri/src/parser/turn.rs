@@ -700,6 +700,55 @@ fn handle_response_item(
             builder.add_function_call_output(&call_id, &output);
         }
 
+        // Codex < v0.133.0 (PR #23075 removed UserTurn): user input was emitted as a
+        // response_item with type "user_turn" rather than a "user_message" event_msg.
+        // Migrate by extracting the message text and storing it on the current turn.
+        "user_turn" => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.user_message.is_none() {
+                    let text = extract_content_text(payload);
+                    if !text.is_empty() {
+                        turn.user_message = Some(text);
+                    }
+                }
+            }
+        }
+
+        // Codex < v0.133.0 (PR #23081 removed UserInputWithTurnContext): combined entry
+        // bundling user input and turn context into one response_item. Apply both: extract
+        // the user message from the "input" sub-field and update context fields from "context".
+        "user_input_with_turn_context" => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.user_message.is_none() {
+                    let input = payload.get("input").unwrap_or(payload);
+                    let text = extract_content_text(input);
+                    if !text.is_empty() {
+                        turn.user_message = Some(text);
+                    }
+                }
+                if let Some(ctx) = payload.get("context") {
+                    if turn.model.is_none() {
+                        turn.model = ctx
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    if turn.cwd.is_none() {
+                        turn.cwd = ctx
+                            .get("cwd")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    if turn.reasoning_effort.is_none() {
+                        turn.reasoning_effort = ctx
+                            .get("effort")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -736,6 +785,26 @@ fn handle_turn_context(
             }
         }
     }
+}
+
+/// Extract plain text from a content value that may be a bare string, an array of
+/// content blocks (OpenAI format: `[{"type":"text","text":"..."}]`), or an object
+/// with a nested "content" field. Used to migrate pre-v0.133.0 UserTurn entries.
+fn extract_content_text(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = v.as_array() {
+        return arr
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    if let Some(content) = v.get("content") {
+        return extract_content_text(content);
+    }
+    String::new()
 }
 
 fn u64_field(v: &Value, key: &str) -> u64 {
@@ -1636,5 +1705,133 @@ mod tests {
         assert_eq!(user_tool.kind, ToolKind::McpTool);
         assert_eq!(user_tool.mcp_server.as_deref(), Some("github"));
         assert_eq!(user_tool.mcp_tool.as_deref(), Some("get_pr_info"));
+    }
+
+    // Codex v0.133.0 compat: PR #23075 removed the UserTurn response_item variant.
+    // Pre-v0.133.0 transcripts contain response_items with type "user_turn"; codex-trace
+    // must extract the user message so the turn is not left with no user_message.
+
+    #[test]
+    fn user_turn_response_item_string_content_is_migrated() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-ut1","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"user_turn","content":"Hello from old Codex"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Hello from old Codex")
+        );
+    }
+
+    #[test]
+    fn user_turn_response_item_content_array_is_migrated() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-ut2","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"user_turn","content":[{"type":"text","text":"Multi-block "},{"type":"text","text":"user input"}]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Multi-block user input")
+        );
+    }
+
+    #[test]
+    fn user_turn_does_not_overwrite_existing_user_message() {
+        // If a user_message event_msg already set the message, user_turn must not overwrite it.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-ut3","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Primary message"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"user_turn","content":"Should be ignored"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734004.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Primary message"));
+    }
+
+    // Codex v0.133.0 compat: PR #23081 removed UserInputWithTurnContext.
+    // Pre-v0.133.0 transcripts may contain response_items with type
+    // "user_input_with_turn_context" bundling user text and context metadata.
+
+    #[test]
+    fn user_input_with_turn_context_extracts_message_and_context() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-uitc1","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"user_input_with_turn_context","input":{"content":"Fix the bug"},"context":{"cwd":"/project","model":"gpt-5","effort":"high"}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Fix the bug"));
+        assert_eq!(turns[0].cwd.as_deref(), Some("/project"));
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn user_input_with_turn_context_input_as_plain_string() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-uitc2","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"user_input_with_turn_context","input":"Plain string input","context":{"cwd":"/home/user"}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Plain string input"));
+        assert_eq!(turns[0].cwd.as_deref(), Some("/home/user"));
+    }
+
+    // Codex v0.133.0 compat: PR #22709 trimmed unused TurnContextItem fields.
+    // Pre-v0.133.0 transcripts have extra fields in turn_context payloads; new transcripts
+    // have fewer. The parser must handle both without panicking or losing data.
+
+    #[test]
+    fn turn_context_with_extra_legacy_fields_does_not_panic() {
+        // Old transcripts may include fields that were trimmed in v0.133.0.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-tc","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp","effort":"medium","legacy_field_a":"ignored","legacy_field_b":42,"context_window":128000}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(turns[0].cwd.as_deref(), Some("/tmp"));
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn turn_context_with_missing_trimmed_fields_does_not_panic() {
+        // New transcripts (v0.133.0+) may omit fields that older transcripts had.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"s-tc2","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+        assert!(turns[0].cwd.is_none());
+        assert!(turns[0].reasoning_effort.is_none());
     }
 }
