@@ -55,6 +55,8 @@ export interface CodexToolCall {
   duration_secs: number | null;
   mcp_server: string | null;
   mcp_tool: string | null;
+  /** Codex v0.133.0+: identifies which plugin the MCP tool belongs to. Null for pre-v0.133.0 sessions. */
+  plugin_id: string | null;
   patch_success: boolean | null;
   patch_changes: Record<string, { type: string; content?: string; unified_diff?: string }> | null;
   web_query: string | null;

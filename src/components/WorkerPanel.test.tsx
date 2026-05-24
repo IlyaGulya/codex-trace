@@ -20,6 +20,7 @@ function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
     duration_secs: 0.5,
     mcp_server: null,
     mcp_tool: null,
+    plugin_id: null,
     patch_success: null,
     patch_changes: null,
     web_query: null,

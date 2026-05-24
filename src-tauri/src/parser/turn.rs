@@ -579,9 +579,10 @@ fn handle_response_item(
             // v0.130.0+ (PR #21454): string-keyed MCP tool maps removed; function_call
             // entries now carry tool_id: { server, tool } instead of a flat namespace string.
             // Store the server directly to avoid parse_mcp_namespace misinterpreting it.
+            // v0.133.0+ (PRs #23353, #23737): tool_id also carries plugin_id.
+            let tool_id = payload.get("tool_id");
             let mcp_server_direct = if namespace.is_none() {
-                payload
-                    .get("tool_id")
+                tool_id
                     .and_then(|tid| tid.get("server"))
                     .and_then(|s| s.as_str())
                     .filter(|s| !s.is_empty())
@@ -589,7 +590,19 @@ fn handle_response_item(
             } else {
                 None
             };
-            builder.add_function_call(call_id, name, arguments_str, namespace, mcp_server_direct);
+            let plugin_id = tool_id
+                .and_then(|tid| tid.get("plugin_id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            builder.add_function_call(
+                call_id,
+                name,
+                arguments_str,
+                namespace,
+                mcp_server_direct,
+                plugin_id,
+            );
         }
 
         "function_call_output" => {
@@ -682,7 +695,14 @@ fn handle_response_item(
                 Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
                 None => "{}".to_string(),
             };
-            builder.add_function_call(call_id, name, &arguments_str, namespace, None);
+            // v0.133.0+ (PRs #23353, #23737): plugin_id field identifies which plugin
+            // the MCP tool belongs to. Absent for older sessions.
+            let plugin_id = payload
+                .get("plugin_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            builder.add_function_call(call_id, name, &arguments_str, namespace, None, plugin_id);
         }
 
         "mcp_tool_call_output" => {
@@ -1636,5 +1656,66 @@ mod tests {
         assert_eq!(user_tool.kind, ToolKind::McpTool);
         assert_eq!(user_tool.mcp_server.as_deref(), Some("github"));
         assert_eq!(user_tool.mcp_tool.as_deref(), Some("get_pr_info"));
+    }
+
+    // Codex v0.133.0 (PRs #23353, #23737): plugin_id added to MCP tool call items.
+
+    #[test]
+    fn mcp_tool_call_with_plugin_id_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-pid1","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-pid1","server":"github","tool":"get_pr_info","plugin_id":"plugin-abc","arguments":{"pr_number":1}}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-pid1","output":"PR info"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747821604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("github"));
+        assert_eq!(tool.plugin_id.as_deref(), Some("plugin-abc"));
+    }
+
+    #[test]
+    fn function_call_with_tool_id_plugin_id_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-pid2","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"get_pr_info","call_id":"fc-pid1","arguments":"{}","tool_id":{"server":"github","tool":"get_pr_info","plugin_id":"plugin-xyz"}}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"fc-pid1","output":"result"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747821604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("github"));
+        assert_eq!(tool.plugin_id.as_deref(), Some("plugin-xyz"));
+    }
+
+    #[test]
+    fn mcp_tool_call_without_plugin_id_has_none() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-07T10:00:00Z","type":"session_meta","payload":{"id":"s-nopid","timestamp":"2026-05-07T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-nopid","server":"slack","tool":"list_channels","arguments":{}}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-nopid","output":"[]"}}"#,
+            r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747821604.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert!(
+            tool.plugin_id.is_none(),
+            "pre-v0.133.0 MCP call must have no plugin_id"
+        );
     }
 }
