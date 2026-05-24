@@ -533,6 +533,12 @@ fn handle_event_msg(
             }
         }
 
+        // Codex v0.133.0 (PRs #23300, #23685, #23696, #23732): Goals feature enabled by
+        // default. Goal lifecycle events are emitted as event_msg turn items in the session
+        // stream. codex-trace does not model goal state — these events are intentionally
+        // skipped so they don't corrupt turn data.
+        "goal_created" | "goal_updated" | "goal_completed" | "goal_paused" => {}
+
         _ => {}
     }
 }
@@ -1636,5 +1642,69 @@ mod tests {
         assert_eq!(user_tool.kind, ToolKind::McpTool);
         assert_eq!(user_tool.mcp_server.as_deref(), Some("github"));
         assert_eq!(user_tool.mcp_tool.as_deref(), Some("get_pr_info"));
+    }
+
+    // Codex v0.133.0 (PRs #23300, #23685, #23696, #23732): Goals feature is now on by
+    // default. Goal lifecycle events are emitted as event_msg turn items interleaved with
+    // normal session events. Verify they are gracefully skipped and do not corrupt turns.
+
+    #[test]
+    fn goal_created_event_interleaved_in_turn_is_skipped() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"goal-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/tmp","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"goal-abc","title":"Write tests","status":"active"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"I'll write the tests now.","phase":"main"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"goal-abc","progress":0.5}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167205.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "I'll write the tests now.");
+    }
+
+    #[test]
+    fn all_goal_lifecycle_events_are_skipped_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:01:00Z","type":"session_meta","payload":{"id":"goal-session-2","timestamp":"2026-05-21T10:01:00Z","cwd":"/tmp","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"g1","title":"Goal 1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:03Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"g1","progress":0.3}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:04Z","type":"event_msg","payload":{"type":"goal_paused","goal_id":"g1","reason":"waiting"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:05Z","type":"event_msg","payload":{"type":"goal_completed","goal_id":"g1","outcome":"success"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167266.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Goal events must not appear as agent messages or tool calls
+        assert!(turns[0].agent_messages.is_empty());
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn goal_events_across_multiple_turns_are_all_skipped() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:02:00Z","type":"session_meta","payload":{"id":"goal-session-3","timestamp":"2026-05-21T10:02:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"g1","title":"First goal"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167323.0}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:05Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"g1","progress":0.8}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:06Z","type":"event_msg","payload":{"type":"goal_completed","goal_id":"g1","outcome":"done"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1748167327.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[1].status, TurnStatus::Complete);
     }
 }

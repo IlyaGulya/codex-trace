@@ -604,6 +604,36 @@ mod tests {
         );
     }
 
+    // Codex v0.133.0 (PRs #23300, #23685, #23696, #23732): Goals feature enabled by default.
+    // Goal lifecycle events are interleaved in the session JSONL turn stream. Verify full
+    // session parse handles them gracefully and produces the correct turn structure.
+
+    #[test]
+    fn parse_session_with_goal_events_produces_correct_turns() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-21T10-00-00-goals.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"goals-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/tmp","cli_version":"0.133.0"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"goal-abc","title":"Implement feature X","status":"active"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"goal-abc","progress":0.25}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"goal-abc","progress":0.75}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:05Z","type":"event_msg","payload":{"type":"goal_completed","goal_id":"goal-abc","outcome":"success"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167206.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "goals-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.133.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
     #[test]
     fn parse_session_regular_exec_session_is_not_headless() {
         let tmp = tempdir().unwrap();
