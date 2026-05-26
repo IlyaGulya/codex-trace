@@ -326,9 +326,12 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                             .map(|s| s.to_string());
                     }
                     "collab_agent_spawn_end" => {
+                        // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
                         if let Some(new_id) = v
                             .get("payload")
-                            .and_then(|p| p.get("new_thread_id"))
+                            .and_then(|p| {
+                                p.get("new_thread_id").or_else(|| p.get("new_session_id"))
+                            })
                             .and_then(|v| v.as_str())
                         {
                             push_unique(&mut spawned_worker_ids, new_id.to_string());
@@ -869,5 +872,112 @@ mod tests {
         let session = sessions.iter().find(|s| s.id == "s1").unwrap();
 
         assert_eq!(session.total_tokens, Some(1800));
+    }
+
+    // Codex v0.131.0 (PR #22268): collab_agent_spawn_end event renamed new_thread_id → new_session_id.
+    // Verify the discover scanner reads new_session_id when new_thread_id is absent.
+    #[test]
+    fn discover_sessions_links_collab_spawn_end_event_v0131_new_session_id() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let parent_path = day_dir.join("rollout-2026-05-18T10-00-00-parent-v131.jsonl");
+        std::fs::write(
+            &parent_path,
+            [
+                r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"parent-v131","timestamp":"2026-05-18T10:00:00Z","cli_version":"0.131.0","source":"cli"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Gather data\"}","call_id":"call_spawn_v131"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:03Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"call_spawn_v131","sender_session_id":"parent-v131","new_session_id":"worker-v131","new_agent_nickname":"Hypatia","new_agent_role":"worker","prompt":"Gather data","status":"pending_init"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn_v131","output":"{\"agent_id\":\"worker-v131\",\"nickname\":\"Hypatia\"}"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562405.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let child_path = day_dir.join("rollout-2026-05-18T10-00-09-worker-v131.jsonl");
+        std::fs::write(
+            &child_path,
+            r#"{"timestamp":"2026-05-18T10:00:09Z","type":"session_meta","payload":{"id":"worker-v131","timestamp":"2026-05-18T10:00:09Z","cli_version":"0.131.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-v131","depth":1,"agent_nickname":"Hypatia","agent_role":"worker"}}}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let parent = sessions.iter().find(|s| s.id == "parent-v131").unwrap();
+        let child = sessions.iter().find(|s| s.id == "worker-v131").unwrap();
+
+        assert_eq!(parent.spawned_worker_ids, vec!["worker-v131"]);
+        assert!(child.is_external_worker);
+        assert!(child.is_inline_worker);
+        assert_eq!(child.worker_nickname.as_deref(), Some("Hypatia"));
+        assert_eq!(child.worker_role.as_deref(), Some("worker"));
+    }
+
+    // Codex v0.131.0 (PRs #22594, #22647, #22724): profile-v2 layered config format.
+    //
+    // codex-trace reads only JSONL session files — never Codex TOML config files. The
+    // profile-v2 changes affect what appears in session_meta: a `profile` field may name
+    // the active profile; `instructions_file` is gone from config so instructions arrive
+    // via `base_instructions.text` or are absent entirely. The discover scanner must handle
+    // both cases without panicking.
+
+    #[test]
+    fn discover_sessions_v0131_profile_v2_session_discovered_correctly() {
+        // session_meta with profile-v2 `profile` field: discover scanner must not panic
+        // and must populate cli_version correctly from the payload.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-18T10-00-00-profilev2.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"v0131-disc-profile","timestamp":"2026-05-18T10:00:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai","profile":"work","base_instructions":{"text":"You are helpful."}}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562402.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0131-disc-profile")
+            .unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn discover_sessions_v0131_no_instructions_discovered_correctly() {
+        // sessions from v0.131.0 without instructions (instructions_file removed) must be
+        // discovered and indexed normally — the absent field has no effect on discovery.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/18");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-18T10-01-00-noinstr.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-18T10:01:00Z","type":"session_meta","payload":{"id":"v0131-disc-noinstr","timestamp":"2026-05-18T10:01:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562462.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0131-disc-noinstr")
+            .unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
     }
 }

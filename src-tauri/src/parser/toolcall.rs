@@ -329,15 +329,14 @@ impl ToolCallBuilder {
             .map(|s| s.to_string());
         let duration_secs = parse_duration(payload);
         // aggregated_output carries the actual command output; stdout is often empty.
-        let output = ["aggregated_output", "stdout", "formatted_output"]
-            .iter()
-            .find_map(|key| {
-                payload
-                    .get(*key)
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            });
+        // formatted_output was a legacy field removed in Codex v0.132.0 (PR #22706).
+        let output = ["aggregated_output", "stdout"].iter().find_map(|key| {
+            payload
+                .get(*key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        });
         let status = str_field(payload, "status");
 
         self.finalized.push(ToolCall {
@@ -1052,6 +1051,45 @@ mod tests {
         let (server, tool) = parse_mcp_namespace("other__ns__tool", "fn_name");
         assert_eq!(server, None);
         assert_eq!(tool, None);
+    }
+
+    // Codex v0.132.0 (PR #22706): the legacy shell output formatting paths were removed.
+    // exec_command_end events no longer carry a `formatted_output` field; the output is
+    // exclusively in `aggregated_output`. The parser must read `aggregated_output` and
+    // must not require `formatted_output` to be present.
+    #[test]
+    fn exec_command_end_v0132_reads_aggregated_output_without_formatted_output() {
+        use super::super::super::parser::toolcall::ToolCallBuilder;
+        use serde_json::json;
+
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+        );
+
+        // v0.132.0 exec_command_end: only aggregated_output, no formatted_output
+        let payload = json!({
+            "call_id": "call_1",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 120_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+        assert!(
+            tool.duration_secs.is_some(),
+            "duration should be extracted from structured field"
+        );
     }
 
     #[test]

@@ -356,4 +356,77 @@ mod tests {
         // The mcp_servers field is accessible via the payload but not required for parsing.
         assert!(e.payload.get("mcp_servers").is_some());
     }
+
+    // Codex v0.131.0 (PRs #22594, #22647, #22724): profile-v2 layered config format.
+    //
+    // PR #22594 introduced --profile-v2 as a new layered config file format.
+    // PR #22647 made Codex reject the legacy [profiles] TOML section when profile-v2 is active.
+    // PR #22724 removed the experimental `instructions_file` config key entirely.
+    //
+    // codex-trace does NOT read Codex CLI config files (TOML profiles). It reads only the
+    // JSONL session files at ~/.codex/sessions/. The profile-v2 changes affect what Codex
+    // writes into session_meta entries:
+    //   - A `profile` field may appear in session_meta indicating the active profile name.
+    //   - Instructions from the active profile arrive via `base_instructions.text` (already
+    //     read by parse_session_meta_new) or may be absent entirely when no profile is set.
+    //   - The `instructions_file` config key is gone — sessions from v0.131.0+ will not
+    //     have instructions sourced from that key (opt_str returns None gracefully).
+    //
+    // The loosely-typed RawEntry model ignores unknown fields, so profile-v2 metadata in
+    // session_meta does not cause parse failures or panics.
+
+    #[test]
+    fn v0131_session_meta_with_profile_v2_field_does_not_panic() {
+        // session_meta from a v0.131.0 session started with --profile-v2 active.
+        // The `profile` field names the active profile; codex-trace ignores it gracefully.
+        let line = r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"v0131-profile-v2","timestamp":"2026-05-18T10:00:00Z","cwd":"/tmp","cli_version":"0.131.0","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with profile-v2 fields must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0131-profile-v2");
+        assert_eq!(e.payload["cli_version"], "0.131.0");
+        assert_eq!(e.payload["profile"], "work");
+        assert_eq!(
+            e.payload["base_instructions"]["text"],
+            "You are a helpful assistant."
+        );
+    }
+
+    #[test]
+    fn v0131_session_meta_without_instructions_does_not_panic() {
+        // v0.131.0 removed `instructions_file` from the Codex config. Sessions started
+        // without a profile that provided instructions will have no `instructions` or
+        // `base_instructions` field — opt_str returns None, not an error.
+        let line = r#"{"timestamp":"2026-05-18T10:01:00Z","type":"session_meta","payload":{"id":"v0131-no-instructions","timestamp":"2026-05-18T10:01:00Z","cwd":"/home/user","cli_version":"0.131.0","model_provider":"openai"}}"#;
+        let e = RawEntry::parse(line).expect("session_meta without instructions must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0131-no-instructions");
+        assert!(e.payload.get("instructions").is_none());
+        assert!(e.payload.get("base_instructions").is_none());
+    }
+
+    #[test]
+    fn v0131_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types must parse under v0.131.0.
+        let lines = [
+            r#"{"timestamp":"2026-05-18T10:02:00Z","type":"session_meta","payload":{"id":"v0131-session","timestamp":"2026-05-18T10:02:00Z","cwd":"/tmp","cli_version":"0.131.0","profile":"default","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-18T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-18T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-18T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-18T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562524.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.131.0");
+        assert_eq!(meta.payload["profile"], "default");
+    }
 }

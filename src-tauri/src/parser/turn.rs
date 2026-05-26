@@ -463,7 +463,13 @@ fn handle_event_msg(
                 // Record collab spawn metadata
                 if let Some(turn) = turns.get_mut(tid) {
                     let call_id = str_field(payload, "call_id");
-                    let new_thread_id = str_field(payload, "new_thread_id");
+                    // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
+                    let new_thread_id = payload
+                        .get("new_thread_id")
+                        .or_else(|| payload.get("new_session_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let agent_nickname = str_field(payload, "new_agent_nickname");
                     let agent_role = str_field(payload, "new_agent_role");
                     let model = payload
@@ -532,6 +538,12 @@ fn handle_event_msg(
                 }
             }
         }
+
+        // Codex v0.133.0 (PRs #23300, #23685, #23696, #23732): Goals feature enabled by
+        // default. Goal lifecycle events are emitted as event_msg turn items in the session
+        // stream. codex-trace does not model goal state — these events are intentionally
+        // skipped so they don't corrupt turn data.
+        "goal_created" | "goal_updated" | "goal_completed" | "goal_paused" => {}
 
         _ => {}
     }
@@ -1061,6 +1073,64 @@ mod tests {
             .unwrap()
             .contains("final chunk under a future transport shape"));
         assert_eq!(tool.status, "completed");
+    }
+
+    // Codex v0.132.0 (PR #22706): the legacy shell output formatting paths were removed.
+    // function_call_output for exec_command now contains the raw command output only —
+    // no "Chunk ID:", "Wall time:", "Process exited with code N", "Output:" markers.
+    // The parser must preserve the full raw output and not attempt marker-based extraction.
+    #[test]
+    fn function_call_output_v0132_plain_text_no_legacy_markers() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-session","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello world\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            // v0.132.0: raw output only — no "Chunk ID", "Wall time", "Process exited", "Output:" markers
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec","output":"hello world\n"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.name, "exec_command");
+        // Raw output must be preserved in full — no marker stripping
+        assert_eq!(tool.output.as_deref(), Some("hello world\n"));
+        // No exit code extractable from plain text — None is correct
+        assert_eq!(tool.exit_code, None);
+        assert_eq!(tool.status, "completed");
+    }
+
+    // Codex v0.132.0 (PR #22706): exec_command_end events no longer include formatted_output.
+    // When both function_call_output (plain text, no markers) and exec_command_end (with
+    // aggregated_output) are present, the exec_command_end structured fields take precedence.
+    #[test]
+    fn exec_command_end_v0132_structured_output_and_exit_code() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-end-session","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls /nonexistent\",\"workdir\":\"/tmp\"}","call_id":"call_ls"}}"#,
+            // v0.132.0: exec_command_end carries aggregated_output + structured exit_code + duration
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_ls","aggregated_output":"ls: /nonexistent: No such file or directory\n","exit_code":1,"status":"failed","duration":{"secs":0,"nanos":5000000}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("ls: /nonexistent: No such file or directory\n")
+        );
+        assert_eq!(tool.exit_code, Some(1));
+        assert_eq!(tool.status, "failed");
+        assert!(tool.duration_secs.is_some());
     }
 
     #[test]
@@ -1833,5 +1903,92 @@ mod tests {
         assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
         assert!(turns[0].cwd.is_none());
         assert!(turns[0].reasoning_effort.is_none());
+    }
+
+    // Codex v0.131.0 (PR #22268): collab_agent_spawn_end event payload field renamed
+    // new_thread_id → new_session_id. Verify the parser reads new_session_id as a fallback.
+    #[test]
+    fn links_spawn_agent_from_collab_spawn_end_with_new_session_id() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"parent-sess","timestamp":"2026-05-18T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Do work\"}","call_id":"call_spawn_v131"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:03Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"call_spawn_v131","sender_session_id":"parent-sess","new_session_id":"worker-sess-v131","new_agent_nickname":"Turing","new_agent_role":"worker","prompt":"Do work","status":"pending_init"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn_v131","output":"{\"agent_id\":\"worker-sess-v131\",\"nickname\":\"Turing\"}"}}"#,
+            r#"{"timestamp":"2026-05-18T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562405.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].collab_spawns.len(), 1);
+        assert_eq!(turns[0].collab_spawns[0].new_thread_id, "worker-sess-v131");
+        assert_eq!(turns[0].collab_spawns[0].agent_nickname, "Turing");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].kind, ToolKind::SpawnAgent);
+    }
+
+    // Codex v0.133.0 (PRs #23300, #23685, #23696, #23732): Goals feature is now on by
+    // default. Goal lifecycle events are emitted as event_msg turn items interleaved with
+    // normal session events. Verify they are gracefully skipped and do not corrupt turns.
+
+    #[test]
+    fn goal_created_event_interleaved_in_turn_is_skipped() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"goal-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/tmp","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"goal-abc","title":"Write tests","status":"active"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"I'll write the tests now.","phase":"main"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"goal-abc","progress":0.5}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167205.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "I'll write the tests now.");
+    }
+
+    #[test]
+    fn all_goal_lifecycle_events_are_skipped_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:01:00Z","type":"session_meta","payload":{"id":"goal-session-2","timestamp":"2026-05-21T10:01:00Z","cwd":"/tmp","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"g1","title":"Goal 1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:03Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"g1","progress":0.3}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:04Z","type":"event_msg","payload":{"type":"goal_paused","goal_id":"g1","reason":"waiting"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:05Z","type":"event_msg","payload":{"type":"goal_completed","goal_id":"g1","outcome":"success"}}"#,
+            r#"{"timestamp":"2026-05-21T10:01:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167266.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Goal events must not appear as agent messages or tool calls
+        assert!(turns[0].agent_messages.is_empty());
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn goal_events_across_multiple_turns_are_all_skipped() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:02:00Z","type":"session_meta","payload":{"id":"goal-session-3","timestamp":"2026-05-21T10:02:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:02Z","type":"event_msg","payload":{"type":"goal_created","goal_id":"g1","title":"First goal"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167323.0}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:05Z","type":"event_msg","payload":{"type":"goal_updated","goal_id":"g1","progress":0.8}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:06Z","type":"event_msg","payload":{"type":"goal_completed","goal_id":"g1","outcome":"done"}}"#,
+            r#"{"timestamp":"2026-05-21T10:02:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1748167327.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[1].status, TurnStatus::Complete);
     }
 }
