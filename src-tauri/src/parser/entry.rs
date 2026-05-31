@@ -429,4 +429,42 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.131.0");
         assert_eq!(meta.payload["profile"], "default");
     }
+
+    // Codex v0.132.0 (PR #22706): "Remove legacy shell output formatting paths".
+    // exec_command_end events no longer carry a `formatted_output` field — output is
+    // exclusively in `aggregated_output`. The JSONL entry types themselves are unchanged;
+    // this regression guard confirms all four standard types parse correctly under v0.132.0
+    // and that exec_command_end events carrying only `aggregated_output` (no `formatted_output`)
+    // are valid JSONL that passes through RawEntry parsing without error.
+    #[test]
+    fn v0132_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-session","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            // exec_command_end with aggregated_output only — formatted_output field absent (removed in v0.132.0)
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606405.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.132.0");
+        // exec_command_end payload must contain aggregated_output and no formatted_output
+        let exec_end = RawEntry::parse(lines[4]).unwrap();
+        assert_eq!(exec_end.payload["type"], "exec_command_end");
+        assert_eq!(exec_end.payload["aggregated_output"], "hello\n");
+        assert!(exec_end.payload.get("formatted_output").is_none());
+    }
 }
