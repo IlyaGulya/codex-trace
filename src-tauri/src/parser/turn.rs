@@ -781,6 +781,45 @@ fn handle_response_item(
             }
         }
 
+        // Codex v0.133.0+ (PRs #23080, #22508): UserTurn and UserInputWithTurnContext were
+        // replaced by a split UserInput + ThreadSettings model. UserInput carries the user's
+        // message text; ThreadSettings carries per-turn config (model, cwd, effort).
+        "user_input" => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.user_message.is_none() {
+                    let text = extract_content_text(payload);
+                    if !text.is_empty() {
+                        turn.user_message = Some(text);
+                    }
+                }
+            }
+        }
+
+        // Codex v0.133.0+ (PRs #23080, #22508): ThreadSettings carries per-turn context
+        // (model, cwd, effort) that was previously bundled inside UserInputWithTurnContext.
+        "thread_settings" => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.model.is_none() {
+                    turn.model = payload
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                if turn.cwd.is_none() {
+                    turn.cwd = payload
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                if turn.reasoning_effort.is_none() {
+                    turn.reasoning_effort = payload
+                        .get("effort")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -1946,6 +1985,119 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_message.as_deref(), Some("Plain string input"));
         assert_eq!(turns[0].cwd.as_deref(), Some("/home/user"));
+    }
+
+    // Codex v0.133.0+ (PRs #23080, #22508): UserTurn and UserInputWithTurnContext were
+    // replaced by a split UserInput + ThreadSettings model.
+
+    #[test]
+    fn user_input_response_item_string_content_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-ui1","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":"Hello from new Codex"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Hello from new Codex")
+        );
+    }
+
+    #[test]
+    fn user_input_response_item_content_array_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-ui2","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":[{"type":"text","text":"Fix "},{"type":"text","text":"the bug"}]}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Fix the bug"));
+    }
+
+    #[test]
+    fn user_input_does_not_overwrite_existing_user_message() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-ui3","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Primary message"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"user_input","content":"Should be ignored"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167204.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Primary message"));
+    }
+
+    #[test]
+    fn thread_settings_response_item_captures_context_fields() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-ts1","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":"Run tests"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"thread_settings","model":"gpt-5","cwd":"/workspace","effort":"high"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167204.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_deref(), Some("Run tests"));
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(turns[0].cwd.as_deref(), Some("/workspace"));
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn thread_settings_partial_fields_are_applied() {
+        // thread_settings may omit some fields; only present fields should be applied.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"s-ts2","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"thread_settings","model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+        assert!(turns[0].cwd.is_none());
+        assert!(turns[0].reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn v0133_full_session_with_user_input_and_thread_settings() {
+        // Full v0.133.0+ session: user_input + thread_settings replace the old user_turn.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/project","cli_version":"0.133.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"user_input","content":"Write a test for the parser"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"thread_settings","model":"gpt-5","cwd":"/project","effort":"medium"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"I'll write a test for the parser.","phase":"main"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167205.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Write a test for the parser")
+        );
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(turns[0].cwd.as_deref(), Some("/project"));
+        assert_eq!(turns[0].reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(
+            turns[0].agent_messages[0].text,
+            "I'll write a test for the parser."
+        );
     }
 
     // Codex v0.133.0 compat: PR #22709 trimmed unused TurnContextItem fields.
