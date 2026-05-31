@@ -429,4 +429,33 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.131.0");
         assert_eq!(meta.payload["profile"], "default");
     }
+
+    // Codex v0.131.0 (PRs #21757, #22193): HTTP request header names changed from
+    // underscore form (x_codex_session_id, x_codex_thread_id) to hyphen form
+    // (x-codex-session-id, x-codex-thread-id). These are transport-layer headers sent
+    // by the Codex CLI to the OpenAI API; they are not logged into the JSONL session
+    // files at ~/.codex/sessions/ that codex-trace reads.
+    //
+    // Session IDs are extracted from JSONL payload fields (id, session_id,
+    // thread.sessionId) — the HTTP header rename has no impact on this parser.
+    // This test guards against future regressions where someone mistakenly tries to
+    // read header-name strings from JSONL payloads.
+    #[test]
+    fn v0131_hyphenated_api_headers_do_not_affect_session_id_extraction() {
+        // session_meta payload from a v0.131.0 session — structurally identical to
+        // prior versions. The HTTP header rename is invisible at this layer; the
+        // session ID continues to arrive in the `session_id` payload field.
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"session_id":"sess-hyphen-131","timestamp":"2026-05-18T10:00:00Z","cwd":"/tmp","cli_version":"0.131.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_session_id(&payload), "sess-hyphen-131");
+
+        // Confirm neither underscore nor hyphen header-name strings appear as field
+        // keys — they are HTTP transport details, not JSONL payload keys.
+        assert!(payload.get("x_codex_session_id").is_none());
+        assert!(payload.get("x-codex-session-id").is_none());
+        assert!(payload.get("x_codex_thread_id").is_none());
+        assert!(payload.get("x-codex-thread-id").is_none());
+    }
 }
