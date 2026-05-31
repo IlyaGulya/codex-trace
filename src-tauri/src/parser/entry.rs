@@ -363,6 +363,10 @@ mod tests {
     // PR #22647 made Codex reject the legacy [profiles] TOML section when profile-v2 is active.
     // PR #22724 removed the experimental `instructions_file` config key entirely.
     //
+    // Note: As of Codex v0.134.0 (PRs #23883, #24051, #24055, #24059), --profile-v2 was
+    // renamed to --profile and all legacy profile v1 support was removed. See the v0134_*
+    // tests below for the corresponding v0.134.0 verification.
+    //
     // codex-trace does NOT read Codex CLI config files (TOML profiles). It reads only the
     // JSONL session files at ~/.codex/sessions/. The profile-v2 changes affect what Codex
     // writes into session_meta entries:
@@ -377,8 +381,9 @@ mod tests {
 
     #[test]
     fn v0131_session_meta_with_profile_v2_field_does_not_panic() {
-        // session_meta from a v0.131.0 session started with --profile-v2 active.
-        // The `profile` field names the active profile; codex-trace ignores it gracefully.
+        // session_meta from a v0.131.0 session started with --profile-v2 active (renamed to
+        // --profile in v0.134.0). The `profile` field names the active profile; codex-trace
+        // ignores it gracefully.
         let line = r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"v0131-profile-v2","timestamp":"2026-05-18T10:00:00Z","cwd":"/tmp","cli_version":"0.131.0","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#;
         let e = RawEntry::parse(line).expect("session_meta with profile-v2 fields must parse");
         assert_eq!(e.entry_type, "session_meta");
@@ -427,6 +432,71 @@ mod tests {
         }
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.131.0");
+        assert_eq!(meta.payload["profile"], "default");
+    }
+
+    // Codex v0.134.0 (PRs #23883, #24051, #24055, #24059): --profile-v2 renamed to --profile;
+    // legacy profile v1 support removed entirely.
+    //
+    // PRs #23883, #24051, #24055, #24059 promoted --profile to the primary profile selector
+    // and removed all legacy profile v1 resolution and write paths. Passing a legacy profile
+    // selector now returns an error instead of silently falling back. This is a CLI-level
+    // change: codex-trace does NOT invoke `codex` at runtime and does NOT read Codex TOML
+    // config files. Sessions from v0.134.0+ carry the same `profile` field in session_meta
+    // as v0.131.0+ sessions — the only observable difference for codex-trace is the
+    // cli_version bump. The parser is unaffected; these tests confirm v0.134.0 sessions
+    // parse correctly.
+
+    #[test]
+    fn v0134_session_meta_with_profile_field_does_not_panic() {
+        // session_meta from v0.134.0 with --profile active (flag renamed from --profile-v2).
+        // The `profile` field names the active profile; codex-trace reads it gracefully.
+        let line = r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-profile","timestamp":"2026-05-26T10:00:00Z","cwd":"/tmp","cli_version":"0.134.0","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with profile field must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0134-profile");
+        assert_eq!(e.payload["cli_version"], "0.134.0");
+        assert_eq!(e.payload["profile"], "work");
+        assert_eq!(
+            e.payload["base_instructions"]["text"],
+            "You are a helpful assistant."
+        );
+    }
+
+    #[test]
+    fn v0134_session_meta_without_profile_does_not_panic() {
+        // v0.134.0 session started without --profile: no `profile` field in session_meta.
+        // The parser must handle the absent field gracefully (opt_str returns None).
+        let line = r#"{"timestamp":"2026-05-26T10:01:00Z","type":"session_meta","payload":{"id":"v0134-no-profile","timestamp":"2026-05-26T10:01:00Z","cwd":"/home/user","cli_version":"0.134.0","model_provider":"openai"}}"#;
+        let e = RawEntry::parse(line).expect("session_meta without profile must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0134-no-profile");
+        assert!(e.payload.get("profile").is_none());
+    }
+
+    #[test]
+    fn v0134_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types must parse under v0.134.0.
+        let lines = [
+            r#"{"timestamp":"2026-05-26T10:02:00Z","type":"session_meta","payload":{"id":"v0134-session","timestamp":"2026-05-26T10:02:00Z","cwd":"/tmp","cli_version":"0.134.0","profile":"default","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254924.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.134.0");
         assert_eq!(meta.payload["profile"], "default");
     }
 }
