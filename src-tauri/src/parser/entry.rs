@@ -429,4 +429,47 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.131.0");
         assert_eq!(meta.payload["profile"], "default");
     }
+
+    // Codex v0.133.0 (PR #22709): TurnContextItem fields trimmed.
+    // turn_context payloads now carry only the fields still used internally; previously
+    // populated fields like cwd and effort may be absent. The loosely-typed RawEntry
+    // model must parse both old (extra fields) and new (trimmed) payloads without error.
+
+    #[test]
+    fn v0133_turn_context_trimmed_payload_parses_as_turn_context_entry() {
+        // v0.133.0 turn_context with minimal payload — only model is present.
+        let line = r#"{"timestamp":"2026-05-21T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5"}}"#;
+        let e = RawEntry::parse(line).expect("turn_context with minimal payload must parse");
+        assert_eq!(e.entry_type, "turn_context");
+        assert_eq!(e.payload["model"], "gpt-5");
+        // cwd and effort are absent — must not panic
+        assert!(e.payload.get("cwd").is_none());
+        assert!(e.payload.get("effort").is_none());
+    }
+
+    #[test]
+    fn v0133_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types must parse under v0.133.0.
+        // turn_context payload is trimmed — only model is present (PR #22709).
+        let lines = [
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/tmp","cli_version":"0.133.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167204.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.133.0");
+    }
 }

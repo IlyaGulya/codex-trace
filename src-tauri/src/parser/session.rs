@@ -767,4 +767,38 @@ mod tests {
         assert_eq!(session.turns.len(), 1);
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.133.0 (PR #22709): TurnContextItem fields trimmed.
+    // turn_context payloads now carry only the model field; cwd and effort are no longer
+    // emitted. Sessions from v0.133.0+ must parse correctly with the reduced payload.
+
+    #[test]
+    fn v0133_turn_context_trimmed_fields_session_parses_correctly() {
+        // v0.133.0 session where turn_context has only model — cwd and effort are absent.
+        // Verifies the parser extracts model from the trimmed payload and does not panic
+        // on the missing fields.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-21T10-00-00-v0133.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-turn-ctx","timestamp":"2026-05-21T10:00:00Z","cwd":"/workspace","cli_version":"0.133.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+                r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167204.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0133-turn-ctx");
+        assert_eq!(session.cli_version.as_deref(), Some("0.133.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].model.as_deref(), Some("gpt-5"));
+        // cwd and effort absent in turn_context — must not panic
+        assert!(session.turns[0].reasoning_effort.is_none());
+        assert!(!session.is_ongoing);
+    }
 }
