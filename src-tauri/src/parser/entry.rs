@@ -429,4 +429,45 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.131.0");
         assert_eq!(meta.payload["profile"], "default");
     }
+
+    // Codex v0.134.0 (PR #24081): `codex-tui.log` is now opt-in.
+    //
+    // Before v0.134.0, the TUI log file was written unconditionally at its default
+    // path. PR #24081 made this opt-in: the file no longer exists unless the user
+    // explicitly enables TUI logging.
+    //
+    // codex-trace reads session data exclusively from JSONL files at
+    // ~/.codex/sessions/ — it does not read `codex-tui.log`. The opt-in change
+    // therefore has no effect on session parsing or session discovery. Verify that
+    // all four standard JSONL entry types continue to parse correctly for v0.134.0
+    // sessions regardless of whether the TUI log is present on disk.
+
+    #[test]
+    fn v0134_tui_log_opt_in_does_not_affect_jsonl_session_parser() {
+        // Codex v0.134.0 PR #24081 made `codex-tui.log` opt-in. codex-trace reads
+        // session data from JSONL files at ~/.codex/sessions/, not from the TUI log,
+        // so the opt-in change has no effect on parsing. Verify all four standard
+        // entry types produced by a v0.134.0 session parse correctly.
+        let lines = [
+            r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-session","timestamp":"2026-05-26T10:00:00Z","cwd":"/tmp","cli_version":"0.134.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253604.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.134.0");
+        assert_eq!(meta.payload["id"], "v0134-session");
+    }
 }
