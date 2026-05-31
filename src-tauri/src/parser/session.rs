@@ -767,4 +767,63 @@ mod tests {
         assert_eq!(session.turns.len(), 1);
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.135.0 (PR #24591): memory state moved from file-based storage to a dedicated
+    // SQLite DB. Active memories are injected into context at turn start and written into the
+    // turn_context JSONL event. parse_session must expose them on each CodexTurn.
+
+    #[test]
+    fn v0135_session_with_memories_in_turn_context() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-28T10-00-00-v0135mem.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-mem-session","timestamp":"2026-05-28T10:00:00Z","cwd":"/project","cli_version":"0.135.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-28T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project","memories":["User prefers terse output","Project uses TypeScript strict mode"]}}"#,
+                r#"{"timestamp":"2026-05-28T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+                r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426404.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0135-mem-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.135.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].memories,
+            vec![
+                "User prefers terse output",
+                "Project uses TypeScript strict mode"
+            ]
+        );
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0135_session_without_memories_produces_empty_vec() {
+        // Pre-v0.135.0 sessions must parse normally with an empty memories Vec.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-28T10-01-00-nomem.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-28T10:01:00Z","type":"session_meta","payload":{"id":"v0134-no-memories","timestamp":"2026-05-28T10:01:00Z","cwd":"/project","cli_version":"0.134.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-28T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-28T10:01:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project","effort":"high"}}"#,
+                r#"{"timestamp":"2026-05-28T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426463.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0134-no-memories");
+        assert!(session.turns[0].memories.is_empty());
+    }
 }

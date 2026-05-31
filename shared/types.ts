@@ -84,6 +84,8 @@ export interface CodexTurn {
   has_compaction: boolean;
   thread_name: string | null;
   collab_spawns: CollabSpawn[];
+  /** Active memories injected at turn start (Codex v0.135.0+, PR #24591). Empty for older sessions. */
+  memories?: string[];
 }
 
 export interface CodexSession {

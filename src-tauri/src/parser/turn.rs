@@ -79,6 +79,9 @@ pub struct CodexTurn {
     pub has_compaction: bool,
     pub thread_name: Option<String>,
     pub collab_spawns: Vec<CollabSpawn>,
+    /// Active memories injected into context at turn start (Codex v0.135.0+, PR #24591).
+    /// Empty for sessions from older Codex versions.
+    pub memories: Vec<String>,
 }
 
 impl CodexTurn {
@@ -103,6 +106,7 @@ impl CodexTurn {
             has_compaction: false,
             thread_name: None,
             collab_spawns: Vec::new(),
+            memories: Vec::new(),
         }
     }
 }
@@ -803,6 +807,17 @@ fn handle_turn_context(
         .get("effort")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Codex v0.135.0 (PR #24591): memories are now stored in a dedicated SQLite DB and
+    // injected into the context at turn start. The active set is written into turn_context.
+    let memories: Vec<String> = payload
+        .get("memories")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     if let Some(ref tid) = current_turn_id {
         if let Some(turn) = turns.get_mut(tid) {
@@ -814,6 +829,9 @@ fn handle_turn_context(
             }
             if effort.is_some() {
                 turn.reasoning_effort = effort;
+            }
+            if !memories.is_empty() {
+                turn.memories = memories;
             }
         }
     }
@@ -2071,5 +2089,63 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert_eq!(turns[1].status, TurnStatus::Complete);
+    }
+
+    // Codex v0.135.0 (PR #24591): memory state moved from file-based storage to a dedicated
+    // SQLite DB. Active memories are now injected into context at turn start and written into
+    // the turn_context JSONL event. codex-trace must parse and expose them on CodexTurn.
+
+    #[test]
+    fn turn_context_with_memories_parsed_correctly() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-mem","timestamp":"2026-05-28T10:00:00Z","cwd":"/project","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project","memories":["User prefers terse output","Project uses TypeScript strict mode"]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 2);
+        assert_eq!(turns[0].memories[0], "User prefers terse output");
+        assert_eq!(turns[0].memories[1], "Project uses TypeScript strict mode");
+        assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn turn_context_without_memories_produces_empty_vec() {
+        // Pre-v0.135.0 sessions: turn_context has no memories field → empty Vec, not None/panic.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0134-nomem","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.134.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp","effort":"medium"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747734003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].memories.is_empty());
+    }
+
+    #[test]
+    fn memories_preserved_across_multiple_turns() {
+        // Each turn_context carries its own memories snapshot; last one wins per turn.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-multiturn","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":["Initial memory"]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426403.0}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:05Z","type":"turn_context","payload":{"model":"gpt-5","memories":["Initial memory","New memory added"]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1748426406.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].memories, vec!["Initial memory"]);
+        assert_eq!(
+            turns[1].memories,
+            vec!["Initial memory", "New memory added"]
+        );
     }
 }
