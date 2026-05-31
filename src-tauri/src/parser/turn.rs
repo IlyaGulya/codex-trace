@@ -38,7 +38,7 @@ pub struct TokenInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollabSpawn {
     pub call_id: String,
-    pub new_thread_id: String,
+    pub new_session_id: String,
     pub agent_nickname: String,
     pub agent_role: String,
     pub model: Option<String>,
@@ -464,9 +464,9 @@ fn handle_event_msg(
                 if let Some(turn) = turns.get_mut(tid) {
                     let call_id = str_field(payload, "call_id");
                     // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
-                    let new_thread_id = payload
-                        .get("new_thread_id")
-                        .or_else(|| payload.get("new_session_id"))
+                    let new_session_id = payload
+                        .get("new_session_id")
+                        .or_else(|| payload.get("new_thread_id"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
@@ -485,7 +485,7 @@ fn handle_event_msg(
 
                     turn.collab_spawns.push(CollabSpawn {
                         call_id: call_id.clone(),
-                        new_thread_id,
+                        new_session_id,
                         agent_nickname,
                         agent_role,
                         model,
@@ -886,7 +886,7 @@ fn spawn_from_function_call_output(
 
     Some(CollabSpawn {
         call_id: call_id.to_string(),
-        new_thread_id: parsed.agent_id,
+        new_session_id: parsed.agent_id,
         agent_nickname: parsed.nickname,
         agent_role,
         model,
@@ -922,7 +922,7 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].collab_spawns.len(), 1);
         assert_eq!(turns[0].collab_spawns[0].call_id, "call_spawn");
-        assert_eq!(turns[0].collab_spawns[0].new_thread_id, "worker-session");
+        assert_eq!(turns[0].collab_spawns[0].new_session_id, "worker-session");
         assert_eq!(turns[0].collab_spawns[0].agent_nickname, "Parfit");
         assert_eq!(turns[0].collab_spawns[0].agent_role, "worker");
         assert_eq!(
@@ -1168,7 +1168,7 @@ mod tests {
 
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].collab_spawns.len(), 1);
-        assert_eq!(turns[0].collab_spawns[0].new_thread_id, "worker-session");
+        assert_eq!(turns[0].collab_spawns[0].new_session_id, "worker-session");
         assert_eq!(turns[0].collab_spawns[0].agent_nickname, "Noether");
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].kind, ToolKind::SpawnAgent);
@@ -2003,7 +2003,7 @@ mod tests {
 
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].collab_spawns.len(), 1);
-        assert_eq!(turns[0].collab_spawns[0].new_thread_id, "worker-sess-v131");
+        assert_eq!(turns[0].collab_spawns[0].new_session_id, "worker-sess-v131");
         assert_eq!(turns[0].collab_spawns[0].agent_nickname, "Turing");
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].kind, ToolKind::SpawnAgent);

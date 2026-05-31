@@ -23,7 +23,7 @@ export interface AgentMessage {
 
 export interface CollabSpawn {
   call_id: string;
-  new_thread_id: string;
+  new_session_id: string;
   agent_nickname: string;
   agent_role: string;
   model?: string | null;
