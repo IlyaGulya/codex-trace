@@ -35,6 +35,19 @@ pub struct TokenInfo {
     pub model_context_window: u64,
 }
 
+/// Compaction metadata embedded in turn headers (Codex v0.135.0, PR #24368).
+/// Captures the state of context compaction at the start of a turn so that
+/// context-window accounting in traces remains accurate even after compaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionMeta {
+    /// Context-window tokens present before compaction.
+    pub tokens_before: Option<u64>,
+    /// Context-window tokens remaining after compaction.
+    pub tokens_after: Option<u64>,
+    /// Optional human-readable summary of what was compacted.
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollabSpawn {
     pub call_id: String,
@@ -79,6 +92,15 @@ pub struct CodexTurn {
     pub has_compaction: bool,
     pub thread_name: Option<String>,
     pub collab_spawns: Vec<CollabSpawn>,
+    /// Codex v0.134.0 (PR #23980): OpenTelemetry trace ID from TurnStartedEvent.
+    /// Null for sessions captured before v0.134.0.
+    pub trace_id: Option<String>,
+    /// Codex v0.135.0 (PR #24160): thread ID this turn was forked from, if any.
+    /// Null for turns that are not forks of another thread.
+    pub forked_from_thread_id: Option<String>,
+    /// Codex v0.135.0 (PR #24368): compaction metadata present at turn start.
+    /// Null when the turn header carries no compaction info (pre-v0.135.0 sessions).
+    pub compaction_meta: Option<CompactionMeta>,
 }
 
 impl CodexTurn {
@@ -103,6 +125,9 @@ impl CodexTurn {
             has_compaction: false,
             thread_name: None,
             collab_spawns: Vec::new(),
+            trace_id: None,
+            forked_from_thread_id: None,
+            compaction_meta: None,
         }
     }
 }
@@ -202,6 +227,28 @@ fn handle_event_msg(
                 .or_else(|| entry.timestamp.as_deref().and_then(parse_timestamp_secs));
             let mut turn = CodexTurn::new(turn_id.clone());
             turn.started_at = started_at;
+            // Codex v0.134.0 (PR #23980): trace_id for OTel correlation.
+            turn.trace_id = payload
+                .get("trace_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            // Codex v0.135.0 (PR #24160): forked_from_thread_id for session-tree reconstruction.
+            turn.forked_from_thread_id = payload
+                .get("forked_from_thread_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            // Codex v0.135.0 (PR #24368): compaction metadata for context-window accounting.
+            turn.compaction_meta = payload.get("compaction").map(|c| CompactionMeta {
+                tokens_before: c.get("tokens_before").and_then(|v| v.as_u64()),
+                tokens_after: c.get("tokens_after").and_then(|v| v.as_u64()),
+                summary: c
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            });
             turns.insert(turn_id.clone(), turn);
             *current_turn_id = Some(turn_id.clone());
             tool_builders
@@ -2071,5 +2118,136 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert_eq!(turns[1].status, TurnStatus::Complete);
+    }
+
+    // Codex v0.134.0 (PR #23980): trace_id added to TurnStartedEvent for OTel correlation.
+
+    #[test]
+    fn v0134_trace_id_in_task_started_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-sess","timestamp":"2026-05-26T10:00:00Z","cli_version":"0.134.0"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","trace_id":"abc-trace-xyz-123"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254802.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].trace_id.as_deref(), Some("abc-trace-xyz-123"));
+    }
+
+    #[test]
+    fn v0134_absent_trace_id_is_none_for_older_sessions() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-25T10:00:00Z","type":"session_meta","payload":{"id":"pre-v0134","timestamp":"2026-05-25T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-25T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748168402.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].trace_id.is_none(),
+            "pre-v0.134.0 sessions must have no trace_id"
+        );
+    }
+
+    // Codex v0.135.0 (PR #24160): forked_from_thread_id added to turn metadata.
+
+    #[test]
+    fn v0135_forked_from_thread_id_in_task_started_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-fork","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","forked_from_thread_id":"parent-thread-abc"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426402.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].forked_from_thread_id.as_deref(),
+            Some("parent-thread-abc")
+        );
+    }
+
+    #[test]
+    fn v0135_absent_forked_from_thread_id_is_none_for_non_forked_turns() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-nofork","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426402.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].forked_from_thread_id.is_none(),
+            "non-forked turn must have no forked_from_thread_id"
+        );
+    }
+
+    // Codex v0.135.0 (PR #24368): compaction metadata added to turn headers.
+
+    #[test]
+    fn v0135_compaction_meta_in_task_started_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T11:00:00Z","type":"session_meta","payload":{"id":"v0135-cmeta","timestamp":"2026-05-28T11:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":120000,"tokens_after":45000,"summary":"Summarised earlier turns"}}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748430002.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.tokens_before, Some(120000));
+        assert_eq!(meta.tokens_after, Some(45000));
+        assert_eq!(meta.summary.as_deref(), Some("Summarised earlier turns"));
+    }
+
+    #[test]
+    fn v0135_absent_compaction_meta_is_none_for_uncompacted_turns() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T11:00:00Z","type":"session_meta","payload":{"id":"v0135-nocomp","timestamp":"2026-05-28T11:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748430002.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].compaction_meta.is_none(),
+            "turns without compaction header must have no compaction_meta"
+        );
+    }
+
+    #[test]
+    fn v0135_all_three_new_fields_in_same_task_started() {
+        // All three v0.134.0/v0.135.0 fields may appear together in a single task_started.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T12:00:00Z","type":"session_meta","payload":{"id":"v0135-all","timestamp":"2026-05-28T12:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","trace_id":"otel-trace-001","forked_from_thread_id":"parent-thread-xyz","compaction":{"tokens_before":80000,"tokens_after":30000}}}"#,
+            r#"{"timestamp":"2026-05-28T12:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748433602.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].trace_id.as_deref(), Some("otel-trace-001"));
+        assert_eq!(
+            turns[0].forked_from_thread_id.as_deref(),
+            Some("parent-thread-xyz")
+        );
+        let meta = turns[0].compaction_meta.as_ref().expect("compaction_meta");
+        assert_eq!(meta.tokens_before, Some(80000));
+        assert_eq!(meta.tokens_after, Some(30000));
+        assert!(meta.summary.is_none());
     }
 }

@@ -39,6 +39,9 @@ function makeTurn(overrides: Partial<CodexTurn> = {}): CodexTurn {
     has_compaction: false,
     thread_name: null,
     collab_spawns: [],
+    trace_id: null,
+    forked_from_thread_id: null,
+    compaction_meta: null,
     ...overrides,
   };
 }
