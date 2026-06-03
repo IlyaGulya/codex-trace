@@ -21,9 +21,19 @@ export interface AgentMessage {
   is_reasoning: boolean;
 }
 
+/** Codex v0.135.0 (PR #24368): compaction metadata from turn headers. */
+export interface CompactionMeta {
+  /** Context-window tokens present before compaction. */
+  tokens_before: number | null;
+  /** Context-window tokens remaining after compaction. */
+  tokens_after: number | null;
+  /** Optional human-readable summary of what was compacted. */
+  summary: string | null;
+}
+
 export interface CollabSpawn {
   call_id: string;
-  new_thread_id: string;
+  new_session_id: string;
   agent_nickname: string;
   agent_role: string;
   model?: string | null;
@@ -84,6 +94,12 @@ export interface CodexTurn {
   has_compaction: boolean;
   thread_name: string | null;
   collab_spawns: CollabSpawn[];
+  /** Codex v0.134.0 (PR #23980): OTel trace ID from TurnStartedEvent. Null for pre-v0.134.0 sessions. */
+  trace_id: string | null;
+  /** Codex v0.135.0 (PR #24160): thread ID this turn was forked from. Null for non-forked turns. */
+  forked_from_thread_id: string | null;
+  /** Codex v0.135.0 (PR #24368): compaction metadata at turn start. Null for pre-v0.135.0 sessions. */
+  compaction_meta: CompactionMeta | null;
 }
 
 export interface CodexSession {
