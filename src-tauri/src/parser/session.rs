@@ -111,7 +111,7 @@ fn parse_session_inner(
     // Collect spawned_worker_ids from all turns
     let spawned_worker_ids: Vec<String> = turns
         .iter()
-        .flat_map(|t| t.collab_spawns.iter().map(|s| s.new_thread_id.clone()))
+        .flat_map(|t| t.collab_spawns.iter().map(|s| s.new_session_id.clone()))
         .collect();
 
     // Determine total tokens from last turn's token info
@@ -178,7 +178,7 @@ fn embed_worker_sessions(
                 continue;
             };
 
-            let Some(worker_path) = find_session_file_by_id(parent_path, &spawn.new_thread_id)
+            let Some(worker_path) = find_session_file_by_id(parent_path, &spawn.new_session_id)
             else {
                 continue;
             };
@@ -470,7 +470,7 @@ mod tests {
 
         assert_eq!(session.spawned_worker_ids, vec!["worker-session"]);
         assert_eq!(
-            session.turns[0].collab_spawns[0].new_thread_id,
+            session.turns[0].collab_spawns[0].new_session_id,
             "worker-session"
         );
 
@@ -766,5 +766,56 @@ mod tests {
         assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
         assert_eq!(session.turns.len(), 1);
         assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.131.0 (PR #22268): collab_agent_spawn_end uses new_session_id instead of
+    // new_thread_id. Verify end-to-end: parse_session reads new_session_id, populates
+    // spawned_worker_ids, and embed_worker_sessions correctly stitches the worker session.
+    #[test]
+    fn v0131_parse_session_stitches_worker_via_new_session_id() {
+        let tmp = tempdir().unwrap();
+        let parent_path = tmp
+            .path()
+            .join("rollout-2026-05-18T10-03-00-parent-v131.jsonl");
+        let worker_path = tmp
+            .path()
+            .join("rollout-2026-05-18T10-03-09-worker-v131.jsonl");
+        std::fs::write(
+            &parent_path,
+            [
+                r#"{"timestamp":"2026-05-18T10:03:00Z","type":"session_meta","payload":{"id":"parent-v131","timestamp":"2026-05-18T10:03:00Z","cli_version":"0.131.0"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Gather data\"}","call_id":"call-spawn-v131"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:03Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"call-spawn-v131","sender_session_id":"parent-v131","new_session_id":"worker-v131","new_agent_nickname":"Hypatia","new_agent_role":"worker","prompt":"Gather data","status":"pending_init"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-spawn-v131","output":"{\"agent_id\":\"worker-v131\",\"nickname\":\"Hypatia\"}"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562585.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &worker_path,
+            [
+                r#"{"timestamp":"2026-05-18T10:03:09Z","type":"session_meta","payload":{"id":"worker-v131","timestamp":"2026-05-18T10:03:09Z","cli_version":"0.131.0","cwd":"/tmp/worker"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:10Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-worker"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-worker","completed_at":1747562591.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&parent_path).unwrap();
+        assert_eq!(session.id, "parent-v131");
+        assert_eq!(session.spawned_worker_ids, vec!["worker-v131"]);
+        assert_eq!(
+            session.turns[0].collab_spawns[0].new_session_id,
+            "worker-v131"
+        );
+        assert_eq!(session.turns[0].collab_spawns[0].agent_nickname, "Hypatia");
+        let worker = session.turns[0].tool_calls[0]
+            .worker_session
+            .as_ref()
+            .expect("spawn_agent tool call should embed worker session");
+        assert_eq!(worker.id, "worker-v131");
     }
 }
