@@ -111,7 +111,7 @@ fn parse_session_inner(
     // Collect spawned_worker_ids from all turns
     let spawned_worker_ids: Vec<String> = turns
         .iter()
-        .flat_map(|t| t.collab_spawns.iter().map(|s| s.new_thread_id.clone()))
+        .flat_map(|t| t.collab_spawns.iter().map(|s| s.new_session_id.clone()))
         .collect();
 
     // Determine total tokens from last turn's token info
@@ -178,7 +178,7 @@ fn embed_worker_sessions(
                 continue;
             };
 
-            let Some(worker_path) = find_session_file_by_id(parent_path, &spawn.new_thread_id)
+            let Some(worker_path) = find_session_file_by_id(parent_path, &spawn.new_session_id)
             else {
                 continue;
             };
@@ -470,7 +470,7 @@ mod tests {
 
         assert_eq!(session.spawned_worker_ids, vec!["worker-session"]);
         assert_eq!(
-            session.turns[0].collab_spawns[0].new_thread_id,
+            session.turns[0].collab_spawns[0].new_session_id,
             "worker-session"
         );
 
@@ -682,11 +682,16 @@ mod tests {
     // the active profile, and instructions now come via `base_instructions.text` from the
     // profile's system_prompt (the `instructions_file` config key is gone from Codex config).
     // All cases below must parse without panics and produce correct field values.
+    //
+    // Note: As of Codex v0.134.0 (PRs #23883, #24051, #24055, #24059), --profile-v2 was
+    // renamed to --profile and all legacy profile v1 support was removed. See the v0134_*
+    // tests below for the corresponding v0.134.0 verification.
 
     #[test]
     fn v0131_profile_v2_session_parses_correctly() {
-        // session_meta from v0.131.0 with --profile-v2 active: carries `profile` field and
-        // instructions sourced from the profile's system_prompt via base_instructions.text.
+        // session_meta from v0.131.0 with --profile-v2 active (renamed to --profile in
+        // v0.134.0): carries `profile` field and instructions sourced from the profile's
+        // system_prompt via base_instructions.text.
         let tmp = tempdir().unwrap();
         let path = tmp
             .path()
@@ -764,6 +769,145 @@ mod tests {
         let session = parse_session(&path).unwrap();
         assert_eq!(session.id, "v0131-standard");
         assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.131.0 (PR #22268): collab_agent_spawn_end uses new_session_id instead of
+    // new_thread_id. Verify end-to-end: parse_session reads new_session_id, populates
+    // spawned_worker_ids, and embed_worker_sessions correctly stitches the worker session.
+    #[test]
+    fn v0131_parse_session_stitches_worker_via_new_session_id() {
+        let tmp = tempdir().unwrap();
+        let parent_path = tmp
+            .path()
+            .join("rollout-2026-05-18T10-03-00-parent-v131.jsonl");
+        let worker_path = tmp
+            .path()
+            .join("rollout-2026-05-18T10-03-09-worker-v131.jsonl");
+        std::fs::write(
+            &parent_path,
+            [
+                r#"{"timestamp":"2026-05-18T10:03:00Z","type":"session_meta","payload":{"id":"parent-v131","timestamp":"2026-05-18T10:03:00Z","cli_version":"0.131.0"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Gather data\"}","call_id":"call-spawn-v131"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:03Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"call-spawn-v131","sender_session_id":"parent-v131","new_session_id":"worker-v131","new_agent_nickname":"Hypatia","new_agent_role":"worker","prompt":"Gather data","status":"pending_init"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-spawn-v131","output":"{\"agent_id\":\"worker-v131\",\"nickname\":\"Hypatia\"}"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1747562585.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &worker_path,
+            [
+                r#"{"timestamp":"2026-05-18T10:03:09Z","type":"session_meta","payload":{"id":"worker-v131","timestamp":"2026-05-18T10:03:09Z","cli_version":"0.131.0","cwd":"/tmp/worker"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:10Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-worker"}}"#,
+                r#"{"timestamp":"2026-05-18T10:03:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-worker","completed_at":1747562591.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&parent_path).unwrap();
+        assert_eq!(session.id, "parent-v131");
+        assert_eq!(session.spawned_worker_ids, vec!["worker-v131"]);
+        assert_eq!(
+            session.turns[0].collab_spawns[0].new_session_id,
+            "worker-v131"
+        );
+        assert_eq!(session.turns[0].collab_spawns[0].agent_nickname, "Hypatia");
+        let worker = session.turns[0].tool_calls[0]
+            .worker_session
+            .as_ref()
+            .expect("spawn_agent tool call should embed worker session");
+        assert_eq!(worker.id, "worker-v131");
+    }
+
+    // Codex v0.134.0 (PRs #23883, #24051, #24055, #24059): --profile-v2 renamed to --profile;
+    // legacy profile v1 support removed entirely.
+    //
+    // codex-trace reads JSONL session files only — it never invokes `codex` or reads Codex
+    // TOML config. Sessions from v0.134.0+ carry the same `profile` field in session_meta
+    // as v0.131.0+ sessions. The parser is unaffected; these tests confirm v0.134.0
+    // sessions parse correctly and produce the expected field values.
+
+    #[test]
+    fn v0134_profile_session_parses_correctly() {
+        // session_meta from v0.134.0 with --profile active (flag renamed from --profile-v2).
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-26T10-00-00-profile.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-profile","timestamp":"2026-05-26T10:00:00Z","cwd":"/home/user","cli_version":"0.134.0","model_provider":"openai","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254802.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0134-profile");
+        assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
+        assert_eq!(
+            session.instructions.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0134_session_without_profile_parses_correctly() {
+        // v0.134.0 session started without --profile: no `profile` field in session_meta.
+        // parse_session must return None for instructions, not panic.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-26T10-01-00-noprofile.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:01:00Z","type":"session_meta","payload":{"id":"v0134-no-profile","timestamp":"2026-05-26T10:01:00Z","cwd":"/home/user","cli_version":"0.134.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254862.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0134-no-profile");
+        assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
+        assert!(session.instructions.is_none());
+        assert_eq!(session.turns.len(), 1);
+    }
+
+    #[test]
+    fn v0134_legacy_profile_v1_absent_does_not_affect_session_parsing() {
+        // v0.134.0 removed legacy profile v1 support entirely. Since codex-trace reads only
+        // JSONL session files (never Codex TOML config), the removal has no effect on
+        // parsing. Standard v0.134.0 sessions must parse correctly regardless.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-26T10-02-00-v0134.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:02:00Z","type":"session_meta","payload":{"id":"v0134-standard","timestamp":"2026-05-26T10:02:00Z","cwd":"/workspace","cli_version":"0.134.0","model_provider":"openai","profile":"default"}}"#,
+                r#"{"timestamp":"2026-05-26T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+                r#"{"timestamp":"2026-05-26T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/workspace"}}"#,
+                r#"{"timestamp":"2026-05-26T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254924.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0134-standard");
+        assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
         assert_eq!(session.turns.len(), 1);
         assert!(!session.is_ongoing);
     }
