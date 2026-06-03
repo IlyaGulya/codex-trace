@@ -363,6 +363,10 @@ mod tests {
     // PR #22647 made Codex reject the legacy [profiles] TOML section when profile-v2 is active.
     // PR #22724 removed the experimental `instructions_file` config key entirely.
     //
+    // Note: As of Codex v0.134.0 (PRs #23883, #24051, #24055, #24059), --profile-v2 was
+    // renamed to --profile and all legacy profile v1 support was removed. See the v0134_*
+    // tests below for the corresponding v0.134.0 verification.
+    //
     // codex-trace does NOT read Codex CLI config files (TOML profiles). It reads only the
     // JSONL session files at ~/.codex/sessions/. The profile-v2 changes affect what Codex
     // writes into session_meta entries:
@@ -377,8 +381,9 @@ mod tests {
 
     #[test]
     fn v0131_session_meta_with_profile_v2_field_does_not_panic() {
-        // session_meta from a v0.131.0 session started with --profile-v2 active.
-        // The `profile` field names the active profile; codex-trace ignores it gracefully.
+        // session_meta from a v0.131.0 session started with --profile-v2 active (renamed to
+        // --profile in v0.134.0). The `profile` field names the active profile; codex-trace
+        // ignores it gracefully.
         let line = r#"{"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"v0131-profile-v2","timestamp":"2026-05-18T10:00:00Z","cwd":"/tmp","cli_version":"0.131.0","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#;
         let e = RawEntry::parse(line).expect("session_meta with profile-v2 fields must parse");
         assert_eq!(e.entry_type, "session_meta");
@@ -428,6 +433,222 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.131.0");
         assert_eq!(meta.payload["profile"], "default");
+    }
+
+    // Codex v0.131.0 (PRs #21757, #22193): HTTP request header names changed from
+    // underscore form (x_codex_session_id, x_codex_thread_id) to hyphen form
+    // (x-codex-session-id, x-codex-thread-id). These are transport-layer headers sent
+    // by the Codex CLI to the OpenAI API; they are not logged into the JSONL session
+    // files at ~/.codex/sessions/ that codex-trace reads.
+    //
+    // Session IDs are extracted from JSONL payload fields (id, session_id,
+    // thread.sessionId) — the HTTP header rename has no impact on this parser.
+    // This test guards against future regressions where someone mistakenly tries to
+    // read header-name strings from JSONL payloads.
+    #[test]
+    fn v0131_hyphenated_api_headers_do_not_affect_session_id_extraction() {
+        // session_meta payload from a v0.131.0 session — structurally identical to
+        // prior versions. The HTTP header rename is invisible at this layer; the
+        // session ID continues to arrive in the `session_id` payload field.
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"session_id":"sess-hyphen-131","timestamp":"2026-05-18T10:00:00Z","cwd":"/tmp","cli_version":"0.131.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_session_id(&payload), "sess-hyphen-131");
+
+        // Confirm neither underscore nor hyphen header-name strings appear as field
+        // keys — they are HTTP transport details, not JSONL payload keys.
+        assert!(payload.get("x_codex_session_id").is_none());
+        assert!(payload.get("x-codex-session-id").is_none());
+        assert!(payload.get("x_codex_thread_id").is_none());
+        assert!(payload.get("x-codex-thread-id").is_none());
+    }
+
+    // Codex v0.132.0 (PR #22706): "Remove legacy shell output formatting paths".
+    // exec_command_end events no longer carry a `formatted_output` field — output is
+    // exclusively in `aggregated_output`. The JSONL entry types themselves are unchanged;
+    // this regression guard confirms all four standard types parse correctly under v0.132.0
+    // and that exec_command_end events carrying only `aggregated_output` (no `formatted_output`)
+    // are valid JSONL that passes through RawEntry parsing without error.
+    #[test]
+    fn v0132_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-session","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            // exec_command_end with aggregated_output only — formatted_output field absent (removed in v0.132.0)
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606405.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.132.0");
+        // exec_command_end payload must contain aggregated_output and no formatted_output
+        let exec_end = RawEntry::parse(lines[4]).unwrap();
+        assert_eq!(exec_end.payload["type"], "exec_command_end");
+        assert_eq!(exec_end.payload["aggregated_output"], "hello\n");
+        assert!(exec_end.payload.get("formatted_output").is_none());
+    }
+
+    // Codex v0.134.0 (PR #24081): `codex-tui.log` is now opt-in.
+    //
+    // Before v0.134.0, the TUI log file was written unconditionally at its default
+    // path. PR #24081 made this opt-in: the file no longer exists unless the user
+    // explicitly enables TUI logging.
+    //
+    // codex-trace reads session data exclusively from JSONL files at
+    // ~/.codex/sessions/ — it does not read `codex-tui.log`. The opt-in change
+    // therefore has no effect on session parsing or session discovery. Verify that
+    // all four standard JSONL entry types continue to parse correctly for v0.134.0
+    // sessions regardless of whether the TUI log is present on disk.
+
+    #[test]
+    fn v0134_tui_log_opt_in_does_not_affect_jsonl_session_parser() {
+        // Codex v0.134.0 PR #24081 made `codex-tui.log` opt-in. codex-trace reads
+        // session data from JSONL files at ~/.codex/sessions/, not from the TUI log,
+        // so the opt-in change has no effect on parsing. Verify all four standard
+        // entry types produced by a v0.134.0 session parse correctly.
+        let lines = [
+            r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-session","timestamp":"2026-05-26T10:00:00Z","cwd":"/tmp","cli_version":"0.134.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-26T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253604.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.134.0");
+        assert_eq!(meta.payload["id"], "v0134-session");
+    }
+
+    // Codex v0.134.0 (PRs #23883, #24051, #24055, #24059): --profile-v2 renamed to --profile;
+    // legacy profile v1 support removed entirely.
+    //
+    // PRs #23883, #24051, #24055, #24059 promoted --profile to the primary profile selector
+    // and removed all legacy profile v1 resolution and write paths. Passing a legacy profile
+    // selector now returns an error instead of silently falling back. This is a CLI-level
+    // change: codex-trace does NOT invoke `codex` at runtime and does NOT read Codex TOML
+    // config files. Sessions from v0.134.0+ carry the same `profile` field in session_meta
+    // as v0.131.0+ sessions — the only observable difference for codex-trace is the
+    // cli_version bump. The parser is unaffected; these tests confirm v0.134.0 sessions
+    // parse correctly.
+
+    #[test]
+    fn v0134_session_meta_with_profile_field_does_not_panic() {
+        // session_meta from v0.134.0 with --profile active (flag renamed from --profile-v2).
+        // The `profile` field names the active profile; codex-trace reads it gracefully.
+        let line = r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-profile","timestamp":"2026-05-26T10:00:00Z","cwd":"/tmp","cli_version":"0.134.0","profile":"work","base_instructions":{"text":"You are a helpful assistant."}}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with profile field must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0134-profile");
+        assert_eq!(e.payload["cli_version"], "0.134.0");
+        assert_eq!(e.payload["profile"], "work");
+        assert_eq!(
+            e.payload["base_instructions"]["text"],
+            "You are a helpful assistant."
+        );
+    }
+
+    #[test]
+    fn v0134_session_meta_without_profile_does_not_panic() {
+        // v0.134.0 session started without --profile: no `profile` field in session_meta.
+        // The parser must handle the absent field gracefully (opt_str returns None).
+        let line = r#"{"timestamp":"2026-05-26T10:01:00Z","type":"session_meta","payload":{"id":"v0134-no-profile","timestamp":"2026-05-26T10:01:00Z","cwd":"/home/user","cli_version":"0.134.0","model_provider":"openai"}}"#;
+        let e = RawEntry::parse(line).expect("session_meta without profile must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0134-no-profile");
+        assert!(e.payload.get("profile").is_none());
+    }
+
+    #[test]
+    fn v0134_all_standard_entry_types_parse_correctly_with_profile() {
+        // Regression guard: all four standard JSONL entry types must parse under v0.134.0.
+        let lines = [
+            r#"{"timestamp":"2026-05-26T10:02:00Z","type":"session_meta","payload":{"id":"v0134-session-profile","timestamp":"2026-05-26T10:02:00Z","cwd":"/tmp","cli_version":"0.134.0","profile":"default","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-26T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254924.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.134.0");
+        assert_eq!(meta.payload["profile"], "default");
+    }
+
+    // Codex v0.133.0 (PR #22709): TurnContextItem fields trimmed.
+    // turn_context payloads now carry only the fields still used internally; previously
+    // populated fields like cwd and effort may be absent. The loosely-typed RawEntry
+    // model must parse both old (extra fields) and new (trimmed) payloads without error.
+
+    #[test]
+    fn v0133_turn_context_trimmed_payload_parses_as_turn_context_entry() {
+        // v0.133.0 turn_context with minimal payload — only model is present.
+        let line = r#"{"timestamp":"2026-05-21T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5"}}"#;
+        let e = RawEntry::parse(line).expect("turn_context with minimal payload must parse");
+        assert_eq!(e.entry_type, "turn_context");
+        assert_eq!(e.payload["model"], "gpt-5");
+        // cwd and effort are absent — must not panic
+        assert!(e.payload.get("cwd").is_none());
+        assert!(e.payload.get("effort").is_none());
+    }
+
+    #[test]
+    fn v0133_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types must parse under v0.133.0.
+        // turn_context payload is trimmed — only model is present (PR #22709).
+        let lines = [
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/tmp","cli_version":"0.133.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167204.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.133.0");
     }
 
     // Codex v0.135.0 (PR #24591): memory state moved to a dedicated SQLite DB.

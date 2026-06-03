@@ -922,11 +922,16 @@ mod tests {
     // the active profile; `instructions_file` is gone from config so instructions arrive
     // via `base_instructions.text` or are absent entirely. The discover scanner must handle
     // both cases without panicking.
+    //
+    // Note: As of Codex v0.134.0 (PRs #23883, #24051, #24055, #24059), --profile-v2 was
+    // renamed to --profile and all legacy profile v1 support was removed. See the v0134_*
+    // tests below for the corresponding v0.134.0 verification.
 
     #[test]
     fn discover_sessions_v0131_profile_v2_session_discovered_correctly() {
-        // session_meta with profile-v2 `profile` field: discover scanner must not panic
-        // and must populate cli_version correctly from the payload.
+        // session_meta with profile-v2 `profile` field (--profile-v2 renamed to --profile
+        // in v0.134.0): discover scanner must not panic and must populate cli_version
+        // correctly from the payload.
         let tmp = tempdir().unwrap();
         let day_dir = tmp.path().join("2026/05/18");
         std::fs::create_dir_all(&day_dir).unwrap();
@@ -977,6 +982,73 @@ mod tests {
             .find(|s| s.id == "v0131-disc-noinstr")
             .unwrap();
         assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.134.0 (PRs #23883, #24051, #24055, #24059): --profile-v2 renamed to --profile;
+    // legacy profile v1 support removed entirely.
+    //
+    // codex-trace reads JSONL session files only — it never invokes `codex` or reads Codex
+    // TOML config. Sessions from v0.134.0+ carry the same `profile` field in session_meta
+    // as v0.131.0+ sessions. The discover scanner is unaffected; these tests confirm
+    // v0.134.0 sessions are discovered and indexed correctly.
+
+    #[test]
+    fn discover_sessions_v0134_profile_session_discovered_correctly() {
+        // session_meta with --profile active (flag renamed from --profile-v2 in v0.134.0):
+        // discover scanner must not panic and must populate cli_version correctly.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/26");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-26T10-00-00-profile.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-disc-profile","timestamp":"2026-05-26T10:00:00Z","cwd":"/home/user","cli_version":"0.134.0","model_provider":"openai","profile":"work","base_instructions":{"text":"You are helpful."}}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254802.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0134-disc-profile")
+            .unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn discover_sessions_v0134_no_profile_discovered_correctly() {
+        // v0.134.0 session without --profile: no `profile` field in session_meta.
+        // The discover scanner must index the session normally — the absent field has no
+        // effect on discovery (legacy profile v1 removal is transparent to codex-trace).
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/26");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-26T10-01-00-noprofile.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:01:00Z","type":"session_meta","payload":{"id":"v0134-disc-noprofile","timestamp":"2026-05-26T10:01:00Z","cwd":"/home/user","cli_version":"0.134.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748254862.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0134-disc-noprofile")
+            .unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
         assert_eq!(session.turn_count, 1);
         assert!(!session.is_ongoing);
     }
