@@ -67,6 +67,10 @@ export interface CodexToolCall {
   mcp_tool: string | null;
   /** Codex v0.133.0+: identifies which plugin the MCP tool belongs to. Null for pre-v0.133.0 sessions. */
   plugin_id: string | null;
+  /** Codex v0.134.0+ (PR #22882): subagent session ID from hook input identity fields. Null for parent-agent calls and pre-v0.134.0 sessions. */
+  subagent_id: string | null;
+  /** Codex v0.134.0+ (PR #22882): subagent human-readable name from hook input identity fields. Null for parent-agent calls and pre-v0.134.0 sessions. */
+  subagent_name: string | null;
   patch_success: boolean | null;
   patch_changes: Record<string, { type: string; content?: string; unified_diff?: string }> | null;
   web_query: string | null;

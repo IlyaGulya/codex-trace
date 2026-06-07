@@ -28,6 +28,8 @@ function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
     image_prompt: null,
     worker_session: null,
     status: "completed",
+    subagent_id: null,
+    subagent_name: null,
     ...overrides,
   };
 }

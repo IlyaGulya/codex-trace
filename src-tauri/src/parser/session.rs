@@ -983,6 +983,79 @@ mod tests {
         assert!(!session.is_ongoing);
     }
 
+    // Codex v0.134.0 (PR #22882): subagent identity fields added to hook input payloads.
+    //
+    // Tool call end events now optionally carry `subagent_id` and `subagent_name`.
+    // The full parse pipeline must propagate these fields from the JSONL events through
+    // to the ToolCall structs returned in CodexSession.turns[].tool_calls[].
+
+    #[test]
+    fn v0134_parse_session_with_subagent_identity_in_exec_command_end() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-26T10-00-00-v0134sub.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:00:00Z","type":"session_meta","payload":{"id":"v0134-sub-session","timestamp":"2026-05-26T10:00:00Z","cwd":"/tmp","cli_version":"0.134.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello\",\"workdir\":\"/tmp\"}","call_id":"call_sub_1","subagent_id":"worker-sess-abc","subagent_name":"Parfit"}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_sub_1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000},"subagent_id":"worker-sess-abc","subagent_name":"Parfit"}}"#,
+                r#"{"timestamp":"2026-05-26T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253604.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0134-sub-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(tool.subagent_id.as_deref(), Some("worker-sess-abc"));
+        assert_eq!(tool.subagent_name.as_deref(), Some("Parfit"));
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0134_parse_session_without_subagent_identity_fields_is_unaffected() {
+        // Pre-v0.134.0 sessions and parent-agent tool calls must parse normally
+        // with subagent_id/subagent_name defaulting to None on every ToolCall.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-26T10-01-00-v0134nosub.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-26T10:01:00Z","type":"session_meta","payload":{"id":"v0134-no-sub","timestamp":"2026-05-26T10:01:00Z","cwd":"/tmp","cli_version":"0.134.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/tmp\"}","call_id":"call_plain"}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_plain","aggregated_output":"file.txt\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":5000000}}}"#,
+                r#"{"timestamp":"2026-05-26T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253664.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0134-no-sub");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert!(
+            tool.subagent_id.is_none(),
+            "subagent_id must be None for parent-agent calls"
+        );
+        assert!(
+            tool.subagent_name.is_none(),
+            "subagent_name must be None for parent-agent calls"
+        );
+    }
+
     #[test]
     fn v0135_session_without_memories_produces_empty_vec() {
         // Pre-v0.135.0 sessions must parse normally with an empty memories Vec.

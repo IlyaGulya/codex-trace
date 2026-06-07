@@ -669,6 +669,44 @@ mod tests {
         assert_eq!(mems[1], "Project uses TypeScript strict mode");
     }
 
+    // Codex v0.134.0 (PR #22882): subagent identity fields added to hook input payloads.
+    //
+    // PreToolUse and PostToolUse hook inputs now carry `subagent_id` and `subagent_name`
+    // so that tool calls can be attributed to the subagent that produced them in
+    // multi-agent sessions. These fields are additive — the loosely-typed RawEntry model
+    // ignores unknown fields by design, so no deserialization errors can occur regardless
+    // of whether the fields are present.
+
+    #[test]
+    fn v0134_exec_command_end_with_subagent_identity_parses_without_error() {
+        // exec_command_end event carrying the new subagent_id / subagent_name fields
+        // (PostToolUse hook input, logged by Codex ≥ v0.134.0). The RawEntry parser
+        // must accept these fields without panic — they are ignored at this layer and
+        // consumed downstream in toolcall.rs.
+        let line = r#"{"timestamp":"2026-05-26T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","aggregated_output":"ok\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000},"subagent_id":"worker-session-abc","subagent_name":"Parfit"}}"#;
+        let e = RawEntry::parse(line).expect("exec_command_end with subagent fields must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(
+            e.payload.get("type").and_then(|t| t.as_str()),
+            Some("exec_command_end")
+        );
+        // Subagent fields flow through to the payload Value for downstream extraction.
+        assert_eq!(e.payload["subagent_id"], "worker-session-abc");
+        assert_eq!(e.payload["subagent_name"], "Parfit");
+    }
+
+    #[test]
+    fn v0134_function_call_with_subagent_identity_parses_without_error() {
+        // function_call response_item carrying subagent_id / subagent_name (PreToolUse
+        // hook input). Must parse correctly so downstream toolcall.rs can extract the
+        // identity and store it on the resulting ToolCall.
+        let line = r#"{"timestamp":"2026-05-26T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\"}","call_id":"call_sub","subagent_id":"worker-session-xyz","subagent_name":"Noether"}}"#;
+        let e = RawEntry::parse(line).expect("function_call with subagent fields must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["subagent_id"], "worker-session-xyz");
+        assert_eq!(e.payload["subagent_name"], "Noether");
+    }
+
     #[test]
     fn v0135_all_standard_entry_types_parse_correctly() {
         // Regression guard: all four standard JSONL entry types from a v0.135.0 session
