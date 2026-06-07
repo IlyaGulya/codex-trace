@@ -694,4 +694,62 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.135.0");
     }
+
+    // Codex v0.136.0 (PR #24962): shell hook output event schemas tightened.
+    // hook output events are now emitted as event_msg entries with type "shell_hook_output".
+    // The strict schema requires call_id, hook_type, stdout, exit_code; previously nullable
+    // fields (metadata, stderr) are absent rather than null. RawEntry must parse these
+    // as event_msg entries without error.
+
+    #[test]
+    fn v0136_shell_hook_output_parses_as_event_msg() {
+        // v0.136.0 strict schema — no metadata, no stderr fields
+        let line = r#"{"timestamp":"2026-06-01T10:00:00Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-1","hook_type":"pre_exec","stdout":"hook ok\n","exit_code":0,"duration":{"secs":0,"nanos":5000000}}}"#;
+        let e = RawEntry::parse(line).expect("shell_hook_output event must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("shell_hook_output"));
+        assert_eq!(e.payload["hook_type"], "pre_exec");
+        assert_eq!(e.payload["exit_code"], 0);
+    }
+
+    #[test]
+    fn v0136_shell_hook_output_absent_nullable_fields_does_not_panic() {
+        // v0.136.0 tightening: metadata and stderr are absent (not null).
+        // Verify that RawEntry parsing does not panic on the minimal strict payload.
+        let line = r#"{"timestamp":"2026-06-01T10:01:00Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-min","hook_type":"post_mcp","stdout":"","exit_code":0}}"#;
+        let e = RawEntry::parse(line).expect("minimal shell_hook_output must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("shell_hook_output"));
+        // These fields are absent in the v0.136.0 strict schema — must not be present
+        assert!(e.payload.get("metadata").is_none());
+        assert!(e.payload.get("stderr").is_none());
+    }
+
+    #[test]
+    fn v0136_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard entry types plus shell_hook_output must parse
+        // correctly for a v0.136.0 session.
+        let lines = [
+            r#"{"timestamp":"2026-06-01T10:02:00Z","type":"session_meta","payload":{"id":"v0136-session","timestamp":"2026-06-01T10:02:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:04Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-v0136","hook_type":"pre_exec","stdout":"ok\n","exit_code":0}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779325.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.136.0");
+    }
 }

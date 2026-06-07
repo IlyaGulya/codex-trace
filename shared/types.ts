@@ -50,6 +50,8 @@ export type ToolKind =
   | "spawn_agent"
   | "wait_agent"
   | "close_agent"
+  /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */
+  | "shell_hook"
   | "unknown";
 
 export interface CodexToolCall {

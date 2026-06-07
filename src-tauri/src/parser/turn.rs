@@ -579,6 +579,19 @@ fn handle_event_msg(
             }
         }
 
+        // Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
+        // The tightened schema requires call_id, hook_type, stdout, and exit_code; previously
+        // nullable fields (metadata, stderr) are now absent rather than null. Parse only the
+        // stable v0.136.0 fields so both old and new payloads deserialize correctly.
+        "shell_hook_output" => {
+            if let Some(ref tid) = current_turn_id {
+                let builder = tool_builders
+                    .entry(tid.clone())
+                    .or_insert_with(ToolCallBuilder::new);
+                builder.finalize_shell_hook(payload);
+            }
+        }
+
         "thread_name_updated" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
@@ -2477,5 +2490,119 @@ mod tests {
             turns[1].memories,
             vec!["Initial memory", "New memory added"]
         );
+    }
+
+    // Codex v0.136.0 (PR #24962): shell hook output events with tightened schemas.
+    //
+    // PR #24962 enforced a strict contract on hook output event payloads. Previously the
+    // payload could carry nullable extra fields (e.g. `metadata`, `stderr`); the new schema
+    // removes those fields entirely (absent, not null). codex-trace must parse these events
+    // as ShellHook ToolCall entries and must not panic when the previously-nullable fields
+    // are absent.
+
+    #[test]
+    fn v0136_shell_hook_output_pre_exec_parsed_as_shell_hook_tool_call() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-01T10:00:00Z","type":"session_meta","payload":{"id":"v0136-hook","timestamp":"2026-06-01T10:00:00Z","cli_version":"0.136.0"}}"#,
+            r#"{"timestamp":"2026-06-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:00:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-abc","hook_type":"pre_exec","stdout":"pre-hook ran\n","exit_code":0,"duration":{"secs":0,"nanos":4000000}}}"#,
+            r#"{"timestamp":"2026-06-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.call_id, "hook-abc");
+        assert_eq!(tc.name, "pre_exec");
+        assert_eq!(tc.output.as_deref(), Some("pre-hook ran\n"));
+        assert_eq!(tc.exit_code, Some(0));
+        assert_eq!(tc.status, "completed");
+        assert!(tc.duration_secs.is_some());
+    }
+
+    #[test]
+    fn v0136_shell_hook_output_post_exec_failed_is_status_failed() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-01T10:01:00Z","type":"session_meta","payload":{"id":"v0136-hook-fail","timestamp":"2026-06-01T10:01:00Z","cli_version":"0.136.0"}}"#,
+            r#"{"timestamp":"2026-06-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:01:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-fail-1","hook_type":"post_exec","stdout":"hook error output\n","exit_code":1,"duration":{"secs":0,"nanos":2000000}}}"#,
+            r#"{"timestamp":"2026-06-01T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779263.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "post_exec");
+        assert_eq!(tc.exit_code, Some(1));
+        assert_eq!(tc.status, "failed");
+    }
+
+    #[test]
+    fn v0136_shell_hook_output_absent_nullable_fields_does_not_panic() {
+        // v0.136.0 tightening: metadata and stderr are absent (not null). Verify the parser
+        // handles the strictly-shaped payload without panicking or producing garbage data.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-01T10:02:00Z","type":"session_meta","payload":{"id":"v0136-hook-tight","timestamp":"2026-06-01T10:02:00Z","cli_version":"0.136.0"}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // strict v0.136.0 schema: no metadata, no stderr, no duration
+            r#"{"timestamp":"2026-06-01T10:02:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-tight","hook_type":"pre_mcp","stdout":"","exit_code":0}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779323.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "pre_mcp");
+        assert!(tc.output.is_none()); // empty stdout → None
+        assert!(tc.duration_secs.is_none());
+        assert_eq!(tc.status, "completed");
+    }
+
+    #[test]
+    fn v0136_all_standard_entry_types_parse_correctly_with_shell_hook() {
+        // Regression guard: all four standard JSONL entry types plus shell_hook_output must
+        // parse correctly for a v0.136.0 session.
+        let lines = [
+            r#"{"timestamp":"2026-06-01T10:03:00Z","type":"session_meta","payload":{"id":"v0136-session","timestamp":"2026-06-01T10:03:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:04Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-v0136","hook_type":"pre_exec","stdout":"hook ok\n","exit_code":0,"duration":{"secs":0,"nanos":3000000}}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779385.0}}"#,
+        ];
+        let expected_entry_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        for (entry, expected) in parsed.iter().zip(expected_entry_types.iter()) {
+            assert_eq!(
+                entry.entry_type, *expected,
+                "wrong type for: {}",
+                entry.entry_type
+            );
+        }
+
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].kind, ToolKind::ShellHook);
     }
 }

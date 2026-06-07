@@ -15,6 +15,7 @@ import {
   VscLightbulbEmpty,
   VscLinkExternal,
   VscClose,
+  VscBeaker,
 } from "react-icons/vsc";
 import { MdOutlineGeneratingTokens, MdOutlineImage } from "react-icons/md";
 import { GoGitMerge } from "react-icons/go";
@@ -107,4 +108,8 @@ export function PopoutIcon() {
 
 export function CloseIcon() {
   return <VscClose />;
+}
+
+export function HookIcon() {
+  return <VscBeaker className="icon--hook" />;
 }

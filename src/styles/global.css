@@ -2994,6 +2994,9 @@ body {
 .tool-call--collab .tool-call__kind {
   color: var(--collab-badge);
 }
+.tool-call--hook .tool-call__kind {
+  color: var(--icon-hook);
+}
 .tool-call--failed {
   border-color: var(--status-error);
 }
@@ -3236,6 +3239,9 @@ body {
 }
 .tool-call--collab .tool-call__icon {
   color: var(--collab-badge);
+}
+.tool-call--hook .tool-call__icon {
+  color: var(--icon-hook);
 }
 .tool-call__section {
   margin-bottom: 10px;
