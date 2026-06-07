@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod compression;
 pub mod discover;
 pub mod entry;
 pub mod ongoing;

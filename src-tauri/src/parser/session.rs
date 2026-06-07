@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use super::compression::read_session_file;
 use super::entry::{extract_session_id, RawEntry};
 use super::toolcall::ToolKind;
 use super::turn::{build_turns, CodexTurn, TokenInfo, TurnStatus};
@@ -49,7 +49,7 @@ fn parse_session_inner(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<CodexSession, String> {
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let content = read_session_file(path)?;
     let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canonical_path.clone()) {
         return Err(format!(
@@ -223,10 +223,9 @@ fn find_session_file_by_id(anchor_path: &Path, session_id: &str) -> Option<PathB
 }
 
 fn session_file_id(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    BufReader::new(file).lines().take(20).find_map(|line| {
-        let line = line.ok()?;
-        let entry = RawEntry::parse(&line)?;
+    let content = read_session_file(path).ok()?;
+    content.lines().take(20).find_map(|line| {
+        let entry = RawEntry::parse(line)?;
         match entry.entry_type.as_str() {
             "session_meta" => {
                 let id = extract_session_id(&entry.payload);
@@ -980,6 +979,61 @@ mod tests {
                 "Project uses TypeScript strict mode"
             ]
         );
+        assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.137.0 (PRs #25089, #25087): cold session rollout files are now stored
+    // compressed with zstd. parse_session must detect the magic bytes and decompress
+    // transparently before parsing.
+
+    fn compress_zstd(data: &[u8]) -> Vec<u8> {
+        zstd::encode_all(data, 3).expect("zstd compress failed")
+    }
+
+    #[test]
+    fn v0137_parse_session_from_zstd_compressed_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-04T10-00-00-v0137compressed.jsonl");
+        let content = [
+            r#"{"timestamp":"2026-06-04T10:00:00Z","type":"session_meta","payload":{"id":"v0137-zstd-session","timestamp":"2026-06-04T10:00:00Z","cwd":"/project","cli_version":"0.137.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello from compressed session"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748995203.0}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, compress_zstd(content.as_bytes())).unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0137-zstd-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.137.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0137_parse_session_plain_still_works() {
+        // Non-compressed files from older Codex versions must continue to parse correctly.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-04T10-01-00-v0136plain.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-04T10:01:00Z","type":"session_meta","payload":{"id":"v0136-plain-session","timestamp":"2026-06-04T10:01:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748995262.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0136-plain-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.136.0"));
+        assert_eq!(session.turns.len(), 1);
         assert!(!session.is_ongoing);
     }
 
