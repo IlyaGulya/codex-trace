@@ -37,6 +37,11 @@ pub struct CodexSession {
     /// true when the session was started via `codex remote-control` (Codex v0.130.0+, PR #21424).
     /// Detected from originator == "remote-control" or source == "remote-control" in session_meta.
     pub is_headless: bool,
+    /// true when the session contains spawn_agent calls whose metadata was suppressed.
+    /// Codex v0.137.0 (PR #26114) changed hide_spawn_agent_metadata to default true, causing
+    /// function_call_output for spawn_agent to be empty. When this is true, multi-agent
+    /// subagent lineage is absent and users should set hide_spawn_agent_metadata = false.
+    pub has_missing_spawn_metadata: bool,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -81,6 +86,7 @@ fn parse_session_inner(
         path: path.to_string_lossy().to_string(),
         ai_title: None,
         is_headless: false,
+        has_missing_spawn_metadata: false,
     };
 
     // Parse session_meta from first matching entry
@@ -147,6 +153,16 @@ fn parse_session_inner(
         }
     }
 
+    // Codex v0.137.0 (PR #26114): hide_spawn_agent_metadata defaults to true.
+    // When active, spawn_agent function_call_output is empty and collab_agent_spawn_end
+    // events are suppressed, so no spawn metadata is recorded. Detect this by checking
+    // for spawn_agent calls whose output was empty (status "unknown").
+    let has_missing_spawn_metadata = turns.iter().any(|t| {
+        t.tool_calls
+            .iter()
+            .any(|tc| tc.kind == ToolKind::SpawnAgent && tc.status == "unknown")
+    });
+
     embed_worker_sessions(path, &mut turns, visited);
 
     session.turns = turns;
@@ -154,6 +170,7 @@ fn parse_session_inner(
     session.spawned_worker_ids = spawned_worker_ids;
     session.total_tokens = total_tokens;
     session.is_ongoing = is_ongoing;
+    session.has_missing_spawn_metadata = has_missing_spawn_metadata;
 
     visited.remove(&canonical_path);
     Ok(session)
@@ -1003,5 +1020,115 @@ mod tests {
         let session = parse_session(&path).unwrap();
         assert_eq!(session.id, "v0134-no-memories");
         assert!(session.turns[0].memories.is_empty());
+    }
+
+    // Codex v0.137.0 (PR #26114): hide_spawn_agent_metadata now defaults to true.
+    // When active, spawn_agent function_call_output is empty (no agent_id/nickname JSON),
+    // producing a tool call with status "unknown". codex-trace must detect this and set
+    // has_missing_spawn_metadata = true so the UI can warn users to enable the config flag.
+
+    #[test]
+    fn v0137_spawn_agent_with_hidden_metadata_sets_flag() {
+        // Simulates a Codex v0.137.0 session where hide_spawn_agent_metadata = true (default).
+        // The function_call_output for spawn_agent is empty — no agent_id or nickname JSON.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-04T10-00-00-hidden-meta.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-04T10:00:00Z","type":"session_meta","payload":{"id":"v0137-hidden-meta","timestamp":"2026-06-04T10:00:00Z","cwd":"/project","cli_version":"0.137.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-04T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-04T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Do subtask\"}","call_id":"call-spawn-1"}}"#,
+                // Empty output — hide_spawn_agent_metadata = true suppresses the agent_id/nickname JSON
+                r#"{"timestamp":"2026-06-04T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-spawn-1","output":""}}"#,
+                r#"{"timestamp":"2026-06-04T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749034804.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0137-hidden-meta");
+        assert!(
+            session.has_missing_spawn_metadata,
+            "session with empty spawn_agent output must set has_missing_spawn_metadata"
+        );
+        // spawned_worker_ids must be empty — no metadata to stitch workers
+        assert!(session.spawned_worker_ids.is_empty());
+        // The tool call must be classified as SpawnAgent with status unknown
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "spawn_agent");
+        assert_eq!(tool.status, "unknown");
+    }
+
+    #[test]
+    fn v0137_spawn_agent_with_metadata_present_does_not_set_flag() {
+        // Codex v0.137.0 session where hide_spawn_agent_metadata = false (opted back in).
+        // The function_call_output carries full JSON metadata — no warning should fire.
+        let tmp = tempdir().unwrap();
+        let parent_path = tmp
+            .path()
+            .join("rollout-2026-06-04T10-01-00-with-meta.jsonl");
+        let worker_path = tmp.path().join("rollout-2026-06-04T10-01-09-worker.jsonl");
+        std::fs::write(
+            &parent_path,
+            [
+                r#"{"timestamp":"2026-06-04T10:01:00Z","type":"session_meta","payload":{"id":"v0137-with-meta","timestamp":"2026-06-04T10:01:00Z","cwd":"/project","cli_version":"0.137.0"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Do subtask\"}","call_id":"call-spawn-2"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-spawn-2","output":"{\"agent_id\":\"worker-137\",\"nickname\":\"Ada\"}"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749034864.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &worker_path,
+            [
+                r#"{"timestamp":"2026-06-04T10:01:09Z","type":"session_meta","payload":{"id":"worker-137","timestamp":"2026-06-04T10:01:09Z","cwd":"/project/worker"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:10Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-w"}}"#,
+                r#"{"timestamp":"2026-06-04T10:01:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-w","completed_at":1749034871.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&parent_path).unwrap();
+        assert_eq!(session.id, "v0137-with-meta");
+        assert!(
+            !session.has_missing_spawn_metadata,
+            "session with present spawn metadata must not set has_missing_spawn_metadata"
+        );
+        assert_eq!(session.spawned_worker_ids, vec!["worker-137"]);
+    }
+
+    #[test]
+    fn v0137_session_without_spawn_agent_does_not_set_flag() {
+        // Sessions with no spawn_agent calls must never set has_missing_spawn_metadata.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-04T10-02-00-no-spawn.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-04T10:02:00Z","type":"session_meta","payload":{"id":"v0137-no-spawn","timestamp":"2026-06-04T10:02:00Z","cwd":"/project","cli_version":"0.137.0"}}"#,
+                r#"{"timestamp":"2026-06-04T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-04T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\"}","call_id":"call-exec"}}"#,
+                r#"{"timestamp":"2026-06-04T10:02:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-exec","output":"hi\n"}}"#,
+                r#"{"timestamp":"2026-06-04T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749034924.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0137-no-spawn");
+        assert!(
+            !session.has_missing_spawn_metadata,
+            "session without spawn_agent must not set has_missing_spawn_metadata"
+        );
     }
 }

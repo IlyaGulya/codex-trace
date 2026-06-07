@@ -34,6 +34,14 @@ export function InfoBar({ session }: InfoBarProps) {
           <span className="braille-spinner" /> active
         </span>
       )}
+      {session.has_missing_spawn_metadata && (
+        <span
+          className="info-bar__warn"
+          title="Spawn-agent metadata is hidden (Codex v0.137.0+). Set hide_spawn_agent_metadata = false in your Codex config to enable multi-agent trace coverage."
+        >
+          ⚠ spawn metadata hidden
+        </span>
+      )}
     </div>
   );
 }

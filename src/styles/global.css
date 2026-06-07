@@ -667,6 +667,11 @@ body {
   font-size: 12px;
   animation: pulse 1.5s ease-in-out infinite;
 }
+.info-bar__warn {
+  color: var(--context-warn);
+  font-size: 11px;
+  cursor: default;
+}
 
 @keyframes pulse {
   0%,

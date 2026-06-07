@@ -122,6 +122,13 @@ export interface CodexSession {
   path: string;
   /** true when the session was started via `codex remote-control` (Codex v0.130.0+) */
   is_headless: boolean;
+  /**
+   * true when the session contains spawn_agent calls whose output metadata was hidden.
+   * Codex v0.137.0 (PR #26114) changed hide_spawn_agent_metadata to default true.
+   * When true, multi-agent subagent lineage is absent — set hide_spawn_agent_metadata = false
+   * in Codex config to restore full trace coverage.
+   */
+  has_missing_spawn_metadata: boolean;
 }
 
 export interface CodexSessionInfo {
