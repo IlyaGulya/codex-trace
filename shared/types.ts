@@ -29,6 +29,8 @@ export interface CompactionMeta {
   tokens_after: number | null;
   /** Optional human-readable summary of what was compacted. */
   summary: string | null;
+  /** What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested). Null for sessions that predate this field. */
+  compaction_trigger: string | null;
 }
 
 export interface CollabSpawn {

@@ -46,6 +46,9 @@ pub struct CompactionMeta {
     pub tokens_after: Option<u64>,
     /// Optional human-readable summary of what was compacted.
     pub summary: Option<String>,
+    /// What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested).
+    /// Null for sessions that predate this field.
+    pub compaction_trigger: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +252,11 @@ fn handle_event_msg(
                 tokens_after: c.get("tokens_after").and_then(|v| v.as_u64()),
                 summary: c
                     .get("summary")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                compaction_trigger: c
+                    .get("compaction_trigger")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
@@ -2379,6 +2387,49 @@ mod tests {
         assert_eq!(meta.tokens_before, Some(120000));
         assert_eq!(meta.tokens_after, Some(45000));
         assert_eq!(meta.summary.as_deref(), Some("Summarised earlier turns"));
+        assert!(
+            meta.compaction_trigger.is_none(),
+            "compaction_trigger absent from payload must be None"
+        );
+    }
+
+    #[test]
+    fn v0135_compaction_trigger_auto_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T11:00:00Z","type":"session_meta","payload":{"id":"v0135-ctrigger-auto","timestamp":"2026-05-28T11:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":200000,"tokens_after":60000,"compaction_trigger":"auto"}}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748430002.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn v0135_compaction_trigger_manual_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T11:00:00Z","type":"session_meta","payload":{"id":"v0135-ctrigger-manual","timestamp":"2026-05-28T11:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":150000,"tokens_after":50000,"summary":"User-requested compaction","compaction_trigger":"manual"}}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748430002.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("manual"));
+        assert_eq!(meta.summary.as_deref(), Some("User-requested compaction"));
+        assert_eq!(meta.tokens_before, Some(150000));
+        assert_eq!(meta.tokens_after, Some(50000));
     }
 
     #[test]
