@@ -2478,4 +2478,59 @@ mod tests {
             vec!["Initial memory", "New memory added"]
         );
     }
+
+    // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
+    // image_generation function calls must be classified as ImageGeneration with image_prompt
+    // extracted from arguments. The output array may contain bare image_url items (v0.135.0+)
+    // rather than image_span wrappers — the parser must not look for image_span.
+
+    #[test]
+    fn v0135_image_generation_tool_call_classified_as_image_generation() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-img","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img","arguments":"{\"prompt\":\"a sunset over mountains\"}"}}"#,
+            // v0.135.0+: output is a bare image_url item — no image_span wrapper.
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(
+            tool.image_prompt.as_deref(),
+            Some("a sunset over mountains")
+        );
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0135_image_generation_without_wrapper_span_does_not_yield_unknown_kind() {
+        // Before v0.135.0, an image_span wrapper might have been present. With v0.135.0,
+        // it is absent. The kind must be ImageGeneration regardless of output format.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-img2","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img2","arguments":"{\"prompt\":\"a mountain lake\",\"size\":\"1024x1024\"}"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img2","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,xyz"}}]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+
+        let tool = &turns[0].tool_calls[0];
+        assert_ne!(
+            tool.kind,
+            ToolKind::Unknown,
+            "image_generation must not be Unknown"
+        );
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
+    }
 }

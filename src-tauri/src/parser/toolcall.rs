@@ -214,6 +214,46 @@ impl ToolCallBuilder {
                 return;
             }
 
+            // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session
+            // output. Image content is now emitted bare (e.g. {"type":"image_url",...})
+            // rather than wrapped in {"type":"image_span","content":[...]}. Detect
+            // image_generation by function name and extract the prompt from arguments —
+            // never rely on the wrapper span type, which no longer exists in v0.135.0+.
+            if pending.name == "image_generation" {
+                let image_prompt = pending
+                    .arguments
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::ImageGeneration,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt,
+                    worker_session: None,
+                    status: "completed".to_string(),
+                });
+                return;
+            }
+
             if pending.name == "spawn_agent" {
                 self.finalized.push(ToolCall {
                     call_id: call_id.to_string(),
@@ -1149,5 +1189,88 @@ mod tests {
             !old_out.contains("research preview"),
             "banner text leaked into output"
         );
+    }
+
+    // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
+    // Image content is now emitted bare (e.g. {"type":"image_url",...}) rather than wrapped
+    // in {"type":"image_span","content":[...]}. The image_generation function call must be
+    // classified as ImageGeneration with image_prompt extracted from arguments — never from
+    // the output content, since image data is not stored in the text output field.
+
+    #[test]
+    fn image_generation_classified_as_image_generation_kind() {
+        use super::super::super::parser::toolcall::{ToolCallBuilder, ToolKind};
+
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img".to_string(),
+            "image_generation".to_string(),
+            r#"{"prompt":"a sunset over mountains","size":"1024x1024"}"#,
+            None,
+            None,
+            None,
+        );
+
+        // v0.135.0+: output is a bare image_url item (no image_span wrapper).
+        // The text extraction from the content array yields an empty string —
+        // the prompt comes from arguments, not the output.
+        builder.add_function_call_output("call_img", "");
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(
+            tool.image_prompt.as_deref(),
+            Some("a sunset over mountains")
+        );
+        assert_eq!(tool.status, "completed");
+        assert!(
+            tool.output.is_none(),
+            "empty output string should yield None"
+        );
+    }
+
+    #[test]
+    fn image_generation_with_no_prompt_argument_yields_none_image_prompt() {
+        use super::super::super::parser::toolcall::{ToolCallBuilder, ToolKind};
+
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img2".to_string(),
+            "image_generation".to_string(),
+            r#"{"size":"512x512"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_img2", "");
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert!(tool.image_prompt.is_none());
+    }
+
+    #[test]
+    fn image_generation_with_non_empty_output_preserves_output() {
+        use super::super::super::parser::toolcall::{ToolCallBuilder, ToolKind};
+
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img3".to_string(),
+            "image_generation".to_string(),
+            r#"{"prompt":"a mountain lake"}"#,
+            None,
+            None,
+            None,
+        );
+        // If upstream text extraction yields something (future format), preserve it.
+        builder.add_function_call_output("call_img3", "Generated image successfully");
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
+        assert_eq!(tool.output.as_deref(), Some("Generated image successfully"));
     }
 }

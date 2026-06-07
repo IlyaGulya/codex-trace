@@ -694,4 +694,53 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.135.0");
     }
+
+    // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
+    // Before v0.135.0, image content in function_call_output and message response_items was
+    // wrapped in {"type":"image_span","content":[...]}. v0.135.0+ emits bare image items
+    // such as {"type":"image_url","image_url":{"url":"..."}}. The RawEntry parser must pass
+    // through both formats without panicking; downstream classification is in toolcall.rs.
+
+    #[test]
+    fn v0135_function_call_output_with_bare_image_item_does_not_panic() {
+        // v0.135.0+: image_generation output carries a bare image_url item (no image_span wrapper).
+        let line = r#"{"timestamp":"2026-05-28T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}}"#;
+        let e = RawEntry::parse(line).expect("function_call_output with bare image_url must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call_output");
+        assert_eq!(e.payload["call_id"], "call_img");
+        // The output array is accessible and contains one image_url item.
+        let output_arr = e.payload["output"]
+            .as_array()
+            .expect("output must be array");
+        assert_eq!(output_arr.len(), 1);
+        assert_eq!(output_arr[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn v0135_image_generation_session_parses_correctly() {
+        // Full v0.135.0 session with an image_generation tool call.
+        // function_call output contains bare image_url items (no image_span wrapper).
+        let lines = [
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-img-session","timestamp":"2026-05-28T10:00:00Z","cwd":"/project","cli_version":"0.135.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img","arguments":"{\"prompt\":\"a sunset over mountains\"}"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426404.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.135.0");
+        assert_eq!(meta.payload["id"], "v0135-img-session");
+    }
 }
