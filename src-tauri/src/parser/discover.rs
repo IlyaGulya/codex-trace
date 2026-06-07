@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
+use super::compression::read_session_file;
 use super::entry::{extract_session_id, RawEntry};
 use super::spawn::parse_spawn_agent_output;
 
@@ -115,7 +116,7 @@ fn date_group_from_path(path: &Path) -> String {
 
 /// Quickly scan a JSONL file for session metadata without full parsing.
 fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
-    let content = fs::read_to_string(path).ok()?;
+    let content = read_session_file(path).ok()?;
     let mut lines = content.lines().filter(|l| !l.trim().is_empty());
 
     let first_line = lines.next()?;
@@ -1051,5 +1052,76 @@ mod tests {
         assert_eq!(session.cli_version.as_deref(), Some("0.134.0"));
         assert_eq!(session.turn_count, 1);
         assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.137.0 (PRs #25089, #25087): cold session rollout files are now stored
+    // compressed with zstd. discover_sessions must detect and decompress them transparently.
+
+    fn compress_zstd(data: &[u8]) -> Vec<u8> {
+        zstd::encode_all(data, 3).expect("zstd compress failed")
+    }
+
+    #[test]
+    fn discover_sessions_v0137_zstd_compressed_session() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/04");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-04T10-00-00-zstd.jsonl");
+        let content = [
+            r#"{"timestamp":"2026-06-04T10:00:00Z","type":"session_meta","payload":{"id":"v0137-disc-zstd","timestamp":"2026-06-04T10:00:00Z","cwd":"/project","cli_version":"0.137.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748995202.0}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, compress_zstd(content.as_bytes())).unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions.iter().find(|s| s.id == "v0137-disc-zstd").unwrap();
+        assert_eq!(session.cli_version.as_deref(), Some("0.137.0"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn discover_sessions_v0137_plain_and_compressed_coexist() {
+        // Mixed directory: some plain, some compressed — both must be discovered correctly.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/04");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let plain_path = day_dir.join("rollout-2026-06-04T09-00-00-plain.jsonl");
+        std::fs::write(
+            &plain_path,
+            [
+                r#"{"timestamp":"2026-06-04T09:00:00Z","type":"session_meta","payload":{"id":"v0136-plain","timestamp":"2026-06-04T09:00:00Z","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-04T09:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+                r#"{"timestamp":"2026-06-04T09:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1748991602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let compressed_path = day_dir.join("rollout-2026-06-04T10-00-00-compressed.jsonl");
+        let compressed_content = [
+            r#"{"timestamp":"2026-06-04T10:00:00Z","type":"session_meta","payload":{"id":"v0137-compressed","timestamp":"2026-06-04T10:00:00Z","cli_version":"0.137.0"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"timestamp":"2026-06-04T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1748995202.0}}"#,
+        ]
+        .join("\n");
+        std::fs::write(
+            &compressed_path,
+            compress_zstd(compressed_content.as_bytes()),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert!(
+            sessions.iter().any(|s| s.id == "v0136-plain"),
+            "plain session must be found"
+        );
+        assert!(
+            sessions.iter().any(|s| s.id == "v0137-compressed"),
+            "compressed session must be found"
+        );
     }
 }

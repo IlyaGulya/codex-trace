@@ -80,6 +80,7 @@ function makeSession(toolCalls: CodexToolCall[]): CodexSession {
     path: "/tmp/worker.jsonl",
     ai_title: null,
     is_headless: false,
+    has_missing_spawn_metadata: false,
   };
 }
 
