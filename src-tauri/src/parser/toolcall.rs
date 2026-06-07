@@ -15,6 +15,8 @@ pub enum ToolKind {
     SpawnAgent,
     WaitAgent,
     CloseAgent,
+    /// multi-agent v2 task assignment: `assign_task` (Codex < v0.136.0) or `followup_task` (≥ v0.136.0)
+    FollowupTask,
     Unknown,
 }
 
@@ -236,6 +238,35 @@ impl ToolCallBuilder {
                     image_prompt: None,
                     worker_session: None,
                     status: spawn_agent_status(output),
+                });
+                return;
+            }
+
+            // assign_task (Codex < v0.136.0, PR #25267) was renamed to followup_task
+            // (Codex ≥ v0.136.0, PR #25636). Both represent the multi-agent v2 task
+            // assignment tool and are classified as FollowupTask.
+            if pending.name == "assign_task" || pending.name == "followup_task" {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::FollowupTask,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: Some(output.to_string()),
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    worker_session: None,
+                    status: "completed".to_string(),
                 });
                 return;
             }
@@ -1048,7 +1079,7 @@ fn extract_mcp_output(payload: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exec_function_output, parse_mcp_namespace};
+    use super::{parse_exec_function_output, parse_mcp_namespace, ToolCallBuilder, ToolKind};
 
     #[test]
     fn namespace_with_tool_prefix_keeps_full_namespace_as_server() {
@@ -1122,6 +1153,49 @@ mod tests {
             tool.duration_secs.is_some(),
             "duration should be extracted from structured field"
         );
+    }
+
+    // Codex v0.136.0 (PR #25267) renamed the multi-agent v2 assignment tool from
+    // `assign_task` to `followup_task` (v0.137.0, PR #25636). Both names must be
+    // classified as FollowupTask so sessions from all versions display correctly.
+    #[test]
+    fn assign_task_legacy_classified_as_followup_task() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_assign".to_string(),
+            "assign_task".to_string(),
+            r#"{"message":"Please investigate the regression","agent":"worker-1"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_assign", r#"{"status":"accepted"}"#);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::FollowupTask);
+        assert_eq!(tool.name, "assign_task");
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn followup_task_new_name_classified_as_followup_task() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_followup".to_string(),
+            "followup_task".to_string(),
+            r#"{"message":"Continue the analysis","agent":"worker-2"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_followup", r#"{"status":"accepted"}"#);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::FollowupTask);
+        assert_eq!(tool.name, "followup_task");
+        assert_eq!(tool.status, "completed");
     }
 
     #[test]

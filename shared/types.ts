@@ -50,6 +50,8 @@ export type ToolKind =
   | "spawn_agent"
   | "wait_agent"
   | "close_agent"
+  /** multi-agent v2: assign_task (Codex < v0.136.0) or followup_task (≥ v0.136.0) */
+  | "followup_task"
   | "unknown";
 
 export interface CodexToolCall {

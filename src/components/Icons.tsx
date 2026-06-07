@@ -53,6 +53,10 @@ export function CloseAgentIcon() {
   return <AiOutlineRobot className="icon--agents" />;
 }
 
+export function FollowupTaskIcon() {
+  return <AiOutlineRobot className="icon--agents" />;
+}
+
 export function UnknownToolIcon() {
   return <VscTriangleRight className="icon--tool" />;
 }
