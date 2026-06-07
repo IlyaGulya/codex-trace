@@ -22,6 +22,12 @@ pub struct AgentMsg {
     pub phase: Option<String>,
     pub timestamp: String,
     pub is_reasoning: bool,
+    /// Position of this message in the raw entry stream. Tool calls carry a parallel index
+    /// (see `CodexTurn::tool_call_orders`) drawn from the same counter, so the frontend can
+    /// interleave messages and tool calls in true chronological order instead of rendering
+    /// them in separate blocks.
+    #[serde(default)]
+    pub order: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +52,9 @@ pub struct CompactionMeta {
     pub tokens_after: Option<u64>,
     /// Optional human-readable summary of what was compacted.
     pub summary: Option<String>,
+    /// What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested).
+    /// Null for sessions that predate this field.
+    pub compaction_trigger: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +91,12 @@ pub struct CodexTurn {
     pub text_elements: Vec<TextElement>,
     pub agent_messages: Vec<AgentMsg>,
     pub tool_calls: Vec<ToolCall>,
+    /// Display-order index for each tool call, parallel to `tool_calls` (same length, same
+    /// order). The value is the position of the call's first appearance in the raw entry
+    /// stream, matching `AgentMsg::order`, so the frontend can interleave tool calls with
+    /// agent messages instead of dumping all tool calls at the end of the turn.
+    #[serde(default)]
+    pub tool_call_orders: Vec<usize>,
     pub final_answer: Option<String>,
     pub total_tokens: Option<TokenInfo>,
     pub model: Option<String>,
@@ -118,6 +133,7 @@ impl CodexTurn {
             text_elements: Vec::new(),
             agent_messages: Vec::new(),
             tool_calls: Vec::new(),
+            tool_call_orders: Vec::new(),
             final_answer: None,
             total_tokens: None,
             model: None,
@@ -150,8 +166,15 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     });
 
     let mut synthetic_turn_counter = 0u32;
+    // Position of each tool call's first appearance in the raw stream, keyed by call_id.
+    // Gives tool calls the same kind of order index as agent messages so the two can be
+    // interleaved chronologically in the UI.
+    let mut call_order: HashMap<String, usize> = HashMap::new();
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(call_id) = call_id_of(entry) {
+            call_order.entry(call_id).or_insert(index);
+        }
         match entry.entry_type.as_str() {
             "event_msg" => {
                 handle_event_msg(
@@ -161,6 +184,7 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
                     &mut tool_builders,
                     has_task_started,
                     &mut synthetic_turn_counter,
+                    index,
                 );
             }
             "response_item"
@@ -188,6 +212,12 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     for (turn_id, mut builder) in tool_builders {
         builder.drain_pending();
         if let Some(turn) = turns.get_mut(&turn_id) {
+            // Record each call's stream position, parallel to tool_calls. Calls with no
+            // recorded position (should not happen for well-formed sessions) sort last.
+            for tc in &builder.finalized {
+                let order = call_order.get(&tc.call_id).copied().unwrap_or(usize::MAX);
+                turn.tool_call_orders.push(order);
+            }
             turn.tool_calls.extend(builder.finalized);
         }
     }
@@ -197,6 +227,22 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     result
 }
 
+/// Extract a tool call's `call_id` from a raw entry, checking both the parsed payload and the
+/// raw line (different entry shapes carry it in different places). Returns None for entries not
+/// associated with a tool call.
+fn call_id_of(entry: &RawEntry) -> Option<String> {
+    for v in [&entry.payload, &entry.raw] {
+        if let Some(cid) = v
+            .get("call_id")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(cid.to_string());
+        }
+    }
+    None
+}
+
 fn handle_event_msg(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
@@ -204,6 +250,7 @@ fn handle_event_msg(
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
     has_task_started: bool,
     synthetic_counter: &mut u32,
+    index: usize,
 ) {
     let payload = &entry.payload;
     let msg_type = match payload.get("type").and_then(|t| t.as_str()) {
@@ -249,6 +296,11 @@ fn handle_event_msg(
                 tokens_after: c.get("tokens_after").and_then(|v| v.as_u64()),
                 summary: c
                     .get("summary")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                compaction_trigger: c
+                    .get("compaction_trigger")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
@@ -311,6 +363,7 @@ fn handle_event_msg(
                             phase,
                             timestamp: ts.to_string(),
                             is_reasoning: false,
+                            order: index,
                         });
                     }
                 }
@@ -331,6 +384,7 @@ fn handle_event_msg(
                             phase: None,
                             timestamp: ts.to_string(),
                             is_reasoning: true,
+                            order: index,
                         });
                     }
                 }
@@ -576,6 +630,19 @@ fn handle_event_msg(
                     .entry(tid.clone())
                     .or_insert_with(ToolCallBuilder::new);
                 builder.finalize_unknown_end(other, payload);
+            }
+        }
+
+        // Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
+        // The tightened schema requires call_id, hook_type, stdout, and exit_code; previously
+        // nullable fields (metadata, stderr) are now absent rather than null. Parse only the
+        // stable v0.136.0 fields so both old and new payloads deserialize correctly.
+        "shell_hook_output" => {
+            if let Some(ref tid) = current_turn_id {
+                let builder = tool_builders
+                    .entry(tid.clone())
+                    .or_insert_with(ToolCallBuilder::new);
+                builder.finalize_shell_hook(payload);
             }
         }
 
@@ -1009,6 +1076,40 @@ mod tests {
             .iter()
             .filter_map(|line| RawEntry::parse(line))
             .collect()
+    }
+
+    #[test]
+    fn orders_messages_and_tool_calls_by_stream_position() {
+        // A tool call that happens between two agent messages must sort between them, so the
+        // UI can render it inline instead of dumping all tool calls at the end of the turn.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-04-27T04:53:00Z","type":"session_meta","payload":{"id":"s","timestamp":"2026-04-27T04:53:00Z"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:02Z","type":"event_msg","payload":{"type":"agent_message","message":"FIRST"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call_exec"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec","output":"Output:\nhi\nProcess exited with code 0\n"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:05Z","type":"event_msg","payload":{"type":"agent_message","message":"SECOND"}}"#,
+            r#"{"timestamp":"2026-04-27T04:53:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1777279986.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.agent_messages.len(), 2);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_call_orders.len(), turn.tool_calls.len());
+
+        let first_msg_order = turn.agent_messages[0].order;
+        let second_msg_order = turn.agent_messages[1].order;
+        let tool_order = turn.tool_call_orders[0];
+        assert!(
+            first_msg_order < tool_order,
+            "tool call ({tool_order}) should sort after the first message ({first_msg_order})"
+        );
+        assert!(
+            tool_order < second_msg_order,
+            "tool call ({tool_order}) should sort before the second message ({second_msg_order})"
+        );
     }
 
     #[test]
@@ -2379,6 +2480,49 @@ mod tests {
         assert_eq!(meta.tokens_before, Some(120000));
         assert_eq!(meta.tokens_after, Some(45000));
         assert_eq!(meta.summary.as_deref(), Some("Summarised earlier turns"));
+        assert!(
+            meta.compaction_trigger.is_none(),
+            "compaction_trigger absent from payload must be None"
+        );
+    }
+
+    #[test]
+    fn v0135_compaction_trigger_auto_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T11:00:00Z","type":"session_meta","payload":{"id":"v0135-ctrigger-auto","timestamp":"2026-05-28T11:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":200000,"tokens_after":60000,"compaction_trigger":"auto"}}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748430002.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn v0135_compaction_trigger_manual_is_captured() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T11:00:00Z","type":"session_meta","payload":{"id":"v0135-ctrigger-manual","timestamp":"2026-05-28T11:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":150000,"tokens_after":50000,"summary":"User-requested compaction","compaction_trigger":"manual"}}}"#,
+            r#"{"timestamp":"2026-05-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748430002.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("manual"));
+        assert_eq!(meta.summary.as_deref(), Some("User-requested compaction"));
+        assert_eq!(meta.tokens_before, Some(150000));
+        assert_eq!(meta.tokens_after, Some(50000));
     }
 
     #[test]
@@ -2477,5 +2621,174 @@ mod tests {
             turns[1].memories,
             vec!["Initial memory", "New memory added"]
         );
+    }
+
+    // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
+    // image_generation function calls must be classified as ImageGeneration with image_prompt
+    // extracted from arguments. The output array may contain bare image_url items (v0.135.0+)
+    // rather than image_span wrappers — the parser must not look for image_span.
+
+    #[test]
+    fn v0135_image_generation_tool_call_classified_as_image_generation() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-img","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img","arguments":"{\"prompt\":\"a sunset over mountains\"}"}}"#,
+            // v0.135.0+: output is a bare image_url item — no image_span wrapper.
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(
+            tool.image_prompt.as_deref(),
+            Some("a sunset over mountains")
+        );
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0135_image_generation_without_wrapper_span_does_not_yield_unknown_kind() {
+        // Before v0.135.0, an image_span wrapper might have been present. With v0.135.0,
+        // it is absent. The kind must be ImageGeneration regardless of output format.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-img2","timestamp":"2026-05-28T10:00:00Z","cli_version":"0.135.0"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img2","arguments":"{\"prompt\":\"a mountain lake\",\"size\":\"1024x1024\"}"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img2","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,xyz"}}]}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+
+        let tool = &turns[0].tool_calls[0];
+        assert_ne!(
+            tool.kind,
+            ToolKind::Unknown,
+            "image_generation must not be Unknown"
+        );
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
+    }
+
+    // Codex v0.136.0 (PR #24962): shell hook output events with tightened schemas.
+    //
+    // PR #24962 enforced a strict contract on hook output event payloads. Previously the
+    // payload could carry nullable extra fields (e.g. `metadata`, `stderr`); the new schema
+    // removes those fields entirely (absent, not null). codex-trace must parse these events
+    // as ShellHook ToolCall entries and must not panic when the previously-nullable fields
+    // are absent.
+
+    #[test]
+    fn v0136_shell_hook_output_pre_exec_parsed_as_shell_hook_tool_call() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-01T10:00:00Z","type":"session_meta","payload":{"id":"v0136-hook","timestamp":"2026-06-01T10:00:00Z","cli_version":"0.136.0"}}"#,
+            r#"{"timestamp":"2026-06-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:00:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-abc","hook_type":"pre_exec","stdout":"pre-hook ran\n","exit_code":0,"duration":{"secs":0,"nanos":4000000}}}"#,
+            r#"{"timestamp":"2026-06-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.call_id, "hook-abc");
+        assert_eq!(tc.name, "pre_exec");
+        assert_eq!(tc.output.as_deref(), Some("pre-hook ran\n"));
+        assert_eq!(tc.exit_code, Some(0));
+        assert_eq!(tc.status, "completed");
+        assert!(tc.duration_secs.is_some());
+    }
+
+    #[test]
+    fn v0136_shell_hook_output_post_exec_failed_is_status_failed() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-01T10:01:00Z","type":"session_meta","payload":{"id":"v0136-hook-fail","timestamp":"2026-06-01T10:01:00Z","cli_version":"0.136.0"}}"#,
+            r#"{"timestamp":"2026-06-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:01:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-fail-1","hook_type":"post_exec","stdout":"hook error output\n","exit_code":1,"duration":{"secs":0,"nanos":2000000}}}"#,
+            r#"{"timestamp":"2026-06-01T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779263.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "post_exec");
+        assert_eq!(tc.exit_code, Some(1));
+        assert_eq!(tc.status, "failed");
+    }
+
+    #[test]
+    fn v0136_shell_hook_output_absent_nullable_fields_does_not_panic() {
+        // v0.136.0 tightening: metadata and stderr are absent (not null). Verify the parser
+        // handles the strictly-shaped payload without panicking or producing garbage data.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-01T10:02:00Z","type":"session_meta","payload":{"id":"v0136-hook-tight","timestamp":"2026-06-01T10:02:00Z","cli_version":"0.136.0"}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // strict v0.136.0 schema: no metadata, no stderr, no duration
+            r#"{"timestamp":"2026-06-01T10:02:02Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-tight","hook_type":"pre_mcp","stdout":"","exit_code":0}}"#,
+            r#"{"timestamp":"2026-06-01T10:02:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779323.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "pre_mcp");
+        assert!(tc.output.is_none()); // empty stdout → None
+        assert!(tc.duration_secs.is_none());
+        assert_eq!(tc.status, "completed");
+    }
+
+    #[test]
+    fn v0136_all_standard_entry_types_parse_correctly_with_shell_hook() {
+        // Regression guard: all four standard JSONL entry types plus shell_hook_output must
+        // parse correctly for a v0.136.0 session.
+        let lines = [
+            r#"{"timestamp":"2026-06-01T10:03:00Z","type":"session_meta","payload":{"id":"v0136-session","timestamp":"2026-06-01T10:03:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:04Z","type":"event_msg","payload":{"type":"shell_hook_output","call_id":"hook-v0136","hook_type":"pre_exec","stdout":"hook ok\n","exit_code":0,"duration":{"secs":0,"nanos":3000000}}}"#,
+            r#"{"timestamp":"2026-06-01T10:03:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779385.0}}"#,
+        ];
+        let expected_entry_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        for (entry, expected) in parsed.iter().zip(expected_entry_types.iter()) {
+            assert_eq!(
+                entry.entry_type, *expected,
+                "wrong type for: {}",
+                entry.entry_type
+            );
+        }
+
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].kind, ToolKind::ShellHook);
     }
 }

@@ -31,6 +31,7 @@ function makeSession(overrides: Partial<CodexSession> = {}): CodexSession {
     path: "/sessions/2026/04/26/rollout-abc.jsonl",
     ai_title: null,
     is_headless: false,
+    has_missing_spawn_metadata: false,
     ...overrides,
   };
 }
@@ -79,5 +80,16 @@ describe("InfoBar", () => {
   it("omits branch when git is null", () => {
     render(<InfoBar session={makeSession({ git: null })} />);
     expect(screen.queryByText("main")).not.toBeInTheDocument();
+  });
+
+  // Codex v0.137.0 (PR #26114): hide_spawn_agent_metadata defaults to true.
+  it("shows spawn metadata warning when has_missing_spawn_metadata is true", () => {
+    render(<InfoBar session={makeSession({ has_missing_spawn_metadata: true })} />);
+    expect(screen.getByText(/spawn metadata hidden/)).toBeInTheDocument();
+  });
+
+  it("does not show spawn metadata warning when has_missing_spawn_metadata is false", () => {
+    render(<InfoBar session={makeSession({ has_missing_spawn_metadata: false })} />);
+    expect(screen.queryByText(/spawn metadata hidden/)).not.toBeInTheDocument();
   });
 });

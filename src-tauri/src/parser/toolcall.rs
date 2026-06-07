@@ -15,6 +15,10 @@ pub enum ToolKind {
     SpawnAgent,
     WaitAgent,
     CloseAgent,
+    /// multi-agent v2 task assignment: `assign_task` (Codex < v0.136.0) or `followup_task` (≥ v0.136.0)
+    FollowupTask,
+    /// Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
+    ShellHook,
     Unknown,
 }
 
@@ -222,6 +226,48 @@ impl ToolCallBuilder {
                 return;
             }
 
+            // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session
+            // output. Image content is now emitted bare (e.g. {"type":"image_url",...})
+            // rather than wrapped in {"type":"image_span","content":[...]}. Detect
+            // image_generation by function name and extract the prompt from arguments —
+            // never rely on the wrapper span type, which no longer exists in v0.135.0+.
+            if pending.name == "image_generation" {
+                let image_prompt = pending
+                    .arguments
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::ImageGeneration,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt,
+                    worker_session: None,
+                    status: "completed".to_string(),
+                    subagent_id: None,
+                    subagent_name: None,
+                });
+                return;
+            }
+
             if pending.name == "spawn_agent" {
                 self.finalized.push(ToolCall {
                     call_id: call_id.to_string(),
@@ -244,6 +290,37 @@ impl ToolCallBuilder {
                     image_prompt: None,
                     worker_session: None,
                     status: spawn_agent_status(output),
+                    subagent_id: None,
+                    subagent_name: None,
+                });
+                return;
+            }
+
+            // assign_task (Codex < v0.136.0, PR #25267) was renamed to followup_task
+            // (Codex ≥ v0.136.0, PR #25636). Both represent the multi-agent v2 task
+            // assignment tool and are classified as FollowupTask.
+            if pending.name == "assign_task" || pending.name == "followup_task" {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::FollowupTask,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: Some(output.to_string()),
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    worker_session: None,
+                    status: "completed".to_string(),
                     subagent_id: None,
                     subagent_name: None,
                 });
@@ -688,6 +765,58 @@ impl ToolCallBuilder {
         });
     }
 
+    /// Finalize a shell_hook_output event (Codex v0.136.0, PR #24962).
+    ///
+    /// The v0.136.0 tightened schema requires: call_id, hook_type, stdout, exit_code.
+    /// Fields that were previously null (metadata, stderr) are now absent — read only
+    /// the stable fields so older null-padded payloads also parse correctly.
+    pub fn finalize_shell_hook(&mut self, payload: &Value) {
+        let call_id = str_field(payload, "call_id");
+        let hook_type = str_field(payload, "hook_type");
+        let stdout = payload
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let exit_code = payload
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let duration_secs = parse_duration(payload);
+        let status = if exit_code.map(|c| c != 0).unwrap_or(false) {
+            "failed"
+        } else {
+            "completed"
+        }
+        .to_string();
+        let (subagent_id, subagent_name) = extract_subagent_identity(payload);
+
+        self.finalized.push(ToolCall {
+            call_id,
+            kind: ToolKind::ShellHook,
+            name: hook_type,
+            arguments: Value::Object(serde_json::Map::new()),
+            input_text: None,
+            output: stdout,
+            exit_code,
+            command: None,
+            cwd: None,
+            duration_secs,
+            mcp_server: None,
+            mcp_tool: None,
+            plugin_id: None,
+            patch_success: None,
+            patch_changes: None,
+            web_query: None,
+            web_url: None,
+            image_prompt: None,
+            worker_session: None,
+            status,
+            subagent_id,
+            subagent_name,
+        });
+    }
+
     /// Catch-all for any unrecognised *_end event — preserves name from pending.
     pub fn finalize_unknown_end(&mut self, event_type: &str, payload: &Value) {
         let call_id = str_field(payload, "call_id");
@@ -1111,7 +1240,8 @@ fn extract_mcp_output(payload: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exec_function_output, parse_mcp_namespace};
+    use super::{parse_exec_function_output, parse_mcp_namespace, ToolCallBuilder, ToolKind};
+    use serde_json::json;
 
     #[test]
     fn namespace_with_tool_prefix_keeps_full_namespace_as_server() {
@@ -1153,9 +1283,6 @@ mod tests {
     // must not require `formatted_output` to be present.
     #[test]
     fn exec_command_end_v0132_reads_aggregated_output_without_formatted_output() {
-        use super::super::super::parser::toolcall::ToolCallBuilder;
-        use serde_json::json;
-
         let mut builder = ToolCallBuilder::new();
         builder.add_function_call(
             "call_1".to_string(),
@@ -1185,6 +1312,49 @@ mod tests {
             tool.duration_secs.is_some(),
             "duration should be extracted from structured field"
         );
+    }
+
+    // Codex v0.136.0 (PR #25267) renamed the multi-agent v2 assignment tool from
+    // `assign_task` to `followup_task` (v0.137.0, PR #25636). Both names must be
+    // classified as FollowupTask so sessions from all versions display correctly.
+    #[test]
+    fn assign_task_legacy_classified_as_followup_task() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_assign".to_string(),
+            "assign_task".to_string(),
+            r#"{"message":"Please investigate the regression","agent":"worker-1"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_assign", r#"{"status":"accepted"}"#);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::FollowupTask);
+        assert_eq!(tool.name, "assign_task");
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn followup_task_new_name_classified_as_followup_task() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_followup".to_string(),
+            "followup_task".to_string(),
+            r#"{"message":"Continue the analysis","agent":"worker-2"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_followup", r#"{"status":"accepted"}"#);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::FollowupTask);
+        assert_eq!(tool.name, "followup_task");
+        assert_eq!(tool.status, "completed");
     }
 
     #[test]
@@ -1226,9 +1396,6 @@ mod tests {
 
     #[test]
     fn v0134_exec_command_end_with_subagent_identity_populates_tool_call() {
-        use super::super::super::parser::toolcall::ToolCallBuilder;
-        use serde_json::json;
-
         let mut builder = ToolCallBuilder::new();
         builder.add_function_call(
             "call_exec_sub".to_string(),
@@ -1264,9 +1431,6 @@ mod tests {
         // Codex v0.134.0 (PR #22882): subagent_id/subagent_name are present on PostToolUse
         // hook input data, which is included in mcp_tool_call_end event payloads. The parser
         // must extract these fields from the end event and populate ToolCall accordingly.
-        use super::super::super::parser::toolcall::ToolCallBuilder;
-        use serde_json::json;
-
         let mut builder = ToolCallBuilder::new();
         builder.add_function_call(
             "call_mcp_sub".to_string(),
@@ -1297,9 +1461,6 @@ mod tests {
     fn v0134_absent_subagent_fields_default_to_none() {
         // Pre-v0.134.0 sessions and parent-agent tool calls must have None for both
         // subagent fields — existing logic must be backward-compatible.
-        use super::super::super::parser::toolcall::ToolCallBuilder;
-        use serde_json::json;
-
         let mut builder = ToolCallBuilder::new();
         builder.add_function_call(
             "call_no_sub".to_string(),
@@ -1330,5 +1491,153 @@ mod tests {
             tool.subagent_name.is_none(),
             "subagent_name must be None when absent"
         );
+    }
+
+    // Codex v0.136.0 (PR #24962): shell hook output events with the tightened schema.
+    // The v0.136.0 schema enforces: call_id, hook_type, stdout, exit_code.
+    // Fields previously present as null (metadata, stderr) are now absent entirely.
+
+    #[test]
+    fn shell_hook_output_v0136_pre_exec_classified_as_shell_hook() {
+        let mut builder = ToolCallBuilder::new();
+        // v0.136.0 strict schema: no metadata or stderr fields
+        let payload = json!({
+            "call_id": "hook-call-1",
+            "hook_type": "pre_exec",
+            "stdout": "hook ran ok\n",
+            "exit_code": 0,
+            "duration": {"secs": 0, "nanos": 5_000_000u64}
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.call_id, "hook-call-1");
+        assert_eq!(tc.name, "pre_exec");
+        assert_eq!(tc.output.as_deref(), Some("hook ran ok\n"));
+        assert_eq!(tc.exit_code, Some(0));
+        assert_eq!(tc.status, "completed");
+        assert!(tc.duration_secs.is_some());
+    }
+
+    #[test]
+    fn shell_hook_output_v0136_post_exec_failed_hook() {
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-call-2",
+            "hook_type": "post_exec",
+            "stdout": "hook failed with error\n",
+            "exit_code": 1,
+            "duration": {"secs": 0, "nanos": 2_000_000u64}
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "post_exec");
+        assert_eq!(tc.exit_code, Some(1));
+        assert_eq!(tc.status, "failed");
+    }
+
+    #[test]
+    fn shell_hook_output_v0136_absent_fields_not_null() {
+        // v0.136.0 tightening: previously-null fields (metadata, stderr) are now absent.
+        // Verify finalize_shell_hook does not panic when those fields are absent.
+        let mut builder = ToolCallBuilder::new();
+        let payload = json!({
+            "call_id": "hook-call-3",
+            "hook_type": "pre_mcp",
+            "stdout": "",
+            "exit_code": 0
+            // no duration, no metadata, no stderr — strict v0.136.0 schema
+        });
+        builder.finalize_shell_hook(&payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tc = &builder.finalized[0];
+        assert_eq!(tc.kind, ToolKind::ShellHook);
+        assert_eq!(tc.name, "pre_mcp");
+        assert!(tc.output.is_none()); // empty stdout → None
+        assert!(tc.duration_secs.is_none());
+        assert_eq!(tc.status, "completed");
+    }
+
+    // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
+    // Image content is now emitted bare (e.g. {"type":"image_url",...}) rather than wrapped
+    // in {"type":"image_span","content":[...]}. The image_generation function call must be
+    // classified as ImageGeneration with image_prompt extracted from arguments — never from
+    // the output content, since image data is not stored in the text output field.
+
+    #[test]
+    fn image_generation_classified_as_image_generation_kind() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img".to_string(),
+            "image_generation".to_string(),
+            r#"{"prompt":"a sunset over mountains","size":"1024x1024"}"#,
+            None,
+            None,
+            None,
+        );
+
+        // v0.135.0+: output is a bare image_url item (no image_span wrapper).
+        // The text extraction from the content array yields an empty string —
+        // the prompt comes from arguments, not the output.
+        builder.add_function_call_output("call_img", "");
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(
+            tool.image_prompt.as_deref(),
+            Some("a sunset over mountains")
+        );
+        assert_eq!(tool.status, "completed");
+        assert!(
+            tool.output.is_none(),
+            "empty output string should yield None"
+        );
+    }
+
+    #[test]
+    fn image_generation_with_no_prompt_argument_yields_none_image_prompt() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img2".to_string(),
+            "image_generation".to_string(),
+            r#"{"size":"512x512"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_img2", "");
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert!(tool.image_prompt.is_none());
+    }
+
+    #[test]
+    fn image_generation_with_non_empty_output_preserves_output() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img3".to_string(),
+            "image_generation".to_string(),
+            r#"{"prompt":"a mountain lake"}"#,
+            None,
+            None,
+            None,
+        );
+        // If upstream text extraction yields something (future format), preserve it.
+        builder.add_function_call_output("call_img3", "Generated image successfully");
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
+        assert_eq!(tool.output.as_deref(), Some("Generated image successfully"));
     }
 }

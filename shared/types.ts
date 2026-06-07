@@ -19,6 +19,9 @@ export interface AgentMessage {
   phase: "commentary" | "final_answer" | null;
   timestamp: string;
   is_reasoning: boolean;
+  /** Position in the raw entry stream. `CodexTurn.tool_call_orders` uses the same scale, so
+   * the UI can interleave messages and tool calls chronologically. Absent for old cached data. */
+  order?: number;
 }
 
 /** Codex v0.135.0 (PR #24368): compaction metadata from turn headers. */
@@ -29,6 +32,8 @@ export interface CompactionMeta {
   tokens_after: number | null;
   /** Optional human-readable summary of what was compacted. */
   summary: string | null;
+  /** What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested). Null for sessions that predate this field. */
+  compaction_trigger: string | null;
 }
 
 export interface CollabSpawn {
@@ -50,6 +55,10 @@ export type ToolKind =
   | "spawn_agent"
   | "wait_agent"
   | "close_agent"
+  /** multi-agent v2: assign_task (Codex < v0.136.0) or followup_task (≥ v0.136.0) */
+  | "followup_task"
+  /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */
+  | "shell_hook"
   | "unknown";
 
 export interface CodexToolCall {
@@ -89,6 +98,9 @@ export interface CodexTurn {
   user_message: string | null;
   agent_messages: AgentMessage[];
   tool_calls: CodexToolCall[];
+  /** Display-order index for each tool call, parallel to `tool_calls` (same length/order).
+   * Same scale as `AgentMessage.order`. Absent for old cached data. */
+  tool_call_orders?: number[];
   final_answer: string | null;
   total_tokens: TokenInfo | null;
   model: string | null;
@@ -126,6 +138,13 @@ export interface CodexSession {
   path: string;
   /** true when the session was started via `codex remote-control` (Codex v0.130.0+) */
   is_headless: boolean;
+  /**
+   * true when the session contains spawn_agent calls whose output metadata was hidden.
+   * Codex v0.137.0 (PR #26114) changed hide_spawn_agent_metadata to default true.
+   * When true, multi-agent subagent lineage is absent — set hide_spawn_agent_metadata = false
+   * in Codex config to restore full trace coverage.
+   */
+  has_missing_spawn_metadata: boolean;
 }
 
 export interface CodexSessionInfo {

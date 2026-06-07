@@ -15,6 +15,7 @@ import {
   VscLightbulbEmpty,
   VscLinkExternal,
   VscClose,
+  VscBeaker,
 } from "react-icons/vsc";
 import { MdOutlineGeneratingTokens, MdOutlineImage } from "react-icons/md";
 import { GoGitMerge } from "react-icons/go";
@@ -50,6 +51,10 @@ export function WaitIcon() {
 }
 
 export function CloseAgentIcon() {
+  return <AiOutlineRobot className="icon--agents" />;
+}
+
+export function FollowupTaskIcon() {
   return <AiOutlineRobot className="icon--agents" />;
 }
 
@@ -107,4 +112,8 @@ export function PopoutIcon() {
 
 export function CloseIcon() {
   return <VscClose />;
+}
+
+export function HookIcon() {
+  return <VscBeaker className="icon--hook" />;
 }
