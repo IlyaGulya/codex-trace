@@ -446,6 +446,36 @@ impl ToolCallBuilder {
         let status = str_field(payload, "status");
 
         let (subagent_id, subagent_name) = extract_subagent_identity(payload);
+
+        // When function_call_output already finalized an ExecCommand for this call_id
+        // (v0.132.0+ sessions where both entries appear), backfill the structured
+        // metadata from exec_command_end rather than creating a duplicate entry.
+        // exec_command_end carries authoritative exit_code, duration, command, cwd, and
+        // status; function_call_output carries the full raw output text.
+        if let Some(existing) = self
+            .finalized
+            .iter_mut()
+            .find(|tc| tc.call_id == call_id && tc.kind == ToolKind::ExecCommand)
+        {
+            existing.exit_code = exit_code;
+            existing.duration_secs = duration_secs;
+            if command.is_some() {
+                existing.command = command;
+            }
+            if cwd.is_some() {
+                existing.cwd = cwd;
+            }
+            existing.status = status;
+            existing.subagent_id = subagent_id;
+            existing.subagent_name = subagent_name;
+            // Prefer existing output from function_call_output (full raw text); fall back
+            // to aggregated_output only if no output was captured yet.
+            if existing.output.is_none() {
+                existing.output = output;
+            }
+            return;
+        }
+
         self.finalized.push(ToolCall {
             call_id,
             kind: ToolKind::ExecCommand,
@@ -994,28 +1024,29 @@ fn session_id_from_arguments(arguments: &Value) -> Option<String> {
 }
 
 fn parse_exec_function_output(output: &str) -> ExecFunctionOutput {
-    // Codex v0.133.0+ (PR #23564): code-mode exec output is preserved raw unless an
-    // explicit output token limit is requested. Raw output has no "Output:" structural
-    // marker and therefore no embedded metadata footer. Restrict exit-code and wall-time
-    // extraction to structured (marker-bearing) output to prevent false positives when
-    // raw command content happens to contain phrases like "exit code: 0" or "wall time".
-    // parse_running_session_id and likely_running_output are still applied to all output:
-    // PTY interactive sessions emit "Session ID: …" and "running" status without the
-    // "Output:" wrapper, and that PTY detection must continue to work.
-    let is_structured = payload_after_output_marker(output).is_some();
-
-    let duration_secs = if is_structured {
-        parse_wall_time(output)
-    } else {
-        None
-    };
-    let exit_code = if is_structured {
-        parse_process_exit_code(output)
-    } else {
-        None
-    };
-    let running_session_id = parse_running_session_id(output);
     let tool_output = display_output(output);
+
+    // Exit code, duration, and running session id extraction only apply to the old
+    // SDK-format output that contains an "Output:" marker line. v0.132.0 (PR #22706)
+    // switched function_call_output to plain raw text; v0.133.0 (PR #23564) preserves
+    // exec output in full without truncation, so large blobs now routinely contain
+    // phrases such as "exit code" or "wall time" inside actual command output (compiler
+    // errors, benchmarks, test runners). Scanning raw content for these patterns without
+    // the marker guard produces false-positive exit codes and durations.
+    // `likely_running_output` is intentionally kept active for all formats: it enables
+    // write_stdin PTY output merging when the output text signals a running process,
+    // even when the old SDK "Output:" header is absent.
+    let has_output_marker = payload_after_output_marker(output).is_some();
+    let (exit_code, duration_secs, running_session_id) = if has_output_marker {
+        (
+            parse_process_exit_code(output),
+            parse_wall_time(output),
+            parse_running_session_id(output),
+        )
+    } else {
+        (None, None, None)
+    };
+
     let status = if exit_code.map(|code| code != 0).unwrap_or(false) {
         "failed"
     } else if running_session_id.is_some() || likely_running_output(output, exit_code) {
@@ -1373,6 +1404,89 @@ mod tests {
         assert_eq!(tool.kind, ToolKind::FollowupTask);
         assert_eq!(tool.name, "followup_task");
         assert_eq!(tool.status, "completed");
+    }
+
+    // Codex v0.133.0 (PR #23564): exec output is now preserved in raw form (no truncation).
+    // function_call_output for exec_command may therefore be a large, unstructured blob
+    // containing phrases such as "exit code" or "wall time" as part of actual command output
+    // (compiler errors, benchmarks, test results). The parser must not extract false-positive
+    // metadata from such blobs — metadata only comes from the structured exec_command_end event.
+
+    #[test]
+    fn v0133_raw_exec_output_with_exit_code_in_content_does_not_false_positive() {
+        // Compiler-style output that mentions "exit code" inline — should NOT be parsed as
+        // the process exit code since there is no "Output:" structured-format marker.
+        let output = "error[E0505]: process exited with exit code 1\ncompilation failed\n";
+        let result = parse_exec_function_output(output);
+        assert_eq!(
+            result.exit_code, None,
+            "raw output with 'exit code' in content must not yield a false-positive exit_code"
+        );
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.output.as_deref(), Some(output));
+    }
+
+    #[test]
+    fn v0133_raw_exec_output_with_wall_time_in_content_does_not_false_positive() {
+        // Benchmark output with "wall time" in the text — must not be parsed as duration.
+        let output = "benchmark result: wall time 2.5 seconds per iteration\ntest passed\n";
+        let result = parse_exec_function_output(output);
+        assert_eq!(
+            result.duration_secs, None,
+            "raw output with 'wall time' in content must not yield a false-positive duration"
+        );
+        assert_eq!(result.status, "completed");
+    }
+
+    #[test]
+    fn v0133_raw_exec_output_with_session_id_in_content_is_not_marked_running() {
+        // Web app log output with "session id" — must not mark exec call as running.
+        let output = "2026-05-21 10:00:00 INFO  Starting server with session id abc-123\nListening on :8080\n";
+        let result = parse_exec_function_output(output);
+        assert_eq!(
+            result.running_session_id, None,
+            "raw output with 'session id' must not yield a false-positive running_session_id"
+        );
+        assert_eq!(result.status, "completed");
+    }
+
+    #[test]
+    fn v0133_raw_exec_output_large_blob_metadata_none() {
+        // Simulate a large raw output (multiple lines, realistic content) that contains
+        // "exit code" and "wall time" false-positive patterns without the "Output:" marker.
+        // Neither field should be extracted; status defaults to "completed".
+        // Note: output intentionally contains no "running" keyword to avoid triggering
+        // `likely_running_output`, which is intentionally kept active for PTY streaming
+        // detection even in unmarked output.
+        let output = concat!(
+            "PASS src/auth.test.js\n",
+            "FAIL src/billing.test.js\n",
+            "  ● billing › returns exit code 1 on invalid input\n",
+            "  wall time exceeded threshold: 3.5s > 2.0s\n",
+            "  session id: test-run-7f8a2b\n",
+            "Test Suites: 1 failed, 1 passed\n",
+        );
+        let result = parse_exec_function_output(output);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.duration_secs, None);
+        assert_eq!(result.running_session_id, None);
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.output.as_deref(), Some(output));
+    }
+
+    #[test]
+    fn old_format_with_output_marker_still_parses_metadata_correctly() {
+        // The "Output:" marker guard must not break old-format sessions that legitimately
+        // carry metadata in the SDK header or banner.
+        let sdk_format = "Chunk ID: abc123\nWall time: 0.2500 seconds\nProcess exited with code 0\nOriginal token count: 1\nOutput:\nhello\n";
+        let result = parse_exec_function_output(sdk_format);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            result.duration_secs.is_some(),
+            "duration should be extracted from SDK header"
+        );
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.output.as_deref(), Some("hello\n"));
     }
 
     #[test]

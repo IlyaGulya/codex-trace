@@ -1358,6 +1358,88 @@ mod tests {
         assert!(tool.duration_secs.is_some());
     }
 
+    // Codex v0.133.0 (PR #23564): exec output is now preserved in raw form without truncation.
+    // function_call_output entries may therefore contain very large blobs that include phrases
+    // like "exit code" or "wall time" as part of the actual command output (compilation errors,
+    // benchmark results, test runners). The parser must preserve the full output without
+    // false-positive metadata extraction and without erroring.
+    #[test]
+    fn v0133_raw_exec_output_with_false_positive_patterns_is_handled_correctly() {
+        // Raw output contains "exit code 1" and "wall time" inline (e.g., test runner output).
+        // The parser must not extract these as exec metadata — the exec ended successfully
+        // per the exec_command_end structured event.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-session","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\",\"workdir\":\"/project\"}","call_id":"call_cargo"}}"#,
+            // v0.133.0 raw output: large blob containing "exit code" and "wall time" in content
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_cargo","output":"running 3 tests\ntest_auth ... ok\ntest_billing ... FAILED: exit code 1 expected\nwall time for suite: 2.5s\ntest result: FAILED. 2 passed; 1 failed\n"}}"#,
+            // exec_command_end provides authoritative structured metadata
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_cargo","aggregated_output":"running 3 tests\ntest result: FAILED. 2 passed; 1 failed\n","exit_code":1,"status":"failed","duration":{"secs":2,"nanos":500000000}}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606405.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        // exec_command_end takes precedence — its call_id removes the pending entry so
+        // function_call_output is skipped; the structured event produces exactly one call.
+        let tool_calls = &turns[0].tool_calls;
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "exactly one exec tool call expected; got {:?}",
+            tool_calls.iter().map(|tc| &tc.call_id).collect::<Vec<_>>()
+        );
+        let tool = &tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        // Exit code and status come from the structured exec_command_end event.
+        assert_eq!(tool.exit_code, Some(1));
+        assert_eq!(tool.status, "failed");
+        assert!(tool.duration_secs.is_some());
+    }
+
+    #[test]
+    fn v0133_raw_exec_output_only_no_exec_command_end_no_false_positive_metadata() {
+        // v0.133.0 session where only function_call_output is present (no exec_command_end).
+        // The raw output contains false-positive "exit code" and "wall time" patterns that
+        // must NOT be extracted as metadata — the output must be preserved in full.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-raw-only","timestamp":"2026-05-21T10:00:00Z","cli_version":"0.133.0"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm test\",\"workdir\":\"/app\"}","call_id":"call_npm"}}"#,
+            // Raw output: large blob with false-positive patterns, no "Output:" marker
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_npm","output":"PASS src/auth.test.js\nFAIL src/billing.test.js\n  ● billing › returns exit code 1 on invalid input\n    wall time: 1.2s exceeded budget of 1.0s\nTest Suites: 1 failed, 1 passed\n"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        // No false-positive exit code from "exit code 1" inside test output
+        assert_eq!(
+            tool.exit_code, None,
+            "exit_code must be None — raw output must not be scanned for metadata"
+        );
+        // No false-positive duration from "wall time: 1.2s" inside test output
+        assert_eq!(
+            tool.duration_secs, None,
+            "duration_secs must be None — raw output must not be scanned for metadata"
+        );
+        assert_eq!(tool.status, "completed");
+        // Full raw output must be preserved unmodified
+        assert!(
+            tool.output
+                .as_deref()
+                .unwrap_or("")
+                .contains("returns exit code 1 on invalid input"),
+            "full raw output must be preserved"
+        );
+    }
+
     #[test]
     fn links_spawn_agent_from_collab_spawn_end_event() {
         let entries = entries(&[
