@@ -651,6 +651,49 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.133.0");
     }
 
+    // Codex v0.133.0 (PR #23564): code-mode exec output is now preserved raw unless an
+    // explicit output token limit is requested. function_call_output entries for exec_command
+    // now carry the full raw output. The RawEntry parser must pass it through without
+    // truncating or erroring regardless of output size or content.
+
+    #[test]
+    fn v0133_raw_exec_output_in_function_call_output_parses_correctly() {
+        // v0.133.0 raw output: no "Output:" wrapper. Content may be arbitrarily large.
+        let lines = [
+            r#"{"timestamp":"2026-05-21T10:00:00Z","type":"session_meta","payload":{"id":"v0133-exec-session","timestamp":"2026-05-21T10:00:00Z","cwd":"/project","cli_version":"0.133.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_exec","arguments":"{\"cmd\":\"cargo build\",\"workdir\":\"/project\"}"}}"#,
+            // v0.133.0 raw output in function_call_output — no "Output:" marker, no metadata footer
+            r#"{"timestamp":"2026-05-21T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec","output":"   Compiling my-crate v1.0.0\n   Compiling dep-crate v2.3.1\nFinished with exit code: 0\n"}}"#,
+            r#"{"timestamp":"2026-05-21T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748167204.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        // Verify function_call_output payload carries raw output as-is
+        let output_entry = RawEntry::parse(lines[3]).unwrap();
+        assert_eq!(output_entry.payload["type"], "function_call_output");
+        assert_eq!(output_entry.payload["call_id"], "call_exec");
+        let raw_output = output_entry.payload["output"].as_str().unwrap();
+        assert!(
+            raw_output.contains("Compiling"),
+            "raw output content must be preserved"
+        );
+        // "exit code" in raw output is not a structural marker at this parse layer
+        assert!(
+            raw_output.contains("exit code"),
+            "raw content preserved verbatim"
+        );
+    }
+
     // Codex v0.135.0 (PR #24591): memory state moved to a dedicated SQLite DB.
     // Active memories are injected into context at turn start and written into
     // turn_context payloads. The RawEntry parser must pass through the memories
