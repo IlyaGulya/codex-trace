@@ -113,16 +113,23 @@ fn parse_session_inner(
     // When present the session is definitively closed regardless of file freshness.
     let has_session_end = entries.iter().any(|e| e.entry_type == "session_end");
 
-    // Codex v0.136.0: session_archived / session_unarchived events. The last event wins,
-    // so a session can be archived then unarchived (or vice-versa).
-    let mut is_archived = false;
-    for entry in &entries {
-        match entry.entry_type.as_str() {
-            "session_archived" => is_archived = true,
-            "session_unarchived" => is_archived = false,
-            _ => {}
-        }
-    }
+    // Codex v0.136.0: session_archived / session_unarchived are top-level JSONL entries
+    // appended by `codex archive` / `codex unarchive`. Process them in order so a later
+    // session_unarchived correctly overrides an earlier session_archived.
+    let is_archived = entries.iter().fold(
+        // Start from session_meta.archived field if present
+        entries
+            .iter()
+            .find(|e| e.entry_type == "session_meta")
+            .and_then(|e| e.payload.get("archived"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        |archived, entry| match entry.entry_type.as_str() {
+            "session_archived" => true,
+            "session_unarchived" => false,
+            _ => archived,
+        },
+    );
 
     // Build turns from remaining entries
     let mut turns = build_turns(&entries);
@@ -1248,6 +1255,115 @@ mod tests {
         assert_eq!(session.spawned_worker_ids, vec!["worker-137"]);
     }
 
+    // Codex v0.136.0: sessions gain an archived state. `codex archive` appends a
+    // session_archived top-level entry; `codex unarchive` appends session_unarchived.
+    // session_meta.archived = true covers sessions where the flag was persisted in metadata.
+
+    #[test]
+    fn v0136_session_archived_event_sets_is_archived() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T10-00-00-archived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:00:00Z","type":"session_meta","payload":{"id":"archived-session","timestamp":"2026-06-01T10:00:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772002.0}}"#,
+                r#"{"timestamp":"2026-06-01T10:00:03Z","type":"session_archived"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "archived-session");
+        assert!(
+            session.is_archived,
+            "session_archived event must set is_archived"
+        );
+        assert!(!session.is_ongoing);
+        assert_eq!(session.turns.len(), 1);
+    }
+
+    #[test]
+    fn v0136_session_unarchived_event_clears_is_archived() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T10-01-00-unarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:01:00Z","type":"session_meta","payload":{"id":"unarchived-session","timestamp":"2026-06-01T10:01:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772062.0}}"#,
+                r#"{"timestamp":"2026-06-01T10:01:03Z","type":"session_archived"}"#,
+                r#"{"timestamp":"2026-06-01T10:01:04Z","type":"session_unarchived"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "unarchived-session");
+        assert!(
+            !session.is_archived,
+            "session_unarchived event must clear is_archived"
+        );
+    }
+
+    #[test]
+    fn v0136_archived_flag_in_session_meta_payload() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T10-02-00-metaarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:02:00Z","type":"session_meta","payload":{"id":"meta-archived","timestamp":"2026-06-01T10:02:00Z","cwd":"/project","cli_version":"0.136.0","archived":true}}"#,
+                r#"{"timestamp":"2026-06-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772122.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "meta-archived");
+        assert!(
+            session.is_archived,
+            "archived:true in session_meta must set is_archived"
+        );
+    }
+
+    #[test]
+    fn v0136_regular_session_is_not_archived() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T10-03-00-notarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:03:00Z","type":"session_meta","payload":{"id":"not-archived","timestamp":"2026-06-01T10:03:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:03:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772182.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "not-archived");
+        assert!(
+            !session.is_archived,
+            "session without archive events must not be archived"
+        );
+    }
+
     #[test]
     fn v0137_session_without_spawn_agent_does_not_set_flag() {
         // Sessions with no spawn_agent calls must never set has_missing_spawn_metadata.
@@ -1273,87 +1389,6 @@ mod tests {
         assert!(
             !session.has_missing_spawn_metadata,
             "session without spawn_agent must not set has_missing_spawn_metadata"
-        );
-    }
-
-    // Codex v0.136.0: `codex archive` / `codex unarchive` commands append
-    // session_archived / session_unarchived events to the JSONL file.
-    // parse_session must detect these and set is_archived accordingly.
-
-    #[test]
-    fn v0136_session_archived_event_sets_is_archived() {
-        let tmp = tempdir().unwrap();
-        let path = tmp
-            .path()
-            .join("rollout-2026-06-01T12-00-00-archived.jsonl");
-        std::fs::write(
-            &path,
-            [
-                r#"{"timestamp":"2026-06-01T12:00:00Z","type":"session_meta","payload":{"id":"v0136-archived","timestamp":"2026-06-01T12:00:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
-                r#"{"timestamp":"2026-06-01T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-06-01T12:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779202.0}}"#,
-                r#"{"timestamp":"2026-06-01T12:00:03Z","type":"session_archived","payload":{}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        let session = parse_session(&path).unwrap();
-        assert_eq!(session.id, "v0136-archived");
-        assert!(
-            session.is_archived,
-            "session_archived event must set is_archived = true"
-        );
-        assert!(!session.is_ongoing);
-    }
-
-    #[test]
-    fn v0136_session_unarchived_event_clears_is_archived() {
-        // archive then unarchive: the last event (session_unarchived) wins.
-        let tmp = tempdir().unwrap();
-        let path = tmp
-            .path()
-            .join("rollout-2026-06-01T12-01-00-unarchived.jsonl");
-        std::fs::write(
-            &path,
-            [
-                r#"{"timestamp":"2026-06-01T12:01:00Z","type":"session_meta","payload":{"id":"v0136-unarchived","timestamp":"2026-06-01T12:01:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779262.0}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:03Z","type":"session_archived","payload":{}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:04Z","type":"session_unarchived","payload":{}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        let session = parse_session(&path).unwrap();
-        assert_eq!(session.id, "v0136-unarchived");
-        assert!(
-            !session.is_archived,
-            "session_unarchived must clear is_archived"
-        );
-    }
-
-    #[test]
-    fn v0136_session_without_archive_event_is_not_archived() {
-        // Pre-v0.136.0 sessions and non-archived sessions must have is_archived = false.
-        let tmp = tempdir().unwrap();
-        let path = tmp
-            .path()
-            .join("rollout-2026-06-01T12-02-00-not-archived.jsonl");
-        std::fs::write(
-            &path,
-            [
-                r#"{"timestamp":"2026-06-01T12:02:00Z","type":"session_meta","payload":{"id":"v0136-not-archived","timestamp":"2026-06-01T12:02:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
-                r#"{"timestamp":"2026-06-01T12:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-06-01T12:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779322.0}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        let session = parse_session(&path).unwrap();
-        assert!(
-            !session.is_archived,
-            "session without archive event must have is_archived = false"
         );
     }
 }

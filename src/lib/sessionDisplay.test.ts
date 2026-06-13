@@ -20,12 +20,12 @@ function makeSession(overrides: Partial<CodexSessionInfo> = {}): CodexSessionInf
     is_external_worker: false,
     is_inline_worker: false,
     is_headless: false,
+    is_archived: false,
     worker_nickname: null,
     worker_role: null,
     spawned_worker_ids: [],
     date_group: "2026/04/26",
     ai_title: null,
-    is_archived: false,
     ...overrides,
   };
 }

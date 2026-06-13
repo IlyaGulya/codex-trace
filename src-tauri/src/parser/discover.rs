@@ -147,6 +147,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         worker_nickname,
         worker_role,
         ai_title,
+        meta_archived,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -183,6 +184,12 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
+            // Codex v0.136.0: session_meta may carry archived: true when the session
+            // was archived before this scan (e.g. archived then re-opened in another run).
+            let meta_archived = payload
+                .get("archived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             (
                 id,
                 start_time,
@@ -196,6 +203,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 worker_nickname,
                 worker_role,
                 ai_title,
+                meta_archived,
             )
         }
         "session_meta_root" => {
@@ -208,6 +216,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
+                false,
             )
         }
         _ => return None,
@@ -228,7 +237,8 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         std::collections::HashSet::new();
     let mut is_ongoing = true;
     let mut has_session_end = false;
-    let mut is_archived = false;
+    // Codex v0.136.0: track archived state; initialised from session_meta.archived.
+    let mut is_archived = meta_archived;
 
     for line in lines {
         if line.trim().is_empty() {
@@ -1091,6 +1101,124 @@ mod tests {
         assert!(!session.is_ongoing);
     }
 
+    // Codex v0.136.0: sessions can be archived via `codex archive`. The JSONL gains
+    // a session_archived top-level entry; `codex unarchive` appends session_unarchived.
+    // discover_sessions must expose is_archived correctly in all cases.
+
+    #[test]
+    fn discover_sessions_v0136_session_archived_event_sets_is_archived() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-01T10-00-00-archived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:00:00Z","type":"session_meta","payload":{"id":"archived-session","timestamp":"2026-06-01T10:00:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772002.0}}"#,
+                r#"{"timestamp":"2026-06-01T10:00:03Z","type":"session_archived"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "archived-session")
+            .unwrap();
+        assert!(
+            session.is_archived,
+            "session_archived event must set is_archived"
+        );
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn discover_sessions_v0136_session_unarchived_clears_is_archived() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-01T10-01-00-unarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:01:00Z","type":"session_meta","payload":{"id":"unarchived-session","timestamp":"2026-06-01T10:01:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772062.0}}"#,
+                r#"{"timestamp":"2026-06-01T10:01:03Z","type":"session_archived"}"#,
+                r#"{"timestamp":"2026-06-01T10:01:04Z","type":"session_unarchived"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "unarchived-session")
+            .unwrap();
+        assert!(
+            !session.is_archived,
+            "session_unarchived event must clear is_archived"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0136_archived_flag_in_session_meta_payload() {
+        // session_meta.archived = true covers the case where the meta is written with the
+        // archived flag already set (e.g. a session archived in a previous codex run).
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-01T10-02-00-metaarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:02:00Z","type":"session_meta","payload":{"id":"meta-archived-session","timestamp":"2026-06-01T10:02:00Z","cwd":"/project","cli_version":"0.136.0","archived":true}}"#,
+                r#"{"timestamp":"2026-06-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772122.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "meta-archived-session")
+            .unwrap();
+        assert!(
+            session.is_archived,
+            "archived:true in session_meta payload must set is_archived"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0136_regular_session_is_not_archived() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-01T10-03-00-notarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T10:03:00Z","type":"session_meta","payload":{"id":"not-archived-session","timestamp":"2026-06-01T10:03:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
+                r#"{"timestamp":"2026-06-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T10:03:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748772182.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "not-archived-session")
+            .unwrap();
+        assert!(
+            !session.is_archived,
+            "session without archive events must not be archived"
+        );
+    }
+
     #[test]
     fn discover_sessions_v0137_plain_and_compressed_coexist() {
         // Mixed directory: some plain, some compressed — both must be discovered correctly.
@@ -1131,90 +1259,6 @@ mod tests {
         assert!(
             sessions.iter().any(|s| s.id == "v0137-compressed"),
             "compressed session must be found"
-        );
-    }
-
-    // Codex v0.136.0: `codex archive` / `codex unarchive` append session_archived /
-    // session_unarchived events. The discover scanner must surface is_archived correctly.
-
-    #[test]
-    fn discover_sessions_v0136_archived_session_detected() {
-        let tmp = tempdir().unwrap();
-        let day_dir = tmp.path().join("2026/06/01");
-        std::fs::create_dir_all(&day_dir).unwrap();
-        let path = day_dir.join("rollout-2026-06-01T12-00-00-archived.jsonl");
-        std::fs::write(
-            &path,
-            [
-                r#"{"timestamp":"2026-06-01T12:00:00Z","type":"session_meta","payload":{"id":"disc-archived","timestamp":"2026-06-01T12:00:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
-                r#"{"timestamp":"2026-06-01T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-06-01T12:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779202.0}}"#,
-                r#"{"timestamp":"2026-06-01T12:00:03Z","type":"session_archived","payload":{}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        let sessions = discover_sessions(tmp.path()).unwrap();
-        let session = sessions.iter().find(|s| s.id == "disc-archived").unwrap();
-        assert!(
-            session.is_archived,
-            "discover must set is_archived for archived session"
-        );
-        assert!(!session.is_ongoing);
-    }
-
-    #[test]
-    fn discover_sessions_v0136_unarchived_session_not_archived() {
-        // archive then unarchive: the last event wins.
-        let tmp = tempdir().unwrap();
-        let day_dir = tmp.path().join("2026/06/01");
-        std::fs::create_dir_all(&day_dir).unwrap();
-        let path = day_dir.join("rollout-2026-06-01T12-01-00-unarchived.jsonl");
-        std::fs::write(
-            &path,
-            [
-                r#"{"timestamp":"2026-06-01T12:01:00Z","type":"session_meta","payload":{"id":"disc-unarchived","timestamp":"2026-06-01T12:01:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779262.0}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:03Z","type":"session_archived","payload":{}}"#,
-                r#"{"timestamp":"2026-06-01T12:01:04Z","type":"session_unarchived","payload":{}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        let sessions = discover_sessions(tmp.path()).unwrap();
-        let session = sessions.iter().find(|s| s.id == "disc-unarchived").unwrap();
-        assert!(
-            !session.is_archived,
-            "session_unarchived must clear is_archived in discover"
-        );
-    }
-
-    #[test]
-    fn discover_sessions_v0136_non_archived_session_has_false() {
-        // Pre-v0.136.0 or non-archived sessions must always have is_archived = false.
-        let tmp = tempdir().unwrap();
-        let day_dir = tmp.path().join("2026/06/01");
-        std::fs::create_dir_all(&day_dir).unwrap();
-        let path = day_dir.join("rollout-2026-06-01T12-02-00-not-archived.jsonl");
-        std::fs::write(
-            &path,
-            [
-                r#"{"timestamp":"2026-06-01T12:02:00Z","type":"session_meta","payload":{"id":"disc-not-archived","timestamp":"2026-06-01T12:02:00Z","cwd":"/project","cli_version":"0.136.0"}}"#,
-                r#"{"timestamp":"2026-06-01T12:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-06-01T12:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779322.0}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        let sessions = discover_sessions(tmp.path()).unwrap();
-        let session = sessions
-            .iter()
-            .find(|s| s.id == "disc-not-archived")
-            .unwrap();
-        assert!(
-            !session.is_archived,
-            "non-archived session must have is_archived = false"
         );
     }
 }
