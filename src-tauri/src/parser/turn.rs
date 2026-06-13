@@ -2894,4 +2894,78 @@ mod tests {
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert_ne!(turns[0].status, TurnStatus::Ongoing);
     }
+
+    #[test]
+    fn v0139_mcp_tool_call_with_one_of_input_schema_classified_as_mcp_tool() {
+        // mcp_tool_call response_item from v0.139.0 carrying an input_schema with oneOf.
+        // input_schema is not used by the parser — only call_id, server, tool, arguments,
+        // plugin_id matter. The schema must be silently ignored and the call classified
+        // correctly as McpTool.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-mcp","timestamp":"2026-06-09T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"call-mcp-v0139","server":"my_server","tool":"search","arguments":{"query":"test"},"input_schema":{"type":"object","properties":{"query":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}},"required":["query"]}}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:03Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call-mcp-v0139","result":{"Ok":{"content":[{"type":"text","text":"result data"}]}}}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466804.0}}"#,
+        ];
+        let entries = entries(&lines);
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::McpTool);
+        assert_eq!(tc.mcp_server.as_deref(), Some("my_server"));
+        assert_eq!(tc.mcp_tool.as_deref(), Some("search"));
+        assert_eq!(tc.output.as_deref(), Some("result data"));
+        assert_eq!(tc.status, "completed");
+    }
+
+    #[test]
+    fn v0139_mcp_tool_call_with_all_of_input_schema_classified_as_mcp_tool() {
+        // mcp_tool_call response_item with an allOf-composed input_schema (PR #27084).
+        // build_turns must parse the item without panic and classify it as McpTool.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-allof-mcp","timestamp":"2026-06-09T10:01:00Z"}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"call-allof","server":"connector_server","tool":"connect","arguments":{"host":"db.example.com","port":5432},"input_schema":{"type":"object","allOf":[{"properties":{"host":{"type":"string"}},"required":["host"]},{"properties":{"port":{"type":"integer","default":5432}}}]}}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:03Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call-allof","result":{"Ok":{"content":[{"type":"text","text":"connected"}]}}}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466864.0}}"#,
+        ];
+        let entries = entries(&lines);
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::McpTool);
+        assert_eq!(tc.mcp_server.as_deref(), Some("connector_server"));
+        assert_eq!(tc.mcp_tool.as_deref(), Some("connect"));
+        assert_eq!(tc.output.as_deref(), Some("connected"));
+    }
+
+    #[test]
+    fn v0139_function_call_alongside_complex_schema_session_meta_classified_correctly() {
+        // A function_call in a session whose session_meta carries tools with oneOf/allOf
+        // schemas must be classified and finalized correctly. Schema complexity in
+        // session_meta must not affect turn building or tool call classification.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-fc","timestamp":"2026-06-09T10:02:00Z","cli_version":"0.139.0","tools":[{"name":"exec_command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"},"workdir":{"oneOf":[{"type":"string"},{"type":"null"}]}},"required":["cmd"]}}]}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls /project\",\"workdir\":\"/project\"}","call_id":"call-fc-v0139"}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-fc-v0139","aggregated_output":"src\ntests\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":30000000}}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466924.0}}"#,
+        ];
+        let entries = entries(&lines);
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tc = &turns[0].tool_calls[0];
+        assert_eq!(tc.kind, ToolKind::ExecCommand);
+        assert_eq!(tc.name, "exec_command");
+        assert_eq!(tc.output.as_deref(), Some("src\ntests\n"));
+        assert_eq!(tc.exit_code, Some(0));
+        assert_eq!(tc.status, "completed");
+    }
 }

@@ -1231,6 +1231,100 @@ mod tests {
         assert_eq!(session.spawned_worker_ids, vec!["worker-137"]);
     }
 
+    // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
+    // `oneOf` and `allOf` structures instead of flattening them. parse_session must handle
+    // session_meta entries containing a `tools` array with complex input_schema objects
+    // without panicking or producing incorrect session data.
+
+    #[test]
+    fn v0139_session_with_one_of_tool_schemas_parses_correctly() {
+        // Full session parse where session_meta carries tools with oneOf input_schema.
+        // Confirms parse_session succeeds and core session fields are extracted correctly.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-09T10-00-00-v0139oneof.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-oneof-session","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai","tools":[{"name":"complex_tool","description":"Tool with oneOf parameter","input_schema":{"type":"object","properties":{"action":{"oneOf":[{"type":"string","enum":["create","update","delete"]},{"type":"object","properties":{"custom_op":{"type":"string"}},"required":["custom_op"]}]}},"required":["action"]}}]}}"#,
+                r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Task done"}}"#,
+                r#"{"timestamp":"2026-06-09T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466803.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0139-oneof-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.139.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0139_session_with_all_of_connector_schemas_parses_correctly() {
+        // Full session parse where session_meta carries connector tools with allOf input_schema.
+        // allOf-composed schemas (PR #27084) must not affect session parsing or turn extraction.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-09T10-01-00-v0139allof.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-allof-session","timestamp":"2026-06-09T10:01:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai","tools":[{"name":"connector_tool","description":"Connector with allOf schema","input_schema":{"type":"object","allOf":[{"properties":{"host":{"type":"string"},"port":{"type":"integer","default":443}},"required":["host"]},{"properties":{"auth_token":{"type":"string"},"tls":{"type":"boolean","default":true}}}]}}]}}"#,
+                r#"{"timestamp":"2026-06-09T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-09T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Connected"}}"#,
+                r#"{"timestamp":"2026-06-09T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466863.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0139-allof-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.139.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0139_session_with_complex_tool_schemas_produces_correct_tool_calls() {
+        // End-to-end: session with tools having complex oneOf/allOf schemas, where
+        // the model also makes a function call. The tool call must be classified and
+        // extracted correctly regardless of schema complexity in session_meta.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-09T10-02-00-v0139toolcall.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-toolcall-session","timestamp":"2026-06-09T10:02:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai","tools":[{"name":"exec_command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"},"workdir":{"oneOf":[{"type":"string"},{"type":"null"}]}},"required":["cmd"]}}]}}"#,
+                r#"{"timestamp":"2026-06-09T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-09T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello\",\"workdir\":\"/project\"}","call_id":"call-v0139-1"}}"#,
+                r#"{"timestamp":"2026-06-09T10:02:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v0139-1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#,
+                r#"{"timestamp":"2026-06-09T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466924.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0139-toolcall-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.139.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+        assert!(!session.is_ongoing);
+    }
+
     #[test]
     fn v0137_session_without_spawn_agent_does_not_set_flag() {
         // Sessions with no spawn_agent calls must never set has_missing_spawn_metadata.

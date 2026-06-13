@@ -906,4 +906,40 @@ mod tests {
         // The oneOf structure must be preserved in the payload Value without being flattened.
         assert!(e.payload["arguments"]["value"]["oneOf"].is_array());
     }
+
+    #[test]
+    fn v0139_session_meta_with_one_of_tool_schema_does_not_panic() {
+        // session_meta from v0.139.0 where a tool's input_schema uses oneOf at the top level.
+        // RawEntry reads only scalar session fields; the tools array is ignored — this guards
+        // against any future change that tries to deserialise the schema into a typed struct.
+        let line = r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-oneof","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","tools":[{"name":"complex_tool","description":"A tool with a oneOf schema","input_schema":{"type":"object","properties":{"action":{"oneOf":[{"type":"string","enum":["create","update","delete"]},{"type":"object","properties":{"custom_op":{"type":"string"},"target":{"type":"string"}},"required":["custom_op"]}]}},"required":["action"]}}]}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with oneOf tool schema must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0139-oneof");
+        assert_eq!(e.payload["cli_version"], "0.139.0");
+        assert!(e.payload.get("tools").is_some());
+    }
+
+    #[test]
+    fn v0139_session_meta_with_all_of_connector_schema_does_not_panic() {
+        // session_meta from v0.139.0 with a connector whose input_schema uses allOf (PR #27084).
+        // allOf-composed connector schemas must not cause any parse failure at entry level.
+        let line = r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-allof","timestamp":"2026-06-09T10:01:00Z","cwd":"/project","cli_version":"0.139.0","tools":[{"name":"connector_tool","description":"A connector with allOf schema","input_schema":{"type":"object","allOf":[{"properties":{"host":{"type":"string"},"port":{"type":"integer","default":443}},"required":["host"]},{"properties":{"auth_token":{"type":"string"},"tls":{"type":"boolean","default":true}}}]}}]}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with allOf connector schema must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0139-allof");
+        assert_eq!(e.payload["cli_version"], "0.139.0");
+        assert!(e.payload.get("tools").is_some());
+    }
+
+    #[test]
+    fn v0139_session_meta_with_nested_one_of_all_of_schema_does_not_panic() {
+        // v0.139.0 large schemas with shallow compaction may contain deeply nested
+        // oneOf/allOf at any level of the input_schema object. Verify parsing is stable.
+        let line = r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-nested","timestamp":"2026-06-09T10:02:00Z","cwd":"/project","cli_version":"0.139.0","tools":[{"name":"nested_schema_tool","input_schema":{"type":"object","properties":{"config":{"allOf":[{"type":"object","properties":{"mode":{"oneOf":[{"type":"string","enum":["fast","slow"]},{"type":"null"}]}}},{"type":"object","properties":{"retries":{"type":"integer","minimum":0}}}]}}}}]}}"#;
+        let e =
+            RawEntry::parse(line).expect("session_meta with nested oneOf/allOf schema must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0139-nested");
+    }
 }
