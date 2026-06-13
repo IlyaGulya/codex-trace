@@ -24,6 +24,14 @@ export interface AgentMessage {
   order?: number;
 }
 
+/** Codex v0.132.0 (PR #23148): memory summaries are now versioned.
+ * Pre-v0.132.0 sessions use plain strings; `version` is absent for those. */
+export interface MemorySummary {
+  content: string;
+  /** Format version. Absent for pre-v0.132.0 sessions (plain-string format). */
+  version?: number;
+}
+
 /** Codex v0.135.0 (PR #24368): compaction metadata from turn headers. */
 export interface CompactionMeta {
   /** Context-window tokens present before compaction. */
@@ -116,8 +124,9 @@ export interface CodexTurn {
   forked_from_thread_id: string | null;
   /** Codex v0.135.0 (PR #24368): compaction metadata at turn start. Null for pre-v0.135.0 sessions. */
   compaction_meta: CompactionMeta | null;
-  /** Active memories injected at turn start (Codex v0.135.0+, PR #24591). Empty for older sessions. */
-  memories?: string[];
+  /** Active memories injected at turn start (Codex v0.135.0+, PR #24591).
+   * Items carry an optional version field (Codex v0.132.0+, PR #23148). Empty for older sessions. */
+  memories?: MemorySummary[];
 }
 
 export interface CodexSession {

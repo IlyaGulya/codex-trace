@@ -989,12 +989,15 @@ mod tests {
         assert_eq!(session.id, "v0135-mem-session");
         assert_eq!(session.cli_version.as_deref(), Some("0.135.0"));
         assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].memories.len(), 2);
         assert_eq!(
-            session.turns[0].memories,
-            vec![
-                "User prefers terse output",
-                "Project uses TypeScript strict mode"
-            ]
+            session.turns[0].memories[0].content,
+            "User prefers terse output"
+        );
+        assert_eq!(session.turns[0].memories[0].version, None);
+        assert_eq!(
+            session.turns[0].memories[1].content,
+            "Project uses TypeScript strict mode"
         );
         assert!(!session.is_ongoing);
     }
@@ -1147,6 +1150,46 @@ mod tests {
         let session = parse_session(&path).unwrap();
         assert_eq!(session.id, "v0134-no-memories");
         assert!(session.turns[0].memories.is_empty());
+    }
+
+    // Codex v0.132.0 (PR #23148): memory summaries are now versioned. Memory items in
+    // turn_context are objects {"content":"...","version":N} instead of plain strings.
+    // The full parse pipeline must expose both content and version on each MemorySummary.
+
+    #[test]
+    fn v0132_session_with_versioned_memory_summaries_parsed_correctly() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-20T10-00-00-v0132mem.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-versioned-mem","timestamp":"2026-05-20T10:00:00Z","cwd":"/project","cli_version":"0.132.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project","memories":[{"content":"User prefers terse output","version":1},{"content":"Project uses TypeScript strict mode","version":2}]}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253604.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0132-versioned-mem");
+        assert_eq!(session.cli_version.as_deref(), Some("0.132.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].memories.len(), 2);
+        assert_eq!(
+            session.turns[0].memories[0].content,
+            "User prefers terse output"
+        );
+        assert_eq!(session.turns[0].memories[0].version, Some(1));
+        assert_eq!(
+            session.turns[0].memories[1].content,
+            "Project uses TypeScript strict mode"
+        );
+        assert_eq!(session.turns[0].memories[1].version, Some(2));
     }
 
     // Codex v0.137.0 (PR #26114): hide_spawn_agent_metadata now defaults to true.

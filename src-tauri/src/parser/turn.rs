@@ -41,6 +41,18 @@ pub struct TokenInfo {
     pub model_context_window: u64,
 }
 
+/// A single memory summary item from a `turn_context` memories payload.
+///
+/// Codex v0.132.0 (PR #23148) made memory summaries versioned: items are now
+/// objects `{"content":"...","version":1}` instead of plain strings.
+/// Pre-v0.132.0 sessions carry plain strings; `version` is `None` for those.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemorySummary {
+    pub content: String,
+    /// Format version. None for pre-v0.132.0 sessions (plain-string format).
+    pub version: Option<u32>,
+}
+
 /// Compaction metadata embedded in turn headers (Codex v0.135.0, PR #24368).
 /// Captures the state of context compaction at the start of a turn so that
 /// context-window accounting in traces remains accurate even after compaction.
@@ -117,8 +129,9 @@ pub struct CodexTurn {
     /// Null when the turn header carries no compaction info (pre-v0.135.0 sessions).
     pub compaction_meta: Option<CompactionMeta>,
     /// Active memories injected into context at turn start (Codex v0.135.0+, PR #24591).
+    /// Items carry an optional version field (Codex v0.132.0+, PR #23148).
     /// Empty for sessions from older Codex versions.
-    pub memories: Vec<String>,
+    pub memories: Vec<MemorySummary>,
 }
 
 impl CodexTurn {
@@ -962,12 +975,34 @@ fn handle_turn_context(
         .map(|s| s.to_string());
     // Codex v0.135.0 (PR #24591): memories are now stored in a dedicated SQLite DB and
     // injected into the context at turn start. The active set is written into turn_context.
-    let memories: Vec<String> = payload
+    // Codex v0.132.0 (PR #23148): memory summary items are versioned objects
+    // {"content":"...","version":N}; pre-v0.132.0 sessions use plain strings.
+    let memories: Vec<MemorySummary> = payload
         .get("memories")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .filter_map(|item| {
+                    if let Some(s) = item.as_str() {
+                        // Pre-v0.132.0: plain string memory
+                        Some(MemorySummary {
+                            content: s.to_string(),
+                            version: None,
+                        })
+                    } else if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                        // v0.132.0+: versioned object {"content":"...","version":N}
+                        let version = item
+                            .get("version")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                        Some(MemorySummary {
+                            content: content.to_string(),
+                            version,
+                        })
+                    } else {
+                        None
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -2581,8 +2616,13 @@ mod tests {
         let turns = build_turns(&entries);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].memories.len(), 2);
-        assert_eq!(turns[0].memories[0], "User prefers terse output");
-        assert_eq!(turns[0].memories[1], "Project uses TypeScript strict mode");
+        assert_eq!(turns[0].memories[0].content, "User prefers terse output");
+        assert_eq!(turns[0].memories[0].version, None);
+        assert_eq!(
+            turns[0].memories[1].content,
+            "Project uses TypeScript strict mode"
+        );
+        assert_eq!(turns[0].memories[1].version, None);
         assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
     }
 
@@ -2616,11 +2656,70 @@ mod tests {
 
         let turns = build_turns(&entries);
         assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].memories, vec!["Initial memory"]);
-        assert_eq!(
-            turns[1].memories,
-            vec!["Initial memory", "New memory added"]
-        );
+        assert_eq!(turns[0].memories.len(), 1);
+        assert_eq!(turns[0].memories[0].content, "Initial memory");
+        assert_eq!(turns[0].memories[0].version, None);
+        assert_eq!(turns[1].memories.len(), 2);
+        assert_eq!(turns[1].memories[0].content, "Initial memory");
+        assert_eq!(turns[1].memories[1].content, "New memory added");
+    }
+
+    // Codex v0.132.0 (PR #23148): memory summaries are now versioned and rebuilt when the
+    // stored format is stale. Memory items in turn_context are now objects
+    // {"content":"...","version":N} instead of plain strings. The parser must handle both
+    // formats for backward compatibility.
+
+    #[test]
+    fn v0132_versioned_memory_summary_parsed_with_version_field() {
+        // v0.132.0+: memory items are objects {"content":"...","version":N}
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-mem","timestamp":"2026-05-20T10:00:00Z","cwd":"/project","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":[{"content":"User prefers terse output","version":1},{"content":"Project uses TypeScript","version":2}]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 2);
+        assert_eq!(turns[0].memories[0].content, "User prefers terse output");
+        assert_eq!(turns[0].memories[0].version, Some(1));
+        assert_eq!(turns[0].memories[1].content, "Project uses TypeScript");
+        assert_eq!(turns[0].memories[1].version, Some(2));
+    }
+
+    #[test]
+    fn v0132_versioned_memory_summary_without_version_field_is_tolerated() {
+        // Object format but missing the version field — version must be None, not a panic.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-mem-noversion","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":[{"content":"Remember to be concise"}]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 1);
+        assert_eq!(turns[0].memories[0].content, "Remember to be concise");
+        assert_eq!(turns[0].memories[0].version, None);
+    }
+
+    #[test]
+    fn v0132_memory_summaries_backward_compatible_with_plain_strings() {
+        // Pre-v0.132.0 sessions use plain strings — must still parse without error.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"pre-v0132-mem","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.131.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":["Plain string memory"]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 1);
+        assert_eq!(turns[0].memories[0].content, "Plain string memory");
+        assert_eq!(turns[0].memories[0].version, None);
     }
 
     // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
