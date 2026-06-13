@@ -839,4 +839,71 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.136.0");
     }
+
+    // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
+    // oneOf and allOf structures instead of flattening them. Large schemas also keep more
+    // shallow structure when compacted.
+    //
+    // codex-trace reads session JSONL at the RawEntry level using serde_json::Value — it
+    // never deserialises tool schemas into typed structs, so oneOf/allOf in schema payloads
+    // cannot cause parse failures here. These tests confirm all standard entry types from a
+    // v0.139.0 session parse correctly and that function_call entries carrying JSON-object
+    // arguments (not stringified-JSON arguments) are faithfully preserved.
+
+    #[test]
+    fn v0139_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types from a v0.139.0 session
+        // must parse correctly. A function_call here carries JSON-object arguments — the
+        // format Codex may emit when schemas preserve oneOf/allOf composition.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-session","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.139.0");
+        assert_eq!(meta.payload["id"], "v0139-session");
+    }
+
+    #[test]
+    fn v0139_function_call_with_object_arguments_does_not_panic() {
+        // Codex v0.139.0 (PRs #24118, #27084): tool input schemas now preserve oneOf/allOf.
+        // A function_call entry may arrive with arguments as a JSON object rather than a
+        // stringified-JSON string. The RawEntry parser must pass through both formats without
+        // panicking — downstream classification is in turn.rs / toolcall.rs.
+        let line = r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-v139","name":"exec_command","arguments":{"cmd":"echo hello","workdir":"/tmp"}}}"#;
+        let e = RawEntry::parse(line).expect("function_call with object arguments must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(e.payload["call_id"], "call-v139");
+        // arguments is an object — verify both fields are accessible via Value
+        assert_eq!(e.payload["arguments"]["cmd"], "echo hello");
+        assert_eq!(e.payload["arguments"]["workdir"], "/tmp");
+    }
+
+    #[test]
+    fn v0139_mcp_tool_call_with_oneof_allof_schema_does_not_panic() {
+        // Codex v0.139.0 (PRs #24118, #27084): MCP tool call items may now carry richer
+        // connector input schemas with oneOf/allOf composition. The RawEntry parser must
+        // accept these without error — schema fields are ignored at this layer (not typed).
+        let line = r#"{"timestamp":"2026-06-09T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-v139","server":"my-connector","tool":"submit_form","arguments":{"value":{"oneOf":[{"type":"string"},{"type":"number"}]}}}}"#;
+        let e = RawEntry::parse(line).expect("mcp_tool_call with oneOf argument must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "mcp_tool_call");
+        // The oneOf structure must be preserved in the payload Value without being flattened.
+        assert!(e.payload["arguments"]["value"]["oneOf"].is_array());
+    }
 }

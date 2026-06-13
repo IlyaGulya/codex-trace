@@ -697,10 +697,15 @@ fn handle_response_item(
         "function_call" => {
             let call_id = str_field(payload, "call_id");
             let name = str_field(payload, "name");
-            let arguments_str = payload
-                .get("arguments")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
+            // Codex v0.139.0 (PRs #24118, #27084): tool/connector input schemas now preserve
+            // oneOf and allOf structures. arguments may arrive as a JSON object rather than a
+            // stringified JSON string — handle both forms so complex schema structures are not
+            // silently dropped (matching the existing mcp_tool_call handler behaviour).
+            let arguments_str = match payload.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
+                None => "{}".to_string(),
+            };
             let namespace = payload
                 .get("namespace")
                 .and_then(|v| v.as_str())
@@ -728,7 +733,7 @@ fn handle_response_item(
             builder.add_function_call(
                 call_id,
                 name,
-                arguments_str,
+                &arguments_str,
                 namespace,
                 mcp_server_direct,
                 plugin_id,
@@ -2790,5 +2795,103 @@ mod tests {
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].kind, ToolKind::ShellHook);
+    }
+
+    // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
+    // oneOf and allOf structures instead of flattening them. Large schemas also keep more
+    // shallow structure when compacted. This means function_call and mcp_tool_call entries
+    // may now carry arguments as JSON objects rather than stringified JSON strings when the
+    // schema contains composition keywords.
+
+    #[test]
+    fn v0139_function_call_with_object_arguments_preserves_arguments() {
+        // Before the fix, function_call arguments were extracted with .as_str().unwrap_or("{}")
+        // which silently dropped object arguments. After the fix, object arguments are
+        // serialised to a string with serde_json::to_string — matching mcp_tool_call behaviour.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-obj-args","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // arguments is a JSON object (not a stringified-JSON string)
+            r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-obj","name":"exec_command","arguments":{"cmd":"echo hello","workdir":"/tmp"}}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-obj","output":"hello\n"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466804.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.name, "exec_command");
+        // arguments must not be Value::Null (the fallback when object args were silently dropped)
+        assert!(
+            !tool.arguments.is_null(),
+            "JSON-object arguments must not be silently dropped (regression: was Value::Null)"
+        );
+        // The cmd field must be accessible from the preserved arguments object.
+        assert_eq!(
+            tool.arguments.get("cmd").and_then(|v| v.as_str()),
+            Some("echo hello"),
+            "cmd argument must be preserved from JSON-object arguments"
+        );
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+    }
+
+    #[test]
+    fn v0139_function_call_with_oneof_allof_arguments_parses_without_error() {
+        // Codex v0.139.0 (PRs #24118, #27084): tool schemas preserving oneOf/allOf may cause
+        // the model to pass arguments whose values reflect those composition types. The parser
+        // must not panic or drop these arguments.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-oneof","timestamp":"2026-06-09T10:01:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // function_call with complex nested arguments (schema-driven complex structure)
+            r#"{"timestamp":"2026-06-09T10:01:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-oneof","name":"submit_form","arguments":{"field":{"type":"text","value":"hello"},"options":{"oneOf":[{"label":"A","val":1},{"label":"B","val":2}]}}}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-oneof","output":"submitted"}}"#,
+            r#"{"timestamp":"2026-06-09T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466864.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.name, "submit_form");
+        assert!(
+            !tool.arguments.is_null(),
+            "complex JSON-object arguments must be preserved"
+        );
+        // The oneOf structure in arguments must be accessible without errors.
+        assert!(
+            tool.arguments.get("options").is_some(),
+            "nested argument fields must not be dropped"
+        );
+        assert_eq!(tool.output.as_deref(), Some("submitted"));
+    }
+
+    #[test]
+    fn v0139_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types from a v0.139.0 session
+        // must parse correctly.
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-session","timestamp":"2026-06-09T10:02:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-09T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466924.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        assert_eq!(parsed.len(), 5);
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_ne!(turns[0].status, TurnStatus::Ongoing);
     }
 }
