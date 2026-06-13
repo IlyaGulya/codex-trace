@@ -938,6 +938,29 @@ fn handle_response_item(
             }
         }
 
+        // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` enforces structured
+        // JSON output for resumed automation sessions. Final model responses are emitted as
+        // response_items with type "structured_output" containing the schema-validated JSON
+        // object rather than a free-form text string. Without this handler, structured responses
+        // hit the `_ => {}` catch-all and the turn's final_answer is silently dropped.
+        "structured_output" => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.final_answer.is_none() {
+                    let content = payload.get("content").or_else(|| payload.get("output"));
+                    if let Some(c) = content {
+                        let text = match c {
+                            Value::String(s) if !s.is_empty() => s.clone(),
+                            Value::String(_) => String::new(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        };
+                        if !text.is_empty() {
+                            turn.final_answer = Some(text);
+                        }
+                    }
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -2790,5 +2813,119 @@ mod tests {
         assert_eq!(turns[0].status, TurnStatus::Complete);
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].kind, ToolKind::ShellHook);
+    }
+
+    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` enforces structured JSON
+    // output for resumed automation sessions. The final model response is emitted as a
+    // response_item with type "structured_output" carrying a schema-validated JSON object.
+    // Without explicit handling, it would silently fall into `_ => {}` and final_answer would
+    // remain None.
+
+    #[test]
+    fn v0132_structured_output_response_item_sets_final_answer_from_object() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-structured","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"done","count":42}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let answer = turns[0]
+            .final_answer
+            .as_deref()
+            .expect("final_answer must be set from structured_output response_item");
+        assert!(
+            answer.contains("done"),
+            "answer must contain structured content"
+        );
+        assert!(
+            answer.contains("42"),
+            "answer must contain structured content"
+        );
+    }
+
+    #[test]
+    fn v0132_structured_output_with_string_content_sets_final_answer() {
+        // structured_output may carry a plain string in the content field rather than a
+        // JSON object when the schema resolves to a primitive type.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-str-output","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","content":"schema-validated plain text"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("schema-validated plain text"),
+            "string-typed structured_output content must be stored verbatim"
+        );
+    }
+
+    #[test]
+    fn v0132_structured_output_does_not_overwrite_existing_final_answer() {
+        // task_complete.last_agent_message takes precedence; a structured_output response_item
+        // that arrives before task_complete must not clobber the answer set by agent_message.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-priority","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"prior final answer","phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"should":"not overwrite"}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("prior final answer"),
+            "structured_output must not overwrite an already-set final_answer"
+        );
+    }
+
+    #[test]
+    fn v0132_structured_output_output_field_fallback_sets_final_answer() {
+        // Some structured_output items may use `output` instead of `content`.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-output-field","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","output":{"status":"ok","value":99}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let answer = turns[0]
+            .final_answer
+            .as_deref()
+            .expect("final_answer must be set from output field of structured_output");
+        assert!(answer.contains("ok"));
+        assert!(answer.contains("99"));
+    }
+
+    #[test]
+    fn v0132_all_standard_entry_types_and_structured_output_in_complete_session() {
+        // Regression guard: all standard JSONL entry types plus a structured_output item
+        // must produce one complete turn with the expected final_answer.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-full","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","output_schema":{"type":"object","properties":{"result":{"type":"string"}}}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/tmp\"}","call_id":"call_ls"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_ls","aggregated_output":"file.txt\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:05Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"task completed successfully"}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606406.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Complete);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].kind, ToolKind::ExecCommand);
+        let answer = turn
+            .final_answer
+            .as_deref()
+            .expect("final_answer must be set from structured_output response_item");
+        assert!(answer.contains("task completed successfully"));
     }
 }

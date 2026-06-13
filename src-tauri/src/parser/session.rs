@@ -1231,6 +1231,80 @@ mod tests {
         assert_eq!(session.spawned_worker_ids, vec!["worker-137"]);
     }
 
+    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` enforces structured JSON
+    // output for resumed automation sessions. Session transcripts contain response_items with
+    // type "structured_output" whose content is a schema-validated JSON object. parse_session
+    // must populate the turn's final_answer from these items rather than silently dropping them.
+
+    #[test]
+    fn v0132_exec_resume_with_output_schema_captures_structured_final_answer() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-20T10-00-00-structured.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-structured-session","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","output_schema":{"type":"object","properties":{"result":{"type":"string"}}}}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"task completed successfully"}}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0132-structured-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.132.0"));
+        assert_eq!(session.turns.len(), 1);
+        let turn = &session.turns[0];
+        let answer = turn
+            .final_answer
+            .as_deref()
+            .expect("final_answer must be populated from structured_output response_item");
+        assert!(
+            answer.contains("task completed successfully"),
+            "final_answer must contain the structured JSON content"
+        );
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0132_exec_resume_with_output_schema_and_tool_calls_parses_fully() {
+        // Full exec resume session: exec_command tool call followed by structured_output.
+        // Verifies that both the tool call and the structured final answer are parsed correctly.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-20T10-01-00-structured-full.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-20T10:01:00Z","type":"session_meta","payload":{"id":"v0132-structured-full","timestamp":"2026-05-20T10:01:00Z","cwd":"/project","cli_version":"0.132.0","output_schema":{"type":"object","properties":{"files":{"type":"array"}}}}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls /project\",\"workdir\":\"/project\"}","call_id":"call_ls"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_ls","aggregated_output":"main.rs\nCargo.toml\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":50000000}}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:04Z","type":"response_item","payload":{"type":"structured_output","content":{"files":["main.rs","Cargo.toml"]}}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606465.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0132-structured-full");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        assert_eq!(session.turns[0].tool_calls[0].name, "exec_command");
+        let answer = session.turns[0]
+            .final_answer
+            .as_deref()
+            .expect("final_answer must be captured from structured_output");
+        assert!(answer.contains("main.rs"));
+        assert!(!session.is_ongoing);
+    }
+
     #[test]
     fn v0137_session_without_spawn_agent_does_not_set_flag() {
         // Sessions with no spawn_agent calls must never set has_missing_spawn_metadata.
