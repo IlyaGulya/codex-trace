@@ -85,6 +85,8 @@ export interface CodexToolCall {
   web_query: string | null;
   web_url: string | null;
   image_prompt: string | null;
+  /** Codex v0.138.0 (PRs #25944, #25947): saved file path for image_generation and local image attachment results. Null for pre-v0.138.0 sessions and non-image calls. */
+  image_file_path: string | null;
   worker_session: CodexSession | null;
   status: string;
 }

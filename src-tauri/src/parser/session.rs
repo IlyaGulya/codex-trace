@@ -1258,4 +1258,79 @@ mod tests {
             "session without spawn_agent must not set has_missing_spawn_metadata"
         );
     }
+
+    // Codex v0.138.0 (PRs #25944, #25947): image_generation results now carry a top-level
+    // file_path field exposing the saved file path. parse_session must propagate this field
+    // through to the ToolCall so the UI can link to the saved image.
+
+    #[test]
+    fn v0138_parse_session_image_generation_with_file_path() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-08T10-00-00-v0138img.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-08T10:00:00Z","type":"session_meta","payload":{"id":"v0138-img-session","timestamp":"2026-06-08T10:00:00Z","cwd":"/project","cli_version":"0.138.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img_138","arguments":"{\"prompt\":\"a sunset over mountains\",\"size\":\"1024x1024\"}"}}"#,
+                r#"{"timestamp":"2026-06-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img_138","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}],"file_path":"/home/user/.codex/images/sunset_abc123.png"}}"#,
+                r#"{"timestamp":"2026-06-08T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376804.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0138-img-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.138.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "image_generation");
+        assert_eq!(
+            tool.image_prompt.as_deref(),
+            Some("a sunset over mountains")
+        );
+        assert_eq!(
+            tool.image_file_path.as_deref(),
+            Some("/home/user/.codex/images/sunset_abc123.png"),
+            "image_file_path must be populated from the file_path field"
+        );
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0138_parse_session_image_generation_without_file_path_is_backward_compatible() {
+        // Pre-v0.138.0 sessions must parse normally with image_file_path as None.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-08T10-01-00-v0135imgold.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-08T10:01:00Z","type":"session_meta","payload":{"id":"v0135-img-old","timestamp":"2026-06-08T10:01:00Z","cwd":"/project","cli_version":"0.135.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-08T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-08T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img_old","arguments":"{\"prompt\":\"a mountain lake\"}"}}"#,
+                r#"{"timestamp":"2026-06-08T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img_old","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,def456"}}]}}"#,
+                r#"{"timestamp":"2026-06-08T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376864.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0135-img-old");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "image_generation");
+        assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
+        assert!(
+            tool.image_file_path.is_none(),
+            "image_file_path must be None when file_path is absent"
+        );
+    }
 }

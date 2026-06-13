@@ -746,12 +746,18 @@ fn handle_response_item(
                     .join(""),
                 _ => String::new(),
             };
+            // Codex v0.138.0 (PRs #25944, #25947): image_generation and local image attachment
+            // results now include a top-level file_path field exposing the saved file path.
+            let file_path = payload
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             if let Some(spawn) = spawn_from_function_call_output(builder, &call_id, &output) {
                 if let Some(turn) = turns.get_mut(tid) {
                     turn.collab_spawns.push(spawn);
                 }
             }
-            builder.add_function_call_output(&call_id, &output);
+            builder.add_function_call_output(&call_id, &output, file_path);
         }
 
         "custom_tool_call" => {
@@ -847,7 +853,7 @@ fn handle_response_item(
                     .join(""),
                 _ => String::new(),
             };
-            builder.add_function_call_output(&call_id, &output);
+            builder.add_function_call_output(&call_id, &output, None);
         }
 
         // Codex < v0.133.0 (PR #23075 removed UserTurn): user input was emitted as a

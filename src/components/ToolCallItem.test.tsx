@@ -23,6 +23,7 @@ function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
     web_query: null,
     web_url: null,
     image_prompt: null,
+    image_file_path: null,
     worker_session: null,
     status: "completed",
     subagent_id: null,
@@ -452,6 +453,7 @@ describe("ToolCallItem", () => {
             command: null,
             exit_code: null,
             image_prompt: "a sunset over mountains",
+            image_file_path: null,
           })}
           expanded={false}
           onToggle={vi.fn()}

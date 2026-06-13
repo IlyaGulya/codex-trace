@@ -839,4 +839,60 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.136.0");
     }
+
+    // Codex v0.138.0 (PRs #25944, #25947): local image attachments and standalone image
+    // generations now expose their saved file paths. The file_path is a top-level field in
+    // the function_call_output response_item payload alongside call_id and output.
+    // RawEntry must parse the payload through without error; toolcall.rs extracts the field.
+
+    #[test]
+    fn v0138_function_call_output_with_file_path_parses_as_response_item() {
+        // image_generation result with the new file_path field (v0.138.0+)
+        let line = r#"{"timestamp":"2026-06-08T10:00:00Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img_138","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}],"file_path":"/home/user/.codex/images/sunset_abc123.png"}}"#;
+        let e = RawEntry::parse(line).expect("function_call_output with file_path must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call_output");
+        assert_eq!(e.payload["call_id"], "call_img_138");
+        assert_eq!(
+            e.payload["file_path"],
+            "/home/user/.codex/images/sunset_abc123.png"
+        );
+        let output_arr = e.payload["output"]
+            .as_array()
+            .expect("output must be array");
+        assert_eq!(output_arr[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn v0138_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types must parse under v0.138.0.
+        let lines = [
+            r#"{"timestamp":"2026-06-08T10:00:00Z","type":"session_meta","payload":{"id":"v0138-session","timestamp":"2026-06-08T10:00:00Z","cwd":"/project","cli_version":"0.138.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img","arguments":"{\"prompt\":\"a sunset\"}"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}],"file_path":"/home/user/.codex/images/sunset_123.png"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:04Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376805.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.138.0");
+        // Verify the file_path field is accessible in the image output payload
+        let img_output = RawEntry::parse(lines[3]).unwrap();
+        assert_eq!(
+            img_output.payload["file_path"],
+            "/home/user/.codex/images/sunset_123.png"
+        );
+    }
 }
