@@ -1231,10 +1231,9 @@ mod tests {
         assert_eq!(session.spawned_worker_ids, vec!["worker-137"]);
     }
 
-    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` enforces structured JSON
-    // output for resumed automation sessions. Session transcripts contain response_items with
-    // type "structured_output" whose content is a schema-validated JSON object. parse_session
-    // must populate the turn's final_answer from these items rather than silently dropping them.
+    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
+    // JSON output items. A full parse_session must capture the structured_output response_item
+    // content as the turn's final_answer so exec sessions with --output-schema display correctly.
 
     #[test]
     fn v0132_exec_resume_with_output_schema_captures_structured_final_answer() {
@@ -1271,6 +1270,43 @@ mod tests {
     }
 
     #[test]
+    fn v0132_parse_session_with_structured_output_populates_final_answer() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-20T10-00-00-v0132schema.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-schema-session","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+                // structured_output item from --output-schema exec session
+                r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"success","count":7}}}"#,
+                r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0132-schema-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.132.0"));
+        assert_eq!(session.turns.len(), 1);
+        let turn = &session.turns[0];
+        assert!(
+            turn.final_answer.is_some(),
+            "structured_output response_item must populate final_answer"
+        );
+        let answer = turn.final_answer.as_ref().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(answer).expect("final_answer must be valid JSON");
+        assert_eq!(v["result"], "success");
+        assert_eq!(v["count"], 7);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
     fn v0132_exec_resume_with_output_schema_and_tool_calls_parses_fully() {
         // Full exec resume session: exec_command tool call followed by structured_output.
         // Verifies that both the tool call and the structured final answer are parsed correctly.
@@ -1302,6 +1338,41 @@ mod tests {
             .as_deref()
             .expect("final_answer must be captured from structured_output");
         assert!(answer.contains("main.rs"));
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0132_parse_session_with_message_json_content_populates_final_answer() {
+        // Codex v0.132.0+ (PR #23123): --output-schema sessions may emit the structured
+        // response as a "message" response_item where content is a JSON object.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-20T10-01-00-v0132msgschema.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-20T10:01:00Z","type":"session_meta","payload":{"id":"v0132-msg-schema","timestamp":"2026-05-20T10:01:00Z","cwd":"/tmp","cli_version":"0.132.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":{"status":"ok","output":"done"}}}"#,
+                r#"{"timestamp":"2026-05-20T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606463.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0132-msg-schema");
+        assert_eq!(session.turns.len(), 1);
+        let turn = &session.turns[0];
+        assert!(
+            turn.final_answer.is_some(),
+            "message response_item with JSON content must populate final_answer"
+        );
+        let answer = turn.final_answer.as_ref().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(answer).expect("final_answer must be valid JSON");
+        assert_eq!(v["status"], "ok");
         assert!(!session.is_ongoing);
     }
 
