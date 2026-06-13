@@ -145,6 +145,8 @@ export interface CodexSession {
    * in Codex config to restore full trace coverage.
    */
   has_missing_spawn_metadata: boolean;
+  /** true when the session has been archived via `codex archive` (Codex v0.136.0+). */
+  is_archived: boolean;
 }
 
 export interface CodexSessionInfo {
@@ -172,6 +174,8 @@ export interface CodexSessionInfo {
   ai_title: string | null;
   /** true when the session was started via `codex remote-control` (Codex v0.130.0+) */
   is_headless: boolean;
+  /** true when the session has been archived via `codex archive` (Codex v0.136.0+). */
+  is_archived: boolean;
 }
 
 export interface SettingsResponse {

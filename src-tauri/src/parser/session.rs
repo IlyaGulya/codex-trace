@@ -42,6 +42,10 @@ pub struct CodexSession {
     /// function_call_output for spawn_agent to be empty. When this is true, multi-agent
     /// subagent lineage is absent and users should set hide_spawn_agent_metadata = false.
     pub has_missing_spawn_metadata: bool,
+    /// true when the session has been archived via `codex archive` (Codex v0.136.0+).
+    /// Archived sessions are protected from resume/fork until restored with `codex unarchive`.
+    /// A trailing `session_archived` event sets this; a subsequent `session_unarchived` clears it.
+    pub is_archived: bool,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -87,6 +91,7 @@ fn parse_session_inner(
         ai_title: None,
         is_headless: false,
         has_missing_spawn_metadata: false,
+        is_archived: false,
     };
 
     // Parse session_meta from first matching entry
@@ -107,6 +112,17 @@ fn parse_session_inner(
     // Check for explicit session_end marker (Codex v0.128.0+).
     // When present the session is definitively closed regardless of file freshness.
     let has_session_end = entries.iter().any(|e| e.entry_type == "session_end");
+
+    // Codex v0.136.0: session_archived / session_unarchived events. The last event wins,
+    // so a session can be archived then unarchived (or vice-versa).
+    let mut is_archived = false;
+    for entry in &entries {
+        match entry.entry_type.as_str() {
+            "session_archived" => is_archived = true,
+            "session_unarchived" => is_archived = false,
+            _ => {}
+        }
+    }
 
     // Build turns from remaining entries
     let mut turns = build_turns(&entries);
@@ -171,6 +187,7 @@ fn parse_session_inner(
     session.total_tokens = total_tokens;
     session.is_ongoing = is_ongoing;
     session.has_missing_spawn_metadata = has_missing_spawn_metadata;
+    session.is_archived = is_archived;
 
     visited.remove(&canonical_path);
     Ok(session)
@@ -1256,6 +1273,87 @@ mod tests {
         assert!(
             !session.has_missing_spawn_metadata,
             "session without spawn_agent must not set has_missing_spawn_metadata"
+        );
+    }
+
+    // Codex v0.136.0: `codex archive` / `codex unarchive` commands append
+    // session_archived / session_unarchived events to the JSONL file.
+    // parse_session must detect these and set is_archived accordingly.
+
+    #[test]
+    fn v0136_session_archived_event_sets_is_archived() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T12-00-00-archived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T12:00:00Z","type":"session_meta","payload":{"id":"v0136-archived","timestamp":"2026-06-01T12:00:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-01T12:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T12:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779202.0}}"#,
+                r#"{"timestamp":"2026-06-01T12:00:03Z","type":"session_archived","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0136-archived");
+        assert!(
+            session.is_archived,
+            "session_archived event must set is_archived = true"
+        );
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0136_session_unarchived_event_clears_is_archived() {
+        // archive then unarchive: the last event (session_unarchived) wins.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T12-01-00-unarchived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T12:01:00Z","type":"session_meta","payload":{"id":"v0136-unarchived","timestamp":"2026-06-01T12:01:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-01T12:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T12:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779262.0}}"#,
+                r#"{"timestamp":"2026-06-01T12:01:03Z","type":"session_archived","payload":{}}"#,
+                r#"{"timestamp":"2026-06-01T12:01:04Z","type":"session_unarchived","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0136-unarchived");
+        assert!(
+            !session.is_archived,
+            "session_unarchived must clear is_archived"
+        );
+    }
+
+    #[test]
+    fn v0136_session_without_archive_event_is_not_archived() {
+        // Pre-v0.136.0 sessions and non-archived sessions must have is_archived = false.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-01T12-02-00-not-archived.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T12:02:00Z","type":"session_meta","payload":{"id":"v0136-not-archived","timestamp":"2026-06-01T12:02:00Z","cwd":"/project","cli_version":"0.136.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-01T12:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T12:02:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748779322.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let session = parse_session(&path).unwrap();
+        assert!(
+            !session.is_archived,
+            "session without archive event must have is_archived = false"
         );
     }
 }
