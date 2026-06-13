@@ -54,7 +54,8 @@ export type ToolKind =
   | "image_generation"
   | "spawn_agent"
   | "wait_agent"
-  | "close_agent"
+  /** Codex < v0.139.0 used `close_agent`; renamed to `interrupt_agent` in v0.139.0 (PR #26994). */
+  | "interrupt_agent"
   /** multi-agent v2: assign_task (Codex < v0.136.0) or followup_task (≥ v0.136.0) */
   | "followup_task"
   /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */

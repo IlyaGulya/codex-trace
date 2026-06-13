@@ -14,7 +14,9 @@ pub enum ToolKind {
     ImageGeneration,
     SpawnAgent,
     WaitAgent,
-    CloseAgent,
+    /// Codex < v0.139.0 used `close_agent`; renamed to `interrupt_agent` in v0.139.0 (PR #26994).
+    /// Both old transcripts (close_agent) and new (interrupt_agent) map to this variant.
+    InterruptAgent,
     /// multi-agent v2 task assignment: `assign_task` (Codex < v0.136.0) or `followup_task` (≥ v0.136.0)
     FollowupTask,
     /// Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
@@ -341,7 +343,11 @@ impl ToolCallBuilder {
                         (ToolKind::McpTool, server, tool)
                     }
                     _ if pending.name == "wait_agent" => (ToolKind::WaitAgent, None, None),
-                    _ if pending.name == "close_agent" => (ToolKind::CloseAgent, None, None),
+                    // close_agent (Codex < v0.139.0) was renamed to interrupt_agent (≥ v0.139.0, PR #26994).
+                    // Accept both for backward compatibility with existing transcripts.
+                    _ if pending.name == "close_agent" || pending.name == "interrupt_agent" => {
+                        (ToolKind::InterruptAgent, None, None)
+                    }
                     _ => (ToolKind::Unknown, None, None),
                 }
             };
@@ -699,7 +705,7 @@ impl ToolCallBuilder {
 
         self.finalized.push(ToolCall {
             call_id,
-            kind: ToolKind::CloseAgent,
+            kind: ToolKind::InterruptAgent,
             name: pending_name.unwrap_or_else(|| kind_name(event_type)),
             arguments: payload.clone(),
             input_text: None,
@@ -1312,6 +1318,49 @@ mod tests {
             tool.duration_secs.is_some(),
             "duration should be extracted from structured field"
         );
+    }
+
+    // Codex v0.139.0 (PR #26994): multi-agent v2 close_agent renamed to interrupt_agent.
+    // Both old transcripts (close_agent) and new (interrupt_agent) must classify as InterruptAgent.
+
+    #[test]
+    fn close_agent_legacy_classified_as_interrupt_agent() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_close".to_string(),
+            "close_agent".to_string(),
+            r#"{"reason":"task complete"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_close", r#"{"status":"ok"}"#);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::InterruptAgent);
+        assert_eq!(tool.name, "close_agent");
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn interrupt_agent_new_name_classified_as_interrupt_agent() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_interrupt".to_string(),
+            "interrupt_agent".to_string(),
+            r#"{"reason":"task complete"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_interrupt", r#"{"status":"ok"}"#);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::InterruptAgent);
+        assert_eq!(tool.name, "interrupt_agent");
+        assert_eq!(tool.status, "completed");
     }
 
     // Codex v0.136.0 (PR #25267) renamed the multi-agent v2 assignment tool from
