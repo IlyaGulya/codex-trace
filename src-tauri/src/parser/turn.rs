@@ -956,14 +956,12 @@ fn handle_response_item(
         // Handle assistant message response_items. This includes schema-validated JSON content
         // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where `content`
         // is a JSON object rather than a plain string.
-        "message" => {
-            if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") {
-                if let Some(turn) = turns.get_mut(tid) {
-                    if turn.final_answer.is_none() {
-                        let text = extract_item_content(payload);
-                        if !text.is_empty() {
-                            turn.final_answer = Some(text);
-                        }
+        "message" if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.final_answer.is_none() {
+                    let text = extract_item_content(payload);
+                    if !text.is_empty() {
+                        turn.final_answer = Some(text);
                     }
                 }
             }
