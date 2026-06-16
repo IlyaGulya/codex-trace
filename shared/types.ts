@@ -24,6 +24,14 @@ export interface AgentMessage {
   order?: number;
 }
 
+/** Codex v0.132.0 (PR #23148): memory summaries are now versioned.
+ * Pre-v0.132.0 sessions use plain strings; `version` is absent for those. */
+export interface MemorySummary {
+  content: string;
+  /** Format version. Absent for pre-v0.132.0 sessions (plain-string format). */
+  version?: number;
+}
+
 /** Codex v0.135.0 (PR #24368): compaction metadata from turn headers. */
 export interface CompactionMeta {
   /** Context-window tokens present before compaction. */
@@ -54,7 +62,8 @@ export type ToolKind =
   | "image_generation"
   | "spawn_agent"
   | "wait_agent"
-  | "close_agent"
+  /** Codex < v0.139.0 used `close_agent`; renamed to `interrupt_agent` in v0.139.0 (PR #26994). */
+  | "interrupt_agent"
   /** multi-agent v2: assign_task (Codex < v0.136.0) or followup_task (≥ v0.136.0) */
   | "followup_task"
   /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */
@@ -85,6 +94,8 @@ export interface CodexToolCall {
   web_query: string | null;
   web_url: string | null;
   image_prompt: string | null;
+  /** Codex v0.138.0 (PRs #25944, #25947): saved file path for image_generation and local image attachment results. Null for pre-v0.138.0 sessions and non-image calls. */
+  image_file_path: string | null;
   worker_session: CodexSession | null;
   status: string;
 }
@@ -116,8 +127,9 @@ export interface CodexTurn {
   forked_from_thread_id: string | null;
   /** Codex v0.135.0 (PR #24368): compaction metadata at turn start. Null for pre-v0.135.0 sessions. */
   compaction_meta: CompactionMeta | null;
-  /** Active memories injected at turn start (Codex v0.135.0+, PR #24591). Empty for older sessions. */
-  memories?: string[];
+  /** Active memories injected at turn start (Codex v0.135.0+, PR #24591).
+   * Items carry an optional version field (Codex v0.132.0+, PR #23148). Empty for older sessions. */
+  memories?: MemorySummary[];
 }
 
 export interface CodexSession {
