@@ -14,7 +14,9 @@ pub enum ToolKind {
     ImageGeneration,
     SpawnAgent,
     WaitAgent,
-    CloseAgent,
+    /// Codex < v0.139.0 used `close_agent`; renamed to `interrupt_agent` in v0.139.0 (PR #26994).
+    /// Both old transcripts (close_agent) and new (interrupt_agent) map to this variant.
+    InterruptAgent,
     /// multi-agent v2 task assignment: `assign_task` (Codex < v0.136.0) or `followup_task` (≥ v0.136.0)
     FollowupTask,
     /// Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
@@ -44,6 +46,9 @@ pub struct ToolCall {
     pub web_query: Option<String>,
     pub web_url: Option<String>,
     pub image_prompt: Option<String>,
+    /// Codex v0.138.0 (PRs #25944, #25947): saved file path exposed by image_generation and
+    /// local image attachment results. Absent for pre-v0.138.0 sessions and non-image calls.
+    pub image_file_path: Option<String>,
     pub worker_session: Option<Box<super::session::CodexSession>>,
     pub status: String,
     /// Codex v0.134.0 (PR #22882): subagent session ID from hook input identity fields.
@@ -153,6 +158,7 @@ impl ToolCallBuilder {
                 web_query: None,
                 web_url: None,
                 image_prompt: None,
+                image_file_path: None,
                 worker_session: None,
                 status: if exit_code.unwrap_or(1) == 0 {
                     "completed".to_string()
@@ -169,7 +175,15 @@ impl ToolCallBuilder {
     /// If the pending call has an MCP namespace, classify as McpTool. Built-in
     /// collaboration calls are also typed here because newer Codex SDK logs do
     /// not emit the older collab_*_end events.
-    pub fn add_function_call_output(&mut self, call_id: &str, output: &str) {
+    ///
+    /// `file_path` carries the optional saved-file path added in Codex v0.138.0
+    /// (PRs #25944, #25947) for image_generation and local image attachment results.
+    pub fn add_function_call_output(
+        &mut self,
+        call_id: &str,
+        output: &str,
+        file_path: Option<&str>,
+    ) {
         if let Some(pending) = self.pending.remove(call_id) {
             if pending.name == "exec_command" {
                 let parsed_output = parse_exec_function_output(output);
@@ -237,6 +251,7 @@ impl ToolCallBuilder {
                     .get("prompt")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let image_file_path = file_path.filter(|s| !s.is_empty()).map(|s| s.to_string());
                 self.finalized.push(ToolCall {
                     call_id: call_id.to_string(),
                     kind: ToolKind::ImageGeneration,
@@ -260,6 +275,7 @@ impl ToolCallBuilder {
                     web_query: None,
                     web_url: None,
                     image_prompt,
+                    image_file_path,
                     worker_session: None,
                     status: "completed".to_string(),
                     subagent_id: None,
@@ -288,6 +304,7 @@ impl ToolCallBuilder {
                     web_query: None,
                     web_url: None,
                     image_prompt: None,
+                    image_file_path: None,
                     worker_session: None,
                     status: spawn_agent_status(output),
                     subagent_id: None,
@@ -319,6 +336,7 @@ impl ToolCallBuilder {
                     web_query: None,
                     web_url: None,
                     image_prompt: None,
+                    image_file_path: None,
                     worker_session: None,
                     status: "completed".to_string(),
                     subagent_id: None,
@@ -341,7 +359,11 @@ impl ToolCallBuilder {
                         (ToolKind::McpTool, server, tool)
                     }
                     _ if pending.name == "wait_agent" => (ToolKind::WaitAgent, None, None),
-                    _ if pending.name == "close_agent" => (ToolKind::CloseAgent, None, None),
+                    // close_agent (Codex < v0.139.0) was renamed to interrupt_agent (≥ v0.139.0, PR #26994).
+                    // Accept both for backward compatibility with existing transcripts.
+                    _ if pending.name == "close_agent" || pending.name == "interrupt_agent" => {
+                        (ToolKind::InterruptAgent, None, None)
+                    }
                     _ => (ToolKind::Unknown, None, None),
                 }
             };
@@ -369,6 +391,7 @@ impl ToolCallBuilder {
                 web_query: None,
                 web_url: None,
                 image_prompt: None,
+                image_file_path: None,
                 worker_session: None,
                 status: "completed".to_string(),
                 subagent_id: None,
@@ -495,6 +518,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status,
             subagent_id,
@@ -560,6 +584,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: "completed".to_string(),
             subagent_id,
@@ -647,6 +672,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: str_field(payload, "status"),
             subagent_id,
@@ -680,6 +706,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: str_field(payload, "status"),
             subagent_id,
@@ -713,6 +740,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: "completed".to_string(),
             subagent_id,
@@ -729,7 +757,7 @@ impl ToolCallBuilder {
 
         self.finalized.push(ToolCall {
             call_id,
-            kind: ToolKind::CloseAgent,
+            kind: ToolKind::InterruptAgent,
             name: pending_name.unwrap_or_else(|| kind_name(event_type)),
             arguments: payload.clone(),
             input_text: None,
@@ -746,6 +774,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: "completed".to_string(),
             subagent_id,
@@ -788,6 +817,7 @@ impl ToolCallBuilder {
             web_query: query,
             web_url,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: "completed".to_string(),
             subagent_id,
@@ -840,6 +870,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status,
             subagent_id,
@@ -890,6 +921,7 @@ impl ToolCallBuilder {
             web_query: None,
             web_url: None,
             image_prompt: None,
+            image_file_path: None,
             worker_session: None,
             status: str_field(payload, "status"),
             subagent_id,
@@ -920,6 +952,7 @@ impl ToolCallBuilder {
                 web_query: None,
                 web_url: None,
                 image_prompt: None,
+                image_file_path: None,
                 worker_session: None,
                 status: "unknown".to_string(),
                 subagent_id: None,
@@ -976,6 +1009,7 @@ fn exec_tool_call_from_pending(
         web_query: None,
         web_url: None,
         image_prompt: None,
+        image_file_path: None,
         worker_session: None,
         status: parsed_output.status,
         subagent_id: None,
@@ -1363,6 +1397,49 @@ mod tests {
         );
     }
 
+    // Codex v0.139.0 (PR #26994): multi-agent v2 close_agent renamed to interrupt_agent.
+    // Both old transcripts (close_agent) and new (interrupt_agent) must classify as InterruptAgent.
+
+    #[test]
+    fn close_agent_legacy_classified_as_interrupt_agent() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_close".to_string(),
+            "close_agent".to_string(),
+            r#"{"reason":"task complete"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_close", r#"{"status":"ok"}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::InterruptAgent);
+        assert_eq!(tool.name, "close_agent");
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn interrupt_agent_new_name_classified_as_interrupt_agent() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_interrupt".to_string(),
+            "interrupt_agent".to_string(),
+            r#"{"reason":"task complete"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_interrupt", r#"{"status":"ok"}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::InterruptAgent);
+        assert_eq!(tool.name, "interrupt_agent");
+        assert_eq!(tool.status, "completed");
+    }
+
     // Codex v0.136.0 (PR #25267) renamed the multi-agent v2 assignment tool from
     // `assign_task` to `followup_task` (v0.137.0, PR #25636). Both names must be
     // classified as FollowupTask so sessions from all versions display correctly.
@@ -1377,7 +1454,7 @@ mod tests {
             None,
             None,
         );
-        builder.add_function_call_output("call_assign", r#"{"status":"accepted"}"#);
+        builder.add_function_call_output("call_assign", r#"{"status":"accepted"}"#, None);
 
         assert_eq!(builder.finalized.len(), 1);
         let tool = &builder.finalized[0];
@@ -1397,7 +1474,7 @@ mod tests {
             None,
             None,
         );
-        builder.add_function_call_output("call_followup", r#"{"status":"accepted"}"#);
+        builder.add_function_call_output("call_followup", r#"{"status":"accepted"}"#, None);
 
         assert_eq!(builder.finalized.len(), 1);
         let tool = &builder.finalized[0];
@@ -1717,7 +1794,7 @@ mod tests {
         // v0.135.0+: output is a bare image_url item (no image_span wrapper).
         // The text extraction from the content array yields an empty string —
         // the prompt comes from arguments, not the output.
-        builder.add_function_call_output("call_img", "");
+        builder.add_function_call_output("call_img", "", None);
 
         assert_eq!(builder.finalized.len(), 1);
         let tool = &builder.finalized[0];
@@ -1744,7 +1821,7 @@ mod tests {
             None,
             None,
         );
-        builder.add_function_call_output("call_img2", "");
+        builder.add_function_call_output("call_img2", "", None);
 
         assert_eq!(builder.finalized.len(), 1);
         let tool = &builder.finalized[0];
@@ -1764,13 +1841,96 @@ mod tests {
             None,
         );
         // If upstream text extraction yields something (future format), preserve it.
-        builder.add_function_call_output("call_img3", "Generated image successfully");
+        builder.add_function_call_output("call_img3", "Generated image successfully", None);
 
         assert_eq!(builder.finalized.len(), 1);
         let tool = &builder.finalized[0];
         assert_eq!(tool.kind, ToolKind::ImageGeneration);
         assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
         assert_eq!(tool.output.as_deref(), Some("Generated image successfully"));
+    }
+
+    // Codex v0.138.0 (PRs #25944, #25947): local image attachments and standalone image
+    // generations now expose their saved file paths. The file_path is a top-level field in
+    // the function_call_output payload alongside call_id and output.
+
+    #[test]
+    fn v0138_image_generation_with_file_path_stores_image_file_path() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img_v138".to_string(),
+            "image_generation".to_string(),
+            r#"{"prompt":"a sunset over mountains","size":"1024x1024"}"#,
+            None,
+            None,
+            None,
+        );
+        // v0.138.0: file_path present alongside the image output
+        builder.add_function_call_output(
+            "call_img_v138",
+            "",
+            Some("/home/user/.codex/images/sunset_abc123.png"),
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(
+            tool.image_prompt.as_deref(),
+            Some("a sunset over mountains")
+        );
+        assert_eq!(
+            tool.image_file_path.as_deref(),
+            Some("/home/user/.codex/images/sunset_abc123.png")
+        );
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0138_image_generation_without_file_path_yields_none() {
+        // Pre-v0.138.0 sessions must parse normally with image_file_path as None.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_img_old".to_string(),
+            "image_generation".to_string(),
+            r#"{"prompt":"a mountain lake"}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_img_old", "", None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ImageGeneration);
+        assert_eq!(tool.image_prompt.as_deref(), Some("a mountain lake"));
+        assert!(
+            tool.image_file_path.is_none(),
+            "image_file_path must be None when file_path is absent (pre-v0.138.0)"
+        );
+    }
+
+    #[test]
+    fn v0138_non_image_tool_ignores_file_path_field() {
+        // file_path on a non-image function_call_output must not crash and must not
+        // affect non-image tool calls — the field is only meaningful for image_generation.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_exec_v138".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hi","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+        // The function_call_output for exec_command is processed via finalize_exec, not
+        // add_function_call_output, so file_path passed here is silently ignored.
+        builder.add_function_call_output("call_exec_v138", "hi\n", Some("/tmp/some_file.txt"));
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert!(tool.image_file_path.is_none());
     }
 
     // Codex v0.133.0 (PR #23564): code-mode exec output is now preserved raw unless an
@@ -1838,7 +1998,7 @@ mod tests {
         // v0.133.0 raw output — no "Output:" marker. Content includes phrases that would
         // falsely match metadata patterns if the parser scanned the full output text.
         let raw_output = "   Compiling my-crate v1.0.0\n   Compiling dep-crate v2.3.1\nwarning: unused import\nFinished with exit code: 0\n";
-        builder.add_function_call_output("call_raw", raw_output);
+        builder.add_function_call_output("call_raw", raw_output, None);
 
         assert_eq!(builder.finalized.len(), 1);
         let tool = &builder.finalized[0];
