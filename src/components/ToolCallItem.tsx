@@ -44,7 +44,7 @@ function kindIcon(kind: CodexToolCall["kind"], failed: boolean) {
       return <SpawnIcon />;
     case "wait_agent":
       return <WaitIcon />;
-    case "close_agent":
+    case "interrupt_agent":
       return <CloseAgentIcon />;
     case "followup_task":
       return <FollowupTaskIcon />;
@@ -69,7 +69,7 @@ function kindClass(kind: CodexToolCall["kind"]): string {
       return "tool-call--image";
     case "spawn_agent":
     case "wait_agent":
-    case "close_agent":
+    case "interrupt_agent":
     case "followup_task":
       return "tool-call--collab";
     case "shell_hook":
@@ -295,7 +295,7 @@ function ToolCallBody({ tool, popout = false }: { tool: CodexToolCall; popout?: 
 
       {(tool.kind === "spawn_agent" ||
         tool.kind === "wait_agent" ||
-        tool.kind === "close_agent" ||
+        tool.kind === "interrupt_agent" ||
         tool.kind === "followup_task") &&
         Object.keys(tool.arguments ?? {}).length > 0 && (
           <div className="tool-call__section tool-call__section--input">

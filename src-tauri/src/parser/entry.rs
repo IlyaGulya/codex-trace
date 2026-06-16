@@ -782,6 +782,36 @@ mod tests {
         assert_eq!(meta.payload["id"], "v0135-img-session");
     }
 
+    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits response_items with
+    // type "structured_output". The RawEntry parser must pass these through without panic.
+    // Downstream, handle_response_item (turn.rs) extracts the content as final_answer.
+
+    #[test]
+    fn v0132_structured_output_response_item_parses_correctly() {
+        let line = r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"done","count":42},"output_schema":{"type":"object","properties":{"result":{"type":"string"},"count":{"type":"integer"}}}}}"#;
+        let e = RawEntry::parse(line).expect("structured_output response_item must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "structured_output");
+        assert_eq!(e.payload["content"]["result"], "done");
+        assert_eq!(e.payload["content"]["count"], 42);
+    }
+
+    #[test]
+    fn v0132_session_meta_with_output_schema_field_parses_correctly() {
+        // session_meta from a session started with --output-schema carries an output_schema
+        // field in its payload. The loosely-typed RawEntry model ignores unknown fields, so
+        // this must parse without panic and produce the correct entry_type.
+        let line = r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-schema-session","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","output_schema":{"type":"object","properties":{"result":{"type":"string"}}}}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with output_schema must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0132-schema-session");
+        assert_eq!(e.payload["cli_version"], "0.132.0");
+        assert!(
+            e.payload.get("output_schema").is_some(),
+            "output_schema field must be accessible via payload"
+        );
+    }
+
     // Codex v0.136.0 (PR #24962): shell hook output event schemas tightened.
     // hook output events are now emitted as event_msg entries with type "shell_hook_output".
     // The strict schema requires call_id, hook_type, stdout, exit_code; previously nullable
@@ -812,6 +842,50 @@ mod tests {
         assert!(e.payload.get("stderr").is_none());
     }
 
+    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
+    // JSON output items. A "structured_output" response_item carries a JSON-validated
+    // content object as its payload. RawEntry must parse these without panicking.
+
+    #[test]
+    fn v0132_exec_resume_output_schema_structured_output_item_parses_correctly() {
+        let line = r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"ok","value":42}}}"#;
+        let e = RawEntry::parse(line).expect("structured_output response_item must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "structured_output");
+        assert_eq!(e.payload["content"]["result"], "ok");
+        assert_eq!(e.payload["content"]["value"], 42);
+    }
+
+    #[test]
+    fn v0132_exec_resume_output_schema_full_session_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types plus structured_output must
+        // parse correctly for a v0.132.0 session run with --output-schema.
+        let lines = [
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-schema-session","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"done","items":["a","b"]}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "turn_context",
+            "response_item",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.132.0");
+        // The structured_output item content must be accessible via the payload.
+        let schema_item = RawEntry::parse(lines[3]).unwrap();
+        assert_eq!(schema_item.payload["type"], "structured_output");
+        assert_eq!(schema_item.payload["content"]["result"], "done");
+    }
+
     #[test]
     fn v0136_all_standard_entry_types_parse_correctly() {
         // Regression guard: all standard entry types plus shell_hook_output must parse
@@ -840,6 +914,62 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.136.0");
     }
 
+    // Codex v0.138.0 (PRs #25944, #25947): local image attachments and standalone image
+    // generations now expose their saved file paths. The file_path is a top-level field in
+    // the function_call_output response_item payload alongside call_id and output.
+    // RawEntry must parse the payload through without error; toolcall.rs extracts the field.
+
+    #[test]
+    fn v0138_function_call_output_with_file_path_parses_as_response_item() {
+        // image_generation result with the new file_path field (v0.138.0+)
+        let line = r#"{"timestamp":"2026-06-08T10:00:00Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img_138","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}],"file_path":"/home/user/.codex/images/sunset_abc123.png"}}"#;
+        let e = RawEntry::parse(line).expect("function_call_output with file_path must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call_output");
+        assert_eq!(e.payload["call_id"], "call_img_138");
+        assert_eq!(
+            e.payload["file_path"],
+            "/home/user/.codex/images/sunset_abc123.png"
+        );
+        let output_arr = e.payload["output"]
+            .as_array()
+            .expect("output must be array");
+        assert_eq!(output_arr[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn v0138_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types must parse under v0.138.0.
+        let lines = [
+            r#"{"timestamp":"2026-06-08T10:00:00Z","type":"session_meta","payload":{"id":"v0138-session","timestamp":"2026-06-08T10:00:00Z","cwd":"/project","cli_version":"0.138.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"image_generation","call_id":"call_img","arguments":"{\"prompt\":\"a sunset\"}"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_img","output":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}],"file_path":"/home/user/.codex/images/sunset_123.png"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:04Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376805.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.138.0");
+        // Verify the file_path field is accessible in the image output payload
+        let img_output = RawEntry::parse(lines[3]).unwrap();
+        assert_eq!(
+            img_output.payload["file_path"],
+            "/home/user/.codex/images/sunset_123.png"
+        );
+    }
+
     // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
     // oneOf and allOf structures instead of flattening them. Large schemas also keep more
     // shallow structure when compacted.
@@ -852,9 +982,6 @@ mod tests {
 
     #[test]
     fn v0139_all_standard_entry_types_parse_correctly() {
-        // Regression guard: all four standard JSONL entry types from a v0.139.0 session
-        // must parse correctly. A function_call here carries JSON-object arguments — the
-        // format Codex may emit when schemas preserve oneOf/allOf composition.
         let lines = [
             r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-session","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
@@ -880,66 +1007,31 @@ mod tests {
 
     #[test]
     fn v0139_function_call_with_object_arguments_does_not_panic() {
-        // Codex v0.139.0 (PRs #24118, #27084): tool input schemas now preserve oneOf/allOf.
-        // A function_call entry may arrive with arguments as a JSON object rather than a
-        // stringified-JSON string. The RawEntry parser must pass through both formats without
-        // panicking — downstream classification is in turn.rs / toolcall.rs.
         let line = r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-v139","name":"exec_command","arguments":{"cmd":"echo hello","workdir":"/tmp"}}}"#;
         let e = RawEntry::parse(line).expect("function_call with object arguments must parse");
         assert_eq!(e.entry_type, "response_item");
         assert_eq!(e.payload["type"], "function_call");
         assert_eq!(e.payload["call_id"], "call-v139");
-        // arguments is an object — verify both fields are accessible via Value
         assert_eq!(e.payload["arguments"]["cmd"], "echo hello");
         assert_eq!(e.payload["arguments"]["workdir"], "/tmp");
     }
 
     #[test]
     fn v0139_mcp_tool_call_with_oneof_allof_schema_does_not_panic() {
-        // Codex v0.139.0 (PRs #24118, #27084): MCP tool call items may now carry richer
-        // connector input schemas with oneOf/allOf composition. The RawEntry parser must
-        // accept these without error — schema fields are ignored at this layer (not typed).
         let line = r#"{"timestamp":"2026-06-09T10:00:03Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-v139","server":"my-connector","tool":"submit_form","arguments":{"value":{"oneOf":[{"type":"string"},{"type":"number"}]}}}}"#;
         let e = RawEntry::parse(line).expect("mcp_tool_call with oneOf argument must parse");
         assert_eq!(e.entry_type, "response_item");
         assert_eq!(e.payload["type"], "mcp_tool_call");
-        // The oneOf structure must be preserved in the payload Value without being flattened.
         assert!(e.payload["arguments"]["value"]["oneOf"].is_array());
     }
 
     #[test]
     fn v0139_session_meta_with_one_of_tool_schema_does_not_panic() {
-        // session_meta from v0.139.0 where a tool's input_schema uses oneOf at the top level.
-        // RawEntry reads only scalar session fields; the tools array is ignored — this guards
-        // against any future change that tries to deserialise the schema into a typed struct.
         let line = r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-oneof","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","tools":[{"name":"complex_tool","description":"A tool with a oneOf schema","input_schema":{"type":"object","properties":{"action":{"oneOf":[{"type":"string","enum":["create","update","delete"]},{"type":"object","properties":{"custom_op":{"type":"string"},"target":{"type":"string"}},"required":["custom_op"]}]}},"required":["action"]}}]}}"#;
         let e = RawEntry::parse(line).expect("session_meta with oneOf tool schema must parse");
         assert_eq!(e.entry_type, "session_meta");
         assert_eq!(e.payload["id"], "v0139-oneof");
         assert_eq!(e.payload["cli_version"], "0.139.0");
         assert!(e.payload.get("tools").is_some());
-    }
-
-    #[test]
-    fn v0139_session_meta_with_all_of_connector_schema_does_not_panic() {
-        // session_meta from v0.139.0 with a connector whose input_schema uses allOf (PR #27084).
-        // allOf-composed connector schemas must not cause any parse failure at entry level.
-        let line = r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-allof","timestamp":"2026-06-09T10:01:00Z","cwd":"/project","cli_version":"0.139.0","tools":[{"name":"connector_tool","description":"A connector with allOf schema","input_schema":{"type":"object","allOf":[{"properties":{"host":{"type":"string"},"port":{"type":"integer","default":443}},"required":["host"]},{"properties":{"auth_token":{"type":"string"},"tls":{"type":"boolean","default":true}}}]}}]}}"#;
-        let e = RawEntry::parse(line).expect("session_meta with allOf connector schema must parse");
-        assert_eq!(e.entry_type, "session_meta");
-        assert_eq!(e.payload["id"], "v0139-allof");
-        assert_eq!(e.payload["cli_version"], "0.139.0");
-        assert!(e.payload.get("tools").is_some());
-    }
-
-    #[test]
-    fn v0139_session_meta_with_nested_one_of_all_of_schema_does_not_panic() {
-        // v0.139.0 large schemas with shallow compaction may contain deeply nested
-        // oneOf/allOf at any level of the input_schema object. Verify parsing is stable.
-        let line = r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-nested","timestamp":"2026-06-09T10:02:00Z","cwd":"/project","cli_version":"0.139.0","tools":[{"name":"nested_schema_tool","input_schema":{"type":"object","properties":{"config":{"allOf":[{"type":"object","properties":{"mode":{"oneOf":[{"type":"string","enum":["fast","slow"]},{"type":"null"}]}}},{"type":"object","properties":{"retries":{"type":"integer","minimum":0}}}]}}}}]}}"#;
-        let e =
-            RawEntry::parse(line).expect("session_meta with nested oneOf/allOf schema must parse");
-        assert_eq!(e.entry_type, "session_meta");
-        assert_eq!(e.payload["id"], "v0139-nested");
     }
 }

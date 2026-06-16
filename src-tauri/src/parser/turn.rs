@@ -41,6 +41,18 @@ pub struct TokenInfo {
     pub model_context_window: u64,
 }
 
+/// A single memory summary item from a `turn_context` memories payload.
+///
+/// Codex v0.132.0 (PR #23148) made memory summaries versioned: items are now
+/// objects `{"content":"...","version":1}` instead of plain strings.
+/// Pre-v0.132.0 sessions carry plain strings; `version` is `None` for those.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemorySummary {
+    pub content: String,
+    /// Format version. None for pre-v0.132.0 sessions (plain-string format).
+    pub version: Option<u32>,
+}
+
 /// Compaction metadata embedded in turn headers (Codex v0.135.0, PR #24368).
 /// Captures the state of context compaction at the start of a turn so that
 /// context-window accounting in traces remains accurate even after compaction.
@@ -117,8 +129,9 @@ pub struct CodexTurn {
     /// Null when the turn header carries no compaction info (pre-v0.135.0 sessions).
     pub compaction_meta: Option<CompactionMeta>,
     /// Active memories injected into context at turn start (Codex v0.135.0+, PR #24591).
+    /// Items carry an optional version field (Codex v0.132.0+, PR #23148).
     /// Empty for sessions from older Codex versions.
-    pub memories: Vec<String>,
+    pub memories: Vec<MemorySummary>,
 }
 
 impl CodexTurn {
@@ -751,12 +764,18 @@ fn handle_response_item(
                     .join(""),
                 _ => String::new(),
             };
+            // Codex v0.138.0 (PRs #25944, #25947): image_generation and local image attachment
+            // results now include a top-level file_path field exposing the saved file path.
+            let file_path = payload
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             if let Some(spawn) = spawn_from_function_call_output(builder, &call_id, &output) {
                 if let Some(turn) = turns.get_mut(tid) {
                     turn.collab_spawns.push(spawn);
                 }
             }
-            builder.add_function_call_output(&call_id, &output);
+            builder.add_function_call_output(&call_id, &output, file_path);
         }
 
         "custom_tool_call" => {
@@ -852,7 +871,7 @@ fn handle_response_item(
                     .join(""),
                 _ => String::new(),
             };
-            builder.add_function_call_output(&call_id, &output);
+            builder.add_function_call_output(&call_id, &output, None);
         }
 
         // Codex < v0.133.0 (PR #23075 removed UserTurn): user input was emitted as a
@@ -943,6 +962,35 @@ fn handle_response_item(
             }
         }
 
+        // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits the final
+        // model response as a "structured_output" response_item whose `content` field holds a
+        // JSON object validated against the provided schema. Without this handler the item falls
+        // through to `_ => {}` and the turn's final_answer is never populated.
+        "structured_output" => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.final_answer.is_none() {
+                    let text = extract_item_content(payload);
+                    if !text.is_empty() {
+                        turn.final_answer = Some(text);
+                    }
+                }
+            }
+        }
+
+        // Handle assistant message response_items. This includes schema-validated JSON content
+        // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where `content`
+        // is a JSON object rather than a plain string.
+        "message" if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+            if let Some(turn) = turns.get_mut(tid) {
+                if turn.final_answer.is_none() {
+                    let text = extract_item_content(payload);
+                    if !text.is_empty() {
+                        turn.final_answer = Some(text);
+                    }
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -967,12 +1015,34 @@ fn handle_turn_context(
         .map(|s| s.to_string());
     // Codex v0.135.0 (PR #24591): memories are now stored in a dedicated SQLite DB and
     // injected into the context at turn start. The active set is written into turn_context.
-    let memories: Vec<String> = payload
+    // Codex v0.132.0 (PR #23148): memory summary items are versioned objects
+    // {"content":"...","version":N}; pre-v0.132.0 sessions use plain strings.
+    let memories: Vec<MemorySummary> = payload
         .get("memories")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .filter_map(|item| {
+                    if let Some(s) = item.as_str() {
+                        // Pre-v0.132.0: plain string memory
+                        Some(MemorySummary {
+                            content: s.to_string(),
+                            version: None,
+                        })
+                    } else if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                        // v0.132.0+: versioned object {"content":"...","version":N}
+                        let version = item
+                            .get("version")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                        Some(MemorySummary {
+                            content: content.to_string(),
+                            version,
+                        })
+                    } else {
+                        None
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -992,6 +1062,26 @@ fn handle_turn_context(
                 turn.memories = memories;
             }
         }
+    }
+}
+
+/// Extract text from a response_item `content` field.
+/// Handles:
+/// - Plain strings (standard message content)
+/// - Content arrays (`[{"type":"text","text":"..."}]`, OpenAI format)
+/// - JSON objects (schema-validated responses from `codex exec resume --output-schema`,
+///   Codex v0.132.0+, PR #23123)
+fn extract_item_content(payload: &Value) -> String {
+    let content = payload.get("content").or_else(|| payload.get("output"));
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -2586,8 +2676,13 @@ mod tests {
         let turns = build_turns(&entries);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].memories.len(), 2);
-        assert_eq!(turns[0].memories[0], "User prefers terse output");
-        assert_eq!(turns[0].memories[1], "Project uses TypeScript strict mode");
+        assert_eq!(turns[0].memories[0].content, "User prefers terse output");
+        assert_eq!(turns[0].memories[0].version, None);
+        assert_eq!(
+            turns[0].memories[1].content,
+            "Project uses TypeScript strict mode"
+        );
+        assert_eq!(turns[0].memories[1].version, None);
         assert_eq!(turns[0].model.as_deref(), Some("gpt-5"));
     }
 
@@ -2621,11 +2716,70 @@ mod tests {
 
         let turns = build_turns(&entries);
         assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].memories, vec!["Initial memory"]);
-        assert_eq!(
-            turns[1].memories,
-            vec!["Initial memory", "New memory added"]
-        );
+        assert_eq!(turns[0].memories.len(), 1);
+        assert_eq!(turns[0].memories[0].content, "Initial memory");
+        assert_eq!(turns[0].memories[0].version, None);
+        assert_eq!(turns[1].memories.len(), 2);
+        assert_eq!(turns[1].memories[0].content, "Initial memory");
+        assert_eq!(turns[1].memories[1].content, "New memory added");
+    }
+
+    // Codex v0.132.0 (PR #23148): memory summaries are now versioned and rebuilt when the
+    // stored format is stale. Memory items in turn_context are now objects
+    // {"content":"...","version":N} instead of plain strings. The parser must handle both
+    // formats for backward compatibility.
+
+    #[test]
+    fn v0132_versioned_memory_summary_parsed_with_version_field() {
+        // v0.132.0+: memory items are objects {"content":"...","version":N}
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-mem","timestamp":"2026-05-20T10:00:00Z","cwd":"/project","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":[{"content":"User prefers terse output","version":1},{"content":"Project uses TypeScript","version":2}]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 2);
+        assert_eq!(turns[0].memories[0].content, "User prefers terse output");
+        assert_eq!(turns[0].memories[0].version, Some(1));
+        assert_eq!(turns[0].memories[1].content, "Project uses TypeScript");
+        assert_eq!(turns[0].memories[1].version, Some(2));
+    }
+
+    #[test]
+    fn v0132_versioned_memory_summary_without_version_field_is_tolerated() {
+        // Object format but missing the version field — version must be None, not a panic.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-mem-noversion","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":[{"content":"Remember to be concise"}]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 1);
+        assert_eq!(turns[0].memories[0].content, "Remember to be concise");
+        assert_eq!(turns[0].memories[0].version, None);
+    }
+
+    #[test]
+    fn v0132_memory_summaries_backward_compatible_with_plain_strings() {
+        // Pre-v0.132.0 sessions use plain strings — must still parse without error.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"pre-v0132-mem","timestamp":"2026-05-20T10:00:00Z","cli_version":"0.131.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","memories":["Plain string memory"]}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748253603.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].memories.len(), 1);
+        assert_eq!(turns[0].memories[0].content, "Plain string memory");
+        assert_eq!(turns[0].memories[0].version, None);
     }
 
     // Codex v0.135.0 (PR #24652): plain image wrapper spans removed from session output.
@@ -2797,21 +2951,210 @@ mod tests {
         assert_eq!(turns[0].tool_calls[0].kind, ToolKind::ShellHook);
     }
 
-    // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
-    // oneOf and allOf structures instead of flattening them. Large schemas also keep more
-    // shallow structure when compacted. This means function_call and mcp_tool_call entries
-    // may now carry arguments as JSON objects rather than stringified JSON strings when the
-    // schema contains composition keywords.
+    // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` produces structured
+    // JSON output items. The final model response is emitted as a "structured_output"
+    // response_item with a JSON object in `content`. codex-trace must capture this as the
+    // turn's final_answer so exec sessions with --output-schema display correctly.
+
+    #[test]
+    fn v0132_structured_output_response_item_sets_final_answer() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-schema","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","content":{"result":"success","count":42}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert!(
+            turn.final_answer.is_some(),
+            "structured_output response_item must populate final_answer"
+        );
+        let answer = turn.final_answer.as_ref().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(answer).expect("final_answer must be valid JSON");
+        assert_eq!(v["result"], "success");
+        assert_eq!(v["count"], 42);
+    }
+
+    #[test]
+    fn v0132_structured_output_with_string_content_sets_final_answer() {
+        // structured_output may carry a plain string in the content field rather than a
+        // JSON object when the schema resolves to a primitive type.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-str-output","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","content":"schema-validated plain text"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("schema-validated plain text"),
+            "string-typed structured_output content must be stored verbatim"
+        );
+    }
+
+    #[test]
+    fn v0132_structured_output_does_not_overwrite_existing_final_answer() {
+        // task_complete.last_agent_message takes precedence; a structured_output response_item
+        // that arrives before task_complete must not clobber the answer set by agent_message.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-priority","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"prior final answer","phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"should":"not overwrite"}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("prior final answer"),
+            "structured_output must not overwrite an already-set final_answer"
+        );
+    }
+
+    #[test]
+    fn v0132_structured_output_output_field_fallback_sets_final_answer() {
+        // Some structured_output items may use `output` instead of `content`.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-output-field","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"structured_output","output":{"status":"ok","value":99}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let answer = turns[0]
+            .final_answer
+            .as_deref()
+            .expect("final_answer must be set from output field of structured_output");
+        assert!(answer.contains("ok"));
+        assert!(answer.contains("99"));
+    }
+
+    #[test]
+    fn v0132_message_response_item_with_json_object_content_sets_final_answer() {
+        // Codex v0.132.0+ (PR #23123): `--output-schema` sessions may emit the structured
+        // response as a "message" response_item where `content` is a JSON object rather than
+        // a plain string. This must populate final_answer so the turn is not left empty.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-msg-schema","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":{"status":"done","items":["a","b"]}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert!(
+            turn.final_answer.is_some(),
+            "message response_item with JSON content must populate final_answer"
+        );
+        let answer = turn.final_answer.as_ref().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(answer).expect("final_answer must be valid JSON");
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["items"][0], "a");
+    }
+
+    #[test]
+    fn v0132_message_response_item_with_plain_string_sets_final_answer() {
+        // Plain-text assistant message response_items (common in exec sessions) must
+        // also populate final_answer.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-msg-plain","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Task completed successfully."}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Task completed successfully.")
+        );
+    }
+
+    #[test]
+    fn v0132_task_complete_last_agent_message_overrides_message_item_final_answer() {
+        // task_complete.last_agent_message always overwrites final_answer (fires last in
+        // the stream). This test ensures the priority order is preserved.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-override","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"preliminary answer"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0,"last_agent_message":"definitive answer from task_complete"}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("definitive answer from task_complete")
+        );
+    }
+
+    #[test]
+    fn v0132_user_message_response_item_does_not_set_final_answer() {
+        // Only "assistant" role message response_items should populate final_answer;
+        // user-role items must not.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-user-msg","timestamp":"2026-05-20T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":"user request here"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].final_answer.is_none(),
+            "user-role message must not set final_answer"
+        );
+    }
+
+    #[test]
+    fn v0132_all_standard_entry_types_plus_structured_output_parse_correctly() {
+        // Regression guard: a v0.132.0 --output-schema session must parse all four
+        // standard entry types plus the structured_output response_item without error,
+        // and the turn must reach Complete status with final_answer populated.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"v0132-schema-full","timestamp":"2026-05-20T10:00:00Z","cwd":"/tmp","cli_version":"0.132.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"structured_output","content":{"status":"ok","value":99}}}"#,
+            r#"{"timestamp":"2026-05-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748606404.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, TurnStatus::Complete);
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+        let answer = turn
+            .final_answer
+            .as_ref()
+            .expect("structured_output must set final_answer");
+        let v: serde_json::Value = serde_json::from_str(answer).expect("must be valid JSON");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["value"], 99);
+    }
+
+    // Codex v0.139.0 (PRs #24118, #27084): function_call arguments may arrive as a JSON
+    // object rather than a stringified-JSON string. Verify the parser handles both.
 
     #[test]
     fn v0139_function_call_with_object_arguments_preserves_arguments() {
-        // Before the fix, function_call arguments were extracted with .as_str().unwrap_or("{}")
-        // which silently dropped object arguments. After the fix, object arguments are
-        // serialised to a string with serde_json::to_string — matching mcp_tool_call behaviour.
         let lines = [
             r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-obj-args","timestamp":"2026-06-09T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            // arguments is a JSON object (not a stringified-JSON string)
             r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-obj","name":"exec_command","arguments":{"cmd":"echo hello","workdir":"/tmp"}}}"#,
             r#"{"timestamp":"2026-06-09T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-obj","output":"hello\n"}}"#,
             r#"{"timestamp":"2026-06-09T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466804.0}}"#,
@@ -2825,29 +3168,22 @@ mod tests {
         assert_eq!(turns[0].tool_calls.len(), 1);
         let tool = &turns[0].tool_calls[0];
         assert_eq!(tool.name, "exec_command");
-        // arguments must not be Value::Null (the fallback when object args were silently dropped)
         assert!(
             !tool.arguments.is_null(),
-            "JSON-object arguments must not be silently dropped (regression: was Value::Null)"
+            "JSON-object arguments must not be silently dropped"
         );
-        // The cmd field must be accessible from the preserved arguments object.
         assert_eq!(
             tool.arguments.get("cmd").and_then(|v| v.as_str()),
             Some("echo hello"),
-            "cmd argument must be preserved from JSON-object arguments"
         );
         assert_eq!(tool.output.as_deref(), Some("hello\n"));
     }
 
     #[test]
     fn v0139_function_call_with_oneof_allof_arguments_parses_without_error() {
-        // Codex v0.139.0 (PRs #24118, #27084): tool schemas preserving oneOf/allOf may cause
-        // the model to pass arguments whose values reflect those composition types. The parser
-        // must not panic or drop these arguments.
         let lines = [
             r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-oneof","timestamp":"2026-06-09T10:01:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-09T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            // function_call with complex nested arguments (schema-driven complex structure)
             r#"{"timestamp":"2026-06-09T10:01:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-oneof","name":"submit_form","arguments":{"field":{"type":"text","value":"hello"},"options":{"oneOf":[{"label":"A","val":1},{"label":"B","val":2}]}}}}"#,
             r#"{"timestamp":"2026-06-09T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-oneof","output":"submitted"}}"#,
             r#"{"timestamp":"2026-06-09T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466864.0}}"#,
@@ -2860,112 +3196,8 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].tool_calls.len(), 1);
         let tool = &turns[0].tool_calls[0];
-        assert_eq!(tool.name, "submit_form");
-        assert!(
-            !tool.arguments.is_null(),
-            "complex JSON-object arguments must be preserved"
-        );
-        // The oneOf structure in arguments must be accessible without errors.
-        assert!(
-            tool.arguments.get("options").is_some(),
-            "nested argument fields must not be dropped"
-        );
+        assert!(!tool.arguments.is_null());
+        assert!(tool.arguments.get("options").is_some());
         assert_eq!(tool.output.as_deref(), Some("submitted"));
-    }
-
-    #[test]
-    fn v0139_all_standard_entry_types_parse_correctly() {
-        // Regression guard: all four standard JSONL entry types from a v0.139.0 session
-        // must parse correctly.
-        let lines = [
-            r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-session","timestamp":"2026-06-09T10:02:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466924.0}}"#,
-        ];
-        let parsed: Vec<_> = lines
-            .iter()
-            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
-            .collect();
-        assert_eq!(parsed.len(), 5);
-        let turns = build_turns(&parsed);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].status, TurnStatus::Complete);
-        assert_ne!(turns[0].status, TurnStatus::Ongoing);
-    }
-
-    #[test]
-    fn v0139_mcp_tool_call_with_one_of_input_schema_classified_as_mcp_tool() {
-        // mcp_tool_call response_item from v0.139.0 carrying an input_schema with oneOf.
-        // input_schema is not used by the parser — only call_id, server, tool, arguments,
-        // plugin_id matter. The schema must be silently ignored and the call classified
-        // correctly as McpTool.
-        let lines = [
-            r#"{"timestamp":"2026-06-09T10:00:00Z","type":"session_meta","payload":{"id":"v0139-mcp","timestamp":"2026-06-09T10:00:00Z"}}"#,
-            r#"{"timestamp":"2026-06-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-09T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"call-mcp-v0139","server":"my_server","tool":"search","arguments":{"query":"test"},"input_schema":{"type":"object","properties":{"query":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}},"required":["query"]}}}"#,
-            r#"{"timestamp":"2026-06-09T10:00:03Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call-mcp-v0139","result":{"Ok":{"content":[{"type":"text","text":"result data"}]}}}}"#,
-            r#"{"timestamp":"2026-06-09T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466804.0}}"#,
-        ];
-        let entries = entries(&lines);
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].tool_calls.len(), 1);
-        let tc = &turns[0].tool_calls[0];
-        assert_eq!(tc.kind, ToolKind::McpTool);
-        assert_eq!(tc.mcp_server.as_deref(), Some("my_server"));
-        assert_eq!(tc.mcp_tool.as_deref(), Some("search"));
-        assert_eq!(tc.output.as_deref(), Some("result data"));
-        assert_eq!(tc.status, "completed");
-    }
-
-    #[test]
-    fn v0139_mcp_tool_call_with_all_of_input_schema_classified_as_mcp_tool() {
-        // mcp_tool_call response_item with an allOf-composed input_schema (PR #27084).
-        // build_turns must parse the item without panic and classify it as McpTool.
-        let lines = [
-            r#"{"timestamp":"2026-06-09T10:01:00Z","type":"session_meta","payload":{"id":"v0139-allof-mcp","timestamp":"2026-06-09T10:01:00Z"}}"#,
-            r#"{"timestamp":"2026-06-09T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-09T10:01:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"call-allof","server":"connector_server","tool":"connect","arguments":{"host":"db.example.com","port":5432},"input_schema":{"type":"object","allOf":[{"properties":{"host":{"type":"string"}},"required":["host"]},{"properties":{"port":{"type":"integer","default":5432}}}]}}}"#,
-            r#"{"timestamp":"2026-06-09T10:01:03Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call-allof","result":{"Ok":{"content":[{"type":"text","text":"connected"}]}}}}"#,
-            r#"{"timestamp":"2026-06-09T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466864.0}}"#,
-        ];
-        let entries = entries(&lines);
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].tool_calls.len(), 1);
-        let tc = &turns[0].tool_calls[0];
-        assert_eq!(tc.kind, ToolKind::McpTool);
-        assert_eq!(tc.mcp_server.as_deref(), Some("connector_server"));
-        assert_eq!(tc.mcp_tool.as_deref(), Some("connect"));
-        assert_eq!(tc.output.as_deref(), Some("connected"));
-    }
-
-    #[test]
-    fn v0139_function_call_alongside_complex_schema_session_meta_classified_correctly() {
-        // A function_call in a session whose session_meta carries tools with oneOf/allOf
-        // schemas must be classified and finalized correctly. Schema complexity in
-        // session_meta must not affect turn building or tool call classification.
-        let lines = [
-            r#"{"timestamp":"2026-06-09T10:02:00Z","type":"session_meta","payload":{"id":"v0139-fc","timestamp":"2026-06-09T10:02:00Z","cli_version":"0.139.0","tools":[{"name":"exec_command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"},"workdir":{"oneOf":[{"type":"string"},{"type":"null"}]}},"required":["cmd"]}}]}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls /project\",\"workdir\":\"/project\"}","call_id":"call-fc-v0139"}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-fc-v0139","aggregated_output":"src\ntests\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":30000000}}}"#,
-            r#"{"timestamp":"2026-06-09T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749466924.0}}"#,
-        ];
-        let entries = entries(&lines);
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].tool_calls.len(), 1);
-        let tc = &turns[0].tool_calls[0];
-        assert_eq!(tc.kind, ToolKind::ExecCommand);
-        assert_eq!(tc.name, "exec_command");
-        assert_eq!(tc.output.as_deref(), Some("src\ntests\n"));
-        assert_eq!(tc.exit_code, Some(0));
-        assert_eq!(tc.status, "completed");
     }
 }
