@@ -4,6 +4,64 @@ All notable changes to codex-trace are documented here. Versions follow
 [semantic versioning](https://semver.org/), and this file follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.2.0] — 2026-06-16
+
+A readability upgrade for the turn view plus a sweep of parser compatibility with the
+latest Codex CLI releases (v0.132.0 through v0.139.0). If your sessions had blank final
+answers, missing memory notes, or tool calls that looked corrupted on newer Codex
+builds, this release fixes those — and the assistant's commentary now reads inline,
+in order, alongside the tool calls it interleaves with.
+
+### Added
+
+- **Assistant commentary renders inline**
+  ([`20d48f4`](https://github.com/PixelPaw-Labs/codex-trace/commit/20d48f4)). The
+  assistant's prose is now a first-class timeline item ("Complementary") shown expanded
+  by default, so a turn reads commentary → tool call → commentary → … → final answer top
+  to bottom instead of leaving the text as loose lines above a tool box.
+- **Image file paths from generated images**
+  ([`1deb184`](https://github.com/PixelPaw-Labs/codex-trace/commit/1deb184)). Codex
+  v0.138.0 attaches a `file_path` to image-generation results; codex-trace now surfaces
+  it so you can see where a generated image landed on disk.
+- **Archived-session awareness**
+  ([`fcc8bc4`](https://github.com/PixelPaw-Labs/codex-trace/commit/fcc8bc4)). Sessions
+  archived or unarchived via Codex v0.136.0's `codex archive` / `/archive` are now
+  tracked, so archived runs are recognized rather than shown as ordinary sessions.
+
+### Fixed
+
+- **Raw command output no longer corrupts tool-call details**
+  ([`6850c30`](https://github.com/PixelPaw-Labs/codex-trace/commit/6850c30)). On Codex
+  v0.133.0, exec output is kept verbatim; phrases like "exit code: 1" inside real output
+  were being mistaken for metadata. Exec metadata is now read only from the structured
+  `Output:` marker, so a compiler or test log can no longer fake an exit code or
+  duration.
+- **Tool calls with structured arguments are no longer dropped**
+  ([`f081fd0`](https://github.com/PixelPaw-Labs/codex-trace/commit/f081fd0)). Codex
+  v0.139.0 can emit `function_call` arguments as a JSON object rather than a string;
+  those calls now parse and display instead of showing up empty.
+- **Final answers from `--output-schema` runs now display**
+  ([`26f1874`](https://github.com/PixelPaw-Labs/codex-trace/commit/26f1874)). Codex
+  v0.132.0 `structured_output` / `message` response items were silently skipped, leaving
+  the final answer blank; they're now shown.
+- **Versioned memory summaries are parsed again**
+  ([`947f248`](https://github.com/PixelPaw-Labs/codex-trace/commit/947f248)). Codex
+  v0.132.0 made `turn_context` memories versioned objects instead of plain strings,
+  which dropped them from the view; both forms are now handled.
+- **Agent-interrupt events are recognized under their new name**
+  ([`b9f9bd1`](https://github.com/PixelPaw-Labs/codex-trace/commit/b9f9bd1)). Codex
+  v0.139.0 renamed `close_agent` to `interrupt_agent`; both names are now classified
+  correctly, so multi-agent runs keep displaying these events.
+
+### Changed
+
+- **Fonts aligned with claude-code-trace**
+  ([`20d48f4`](https://github.com/PixelPaw-Labs/codex-trace/commit/20d48f4)). Detail-view
+  text now uses fixed `px` sizing (13px prose) instead of `rem`, so type no longer
+  rescales with browser/OS root font settings.
+
+[0.2.0]: https://github.com/PixelPaw-Labs/codex-trace/releases/tag/v0.2.0
+
 ## [0.1.0] — 2026-06-08
 
 The first release of Codex Trace — a desktop app for browsing and inspecting your
