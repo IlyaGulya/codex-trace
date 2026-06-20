@@ -1078,6 +1078,58 @@ mod tests {
         assert!(e.payload.get("tools").is_some());
     }
 
+    // Codex v0.140.0 (PRs #27504, #27535, #27539, #27541): CLI auth tokens and MCP OAuth
+    // credentials were migrated from plaintext files to an encrypted secret store. The new
+    // config option `secret_auth_storage_configuration` controls which backend is used.
+    //
+    // codex-trace reads only JSONL session files at ~/.codex/sessions/ — it never reads
+    // credential files, auth token files, or Codex CLI config files from the Codex home
+    // directory. The encrypted credential storage change is therefore invisible to this
+    // parser. These tests confirm all standard entry types from a v0.140.0 session parse
+    // correctly, and that a session_meta carrying the new auth config field is handled
+    // without errors (unknown fields are gracefully ignored by the Value-based parser).
+
+    #[test]
+    fn v0140_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-session","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749988804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.140.0");
+        assert_eq!(meta.payload["id"], "v0140-session");
+    }
+
+    #[test]
+    fn v0140_session_meta_with_secret_auth_storage_configuration_does_not_panic() {
+        // session_meta may carry the new secret_auth_storage_configuration field introduced
+        // in v0.140.0. The field names the credential storage backend ("keychain", "file",
+        // etc.). codex-trace never reads credential files — it only extracts known fields
+        // from the payload — so this unknown field must be silently ignored.
+        let line = r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-auth","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai","secret_auth_storage_configuration":"keychain","mcp_oauth_storage":"encrypted"}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with auth config fields must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0140-auth");
+        assert_eq!(e.payload["cli_version"], "0.140.0");
+        // Auth config fields are present in the raw payload but codex-trace does not use them.
+        assert_eq!(e.payload["secret_auth_storage_configuration"], "keychain");
+        assert_eq!(e.payload["mcp_oauth_storage"], "encrypted");
+    }
+
     // Codex v0.136.0: `codex archive` / `codex unarchive` append session_archived and
     // session_unarchived entries to the JSONL file.
 
