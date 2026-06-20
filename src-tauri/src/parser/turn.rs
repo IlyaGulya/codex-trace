@@ -320,9 +320,15 @@ fn handle_event_msg(
             });
             turns.insert(turn_id.clone(), turn);
             *current_turn_id = Some(turn_id.clone());
-            tool_builders
+            let builder = tool_builders
                 .entry(turn_id)
                 .or_insert_with(ToolCallBuilder::new);
+            // Codex v0.141.0+ (PRs #27365, #27371): parse dynamic_tools and build a tool
+            // registry so namespaced MCP/connector tools can be classified correctly.
+            let registry = parse_dynamic_tools(payload);
+            if !registry.is_empty() {
+                builder.set_dynamic_tool_registry(registry);
+            }
         }
 
         "user_message" => {
@@ -1114,6 +1120,54 @@ fn str_field(v: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Parse the `dynamic_tools` field from a `task_started` payload (Codex v0.141.0+).
+///
+/// Returns a registry mapping unqualified tool names to (tool_type, server).
+/// Handles two formats:
+///   {"name": "my_tool", "namespace": "mcp:my-server"}  → key="my_tool", ("mcp","my-server")
+///   {"name": "mcp:my-server/my_tool"}                  → key="my_tool", ("mcp","my-server")
+fn parse_dynamic_tools(payload: &Value) -> HashMap<String, (String, String)> {
+    let Some(tools) = payload.get("dynamic_tools").and_then(|v| v.as_array()) else {
+        return HashMap::new();
+    };
+    let mut registry = HashMap::new();
+    for item in tools {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if let Some(ns) = item
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // Explicit namespace field: "mcp:server" or "connector:plugin"
+            if let Some((tool_type, server)) = ns.split_once(':') {
+                if !tool_type.is_empty() && !server.is_empty() {
+                    registry.insert(
+                        name.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        } else if let Some((tool_type, rest)) = name.split_once(':') {
+            // Qualified name format: "mcp:server/tool_name"
+            if let Some((server, tool)) = rest.split_once('/') {
+                if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
+                    registry.insert(
+                        tool.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    registry
 }
 
 fn spawn_from_function_call_output(
@@ -3281,5 +3335,112 @@ mod tests {
         assert!(!tool.arguments.is_null());
         assert!(tool.arguments.get("options").is_some());
         assert_eq!(tool.output.as_deref(), Some("submitted"));
+    }
+
+    // --- Codex v0.141.0+ dynamic tool namespace tests (PRs #27365, #27371) ---
+
+    #[test]
+    fn parse_dynamic_tools_with_explicit_namespace_field() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({
+            "type": "task_started",
+            "turn_id": "turn-1",
+            "dynamic_tools": [
+                {"name": "my_tool", "namespace": "mcp:my-server"},
+                {"name": "other_tool", "namespace": "connector:plugin-1"}
+            ]
+        });
+        let registry = parse_dynamic_tools(&payload);
+        assert_eq!(
+            registry.get("my_tool"),
+            Some(&("mcp".to_string(), "my-server".to_string()))
+        );
+        assert_eq!(
+            registry.get("other_tool"),
+            Some(&("connector".to_string(), "plugin-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_tools_with_qualified_name_in_name_field() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({
+            "type": "task_started",
+            "turn_id": "turn-1",
+            "dynamic_tools": [
+                {"name": "mcp:my-server/my_tool"}
+            ]
+        });
+        let registry = parse_dynamic_tools(&payload);
+        // Key is the unqualified tool name extracted from the qualified name
+        assert_eq!(
+            registry.get("my_tool"),
+            Some(&("mcp".to_string(), "my-server".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_tools_absent_returns_empty() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({"type": "task_started", "turn_id": "turn-1"});
+        assert!(parse_dynamic_tools(&payload).is_empty());
+    }
+
+    #[test]
+    fn v0141_task_started_dynamic_tools_classifies_mcp_tool_via_registry() {
+        // v0.141.0+: task_started has dynamic_tools; function_call has unqualified name.
+        // Registry lookup must classify the tool as McpTool.
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"session_id":"v0141-dyn","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","dynamic_tools":[{"name":"my_tool","namespace":"mcp:my-server"}]}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-dyn-1","name":"my_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-dyn-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "tool should be classified as McpTool via dynamic_tools registry"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
+    #[test]
+    fn v0141_task_started_dynamic_tools_classifies_mcp_tool_via_qualified_name() {
+        // v0.141.0+: function_call name is "mcp:server/tool" (namespace-qualified).
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"session_id":"v0141-qual","timestamp":"2026-06-18T10:01:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-qual-1","name":"mcp:my-server/my_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-qual-1","output":"done"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750240864.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "namespace-qualified tool name must be classified as McpTool"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
     }
 }

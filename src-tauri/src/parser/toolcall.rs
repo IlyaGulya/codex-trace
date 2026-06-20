@@ -80,6 +80,10 @@ pub struct ToolCallBuilder {
     pub finalized: Vec<ToolCall>,
     pty_sessions: HashMap<String, String>,
     running_exec_call_ids: Vec<String>,
+    /// Codex v0.141.0+ (PRs #27365, #27371): maps tool names to (tool_type, server).
+    /// Populated from the `dynamic_tools` field in `task_started` events.
+    /// Used to classify MCP/connector tools that arrive without a namespace field.
+    dynamic_tool_registry: HashMap<String, (String, String)>,
 }
 
 impl ToolCallBuilder {
@@ -89,7 +93,13 @@ impl ToolCallBuilder {
             finalized: Vec::new(),
             pty_sessions: HashMap::new(),
             running_exec_call_ids: Vec::new(),
+            dynamic_tool_registry: HashMap::new(),
         }
+    }
+
+    /// Set the dynamic tool registry built from `task_started.dynamic_tools` (Codex v0.141.0+).
+    pub fn set_dynamic_tool_registry(&mut self, registry: HashMap<String, (String, String)>) {
+        self.dynamic_tool_registry = registry;
     }
 
     /// Register a function_call (response_item).
@@ -364,7 +374,29 @@ impl ToolCallBuilder {
                     _ if pending.name == "close_agent" || pending.name == "interrupt_agent" => {
                         (ToolKind::InterruptAgent, None, None)
                     }
-                    _ => (ToolKind::Unknown, None, None),
+                    _ => {
+                        // v0.141.0+ (PRs #27365, #27371): tool name may be namespace-qualified
+                        // as "mcp:server/tool_name" or looked up via dynamic_tools registry.
+                        if let Some((tool_type, server, tool)) =
+                            parse_namespaced_tool_name(&pending.name)
+                        {
+                            match tool_type.as_str() {
+                                "mcp" => (ToolKind::McpTool, Some(server), Some(tool)),
+                                _ => (ToolKind::Unknown, None, None),
+                            }
+                        } else if let Some((tool_type, server)) =
+                            self.dynamic_tool_registry.get(&pending.name).cloned()
+                        {
+                            match tool_type.as_str() {
+                                "mcp" => {
+                                    (ToolKind::McpTool, Some(server), Some(pending.name.clone()))
+                                }
+                                _ => (ToolKind::Unknown, None, None),
+                            }
+                        } else {
+                            (ToolKind::Unknown, None, None)
+                        }
+                    }
                 }
             };
             let plugin_id = if kind == ToolKind::McpTool {
@@ -543,6 +575,7 @@ impl ToolCallBuilder {
 
         // Extract server + tool from invocation field, then namespace, then name.
         // namespace format: "mcp__<server>" (no trailing __, no tool name).
+        // v0.141.0+: also handles "mcp:server/tool" qualified name format.
         let (mcp_server, mcp_tool) = if let Some(inv) = payload.get("invocation") {
             let server = inv
                 .get("server")
@@ -555,6 +588,12 @@ impl ToolCallBuilder {
             (server, tool)
         } else if let Some(ns) = &pending.namespace {
             parse_mcp_namespace(ns, &pending.name)
+        } else if let Some((tool_type, server, tool)) = parse_namespaced_tool_name(&pending.name) {
+            if tool_type == "mcp" {
+                (Some(server), Some(tool))
+            } else {
+                parse_mcp_name(&pending.name)
+            }
         } else {
             parse_mcp_name(&pending.name)
         };
@@ -1301,6 +1340,21 @@ fn parse_mcp_name(name: &str) -> (Option<String>, Option<String>) {
     }
 }
 
+/// Parse a namespace-qualified tool name from Codex v0.141.0+ format: "type:server/tool_name".
+/// Returns (tool_type, server, tool_name) or None if the name is not in this format.
+///
+/// Examples:
+///   "mcp:my-server/my_tool"       → ("mcp", "my-server", "my_tool")
+///   "connector:plugin-1/do_thing" → ("connector", "plugin-1", "do_thing")
+fn parse_namespaced_tool_name(name: &str) -> Option<(String, String, String)> {
+    let (tool_type, rest) = name.split_once(':')?;
+    let (server, tool) = rest.split_once('/')?;
+    if tool_type.is_empty() || server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((tool_type.to_string(), server.to_string(), tool.to_string()))
+}
+
 fn extract_mcp_output(payload: &Value) -> Option<String> {
     let content = payload
         .get("result")
@@ -2039,5 +2093,127 @@ mod tests {
             Some("hello world\nExit code: 0\nWall time: 1.5s\n")
         );
         assert_eq!(result.status, "completed");
+    }
+
+    // --- Codex v0.141.0+ dynamic tool namespace tests ---
+
+    #[test]
+    fn parse_namespaced_tool_name_mcp_format() {
+        use super::parse_namespaced_tool_name;
+        let result = parse_namespaced_tool_name("mcp:my-server/my_tool");
+        assert_eq!(
+            result,
+            Some((
+                "mcp".to_string(),
+                "my-server".to_string(),
+                "my_tool".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_namespaced_tool_name_connector_format() {
+        use super::parse_namespaced_tool_name;
+        let result = parse_namespaced_tool_name("connector:plugin-1/do_thing");
+        assert_eq!(
+            result,
+            Some((
+                "connector".to_string(),
+                "plugin-1".to_string(),
+                "do_thing".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_namespaced_tool_name_unqualified_returns_none() {
+        use super::parse_namespaced_tool_name;
+        assert_eq!(parse_namespaced_tool_name("my_tool"), None);
+        assert_eq!(parse_namespaced_tool_name("exec_command"), None);
+        assert_eq!(parse_namespaced_tool_name("mcp__my_server"), None);
+    }
+
+    #[test]
+    fn qualified_mcp_name_in_function_call_classified_as_mcp_tool() {
+        // v0.141.0+: function_call name is "mcp:server/tool_name" (no namespace field)
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_mcp_1".to_string(),
+            "mcp:my-server/my_tool".to_string(),
+            "{}",
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_mcp_1", "result output", None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
+    #[test]
+    fn dynamic_tool_registry_classifies_unqualified_mcp_tool() {
+        // v0.141.0+: registry from dynamic_tools in task_started lets codex-trace classify
+        // MCP tools that arrive as unqualified names with no namespace field.
+        let mut builder = ToolCallBuilder::new();
+        let mut registry = std::collections::HashMap::new();
+        registry.insert(
+            "my_tool".to_string(),
+            ("mcp".to_string(), "my-server".to_string()),
+        );
+        builder.set_dynamic_tool_registry(registry);
+
+        builder.add_function_call(
+            "call_mcp_2".to_string(),
+            "my_tool".to_string(),
+            "{}",
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_mcp_2", "result output", None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
+    #[test]
+    fn dynamic_tool_registry_does_not_affect_builtin_tool_classification() {
+        // Registry entries must not override built-in tool classifications.
+        let mut builder = ToolCallBuilder::new();
+        let mut registry = std::collections::HashMap::new();
+        // Hypothetical conflict: someone registers exec_command as an MCP tool
+        registry.insert(
+            "exec_command".to_string(),
+            ("mcp".to_string(), "some-server".to_string()),
+        );
+        builder.set_dynamic_tool_registry(registry);
+
+        builder.add_function_call(
+            "call_exec".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hi","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+        let payload = json!({
+            "call_id": "call_exec",
+            "aggregated_output": "hi\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 10_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        // Built-in classification must win — exec_command via exec_command_end → ExecCommand
+        assert_eq!(builder.finalized[0].kind, ToolKind::ExecCommand);
     }
 }
