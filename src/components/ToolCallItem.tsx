@@ -50,6 +50,7 @@ function kindIcon(kind: CodexToolCall["kind"], failed: boolean) {
       return <FollowupTaskIcon />;
     case "shell_hook":
       return <HookIcon />;
+    case "context_query":
     default:
       return <UnknownToolIcon />;
   }
@@ -74,6 +75,7 @@ function kindClass(kind: CodexToolCall["kind"]): string {
       return "tool-call--collab";
     case "shell_hook":
       return "tool-call--hook";
+    case "context_query":
     default:
       return "tool-call--unknown";
   }
@@ -306,7 +308,7 @@ function ToolCallBody({ tool, popout = false }: { tool: CodexToolCall; popout?: 
           </div>
         )}
 
-      {tool.kind === "unknown" &&
+      {(tool.kind === "unknown" || tool.kind === "context_query") &&
         tool.arguments != null &&
         Object.keys(tool.arguments).length > 0 && (
           <div className="tool-call__section tool-call__section--input">

@@ -21,6 +21,10 @@ pub enum ToolKind {
     FollowupTask,
     /// Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks.
     ShellHook,
+    /// Codex v0.140.0 (PRs #27438, #27488, #27518): built-in runtime tools that the model
+    /// invokes to query the remaining context budget. Covers `token_budget_context`,
+    /// `context_remaining`, and `context_window`.
+    ContextQuery,
     Unknown,
 }
 
@@ -307,6 +311,45 @@ impl ToolCallBuilder {
                     image_file_path: None,
                     worker_session: None,
                     status: spawn_agent_status(output),
+                    subagent_id: None,
+                    subagent_name: None,
+                });
+                return;
+            }
+
+            // Codex v0.140.0 (PRs #27438, #27488, #27518): built-in context-budget query tools.
+            // token_budget_context, context_remaining, and context_window are invoked by the
+            // model during turns; classify as ContextQuery for enriched display.
+            if matches!(
+                pending.name.as_str(),
+                "token_budget_context" | "context_remaining" | "context_window"
+            ) {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::ContextQuery,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    image_file_path: None,
+                    worker_session: None,
+                    status: "completed".to_string(),
                     subagent_id: None,
                     subagent_name: None,
                 });
@@ -2016,6 +2059,95 @@ mod tests {
             tool.status, "completed",
             "status must be completed for raw output without failure signal"
         );
+    }
+
+    // Codex v0.140.0 (PRs #27438, #27488, #27518): three new built-in context-budget tools.
+    // token_budget_context, context_remaining, and context_window appear in session transcripts
+    // as function_call / function_call_output pairs. They must be classified as ContextQuery,
+    // not Unknown, and must not panic or produce parse errors.
+
+    #[test]
+    fn v0140_token_budget_context_classified_as_context_query() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_budget".to_string(),
+            "token_budget_context".to_string(),
+            r#"{}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output(
+            "call_budget",
+            r#"{"tokens_used":12345,"tokens_remaining":87655}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ContextQuery);
+        assert_eq!(tool.name, "token_budget_context");
+        assert_eq!(tool.status, "completed");
+        assert!(tool.output.is_some());
+    }
+
+    #[test]
+    fn v0140_context_remaining_classified_as_context_query() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_ctx".to_string(),
+            "context_remaining".to_string(),
+            r#"{}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_ctx", r#"{"remaining":50000}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ContextQuery);
+        assert_eq!(tool.name, "context_remaining");
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0140_context_window_classified_as_context_query() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_win".to_string(),
+            "context_window".to_string(),
+            r#"{}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_win", r#"{"window_size":128000}"#, None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ContextQuery);
+        assert_eq!(tool.name, "context_window");
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0140_context_query_with_empty_output_yields_none() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_empty".to_string(),
+            "token_budget_context".to_string(),
+            r#"{}"#,
+            None,
+            None,
+            None,
+        );
+        builder.add_function_call_output("call_empty", "", None);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ContextQuery);
+        assert!(tool.output.is_none(), "empty output should yield None");
     }
 
     #[test]
