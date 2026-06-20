@@ -1095,4 +1095,75 @@ mod tests {
         let e = RawEntry::parse(line).expect("session_unarchived must parse");
         assert_eq!(e.entry_type, "session_unarchived");
     }
+
+    // Codex v0.141.0 (PRs #26242, #26245): exec-server remote transport migrated to
+    // authenticated, end-to-end encrypted Noise relay channels by default. The previous
+    // plaintext/TLS WebSocket between the CLI and exec-server is replaced by Noise-protocol
+    // relay frames.
+    //
+    // codex-trace reads session data exclusively from JSONL files at ~/.codex/sessions/ —
+    // it never connects to the exec-server, never reads WebSocket frames, and never touches
+    // the Noise relay transport. The app-server decrypts Noise frames before surfacing events
+    // via its standard APIs; those events continue to be logged to disk in the same JSONL
+    // format as all prior versions.
+    //
+    // The transport change is therefore invisible to this parser: entry types, field names,
+    // and payload shapes are unchanged. The tests below confirm all standard JSONL entry
+    // types from a v0.141.0 session parse correctly.
+
+    #[test]
+    fn v0141_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-session","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750244404.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.141.0");
+        assert_eq!(meta.payload["id"], "v0141-session");
+    }
+
+    // Remote exec sessions started via the new Noise relay transport produce JSONL entries
+    // in the same format as local sessions — the Noise encryption boundary is at the network
+    // layer, not in the on-disk session format. codex-trace reads files written after
+    // decryption and is unaffected by the transport-layer change.
+    #[test]
+    fn v0141_noise_relay_transport_change_does_not_affect_remote_exec_session_parsing() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"id":"v0141-remote-session","timestamp":"2026-06-18T10:01:00Z","cwd":"/remote/project","cli_version":"0.141.0","model_provider":"openai","originator":"exec-server"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo remote\",\"workdir\":\"/remote/project\"}","call_id":"call-remote-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-remote-1","aggregated_output":"remote\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750244464.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.141.0");
+        assert_eq!(meta.payload["id"], "v0141-remote-session");
+        // originator field is passed through unchanged regardless of transport layer
+        assert_eq!(meta.payload["originator"], "exec-server");
+    }
 }
