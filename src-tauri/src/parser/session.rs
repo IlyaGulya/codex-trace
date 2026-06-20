@@ -1557,4 +1557,48 @@ mod tests {
         assert_eq!(tool.status, "completed");
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.141.0 (PR #28355): ResponseItem gains a new optional top-level `metadata` field.
+    // parse_session must handle response_items with a metadata field without error; the tool
+    // call and agent message pipelines must produce correct results regardless of the field.
+
+    #[test]
+    fn v0141_parse_session_with_response_item_metadata_field() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-18T10-00-00-v0141meta.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-meta-session","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v141-meta","arguments":"{\"cmd\":\"echo hello\"}","metadata":{"priority":"normal","request_id":"req-meta-v141"}}}"#,
+                r#"{"timestamp":"2026-06-18T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v141-meta","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":20000000}}}"#,
+                r#"{"timestamp":"2026-06-18T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done","metadata":{"server_key":"srv-0141","usage":{"prompt_tokens":5,"completion_tokens":2}}}}"#,
+                r#"{"timestamp":"2026-06-18T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240805.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0141-meta-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.141.0"));
+        assert_eq!(session.turns.len(), 1);
+        // tool call must be created correctly despite the metadata field on the function_call
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        // assistant message response_item populates final_answer; the metadata field must not
+        // prevent the content from being extracted
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("Done"),
+            "message with metadata must populate final_answer"
+        );
+        assert!(!session.is_ongoing);
+    }
 }

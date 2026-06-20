@@ -1013,6 +1013,74 @@ mod tests {
         );
     }
 
+    // Codex v0.141.0 (PR #28355): ResponseItem gains a new optional top-level `metadata` field.
+    // The field carries additional per-item structured data populated by the server in certain
+    // response flows. RawEntry must parse response_items with a metadata field without error,
+    // and the field must be accessible via entry.payload so downstream consumers can read it.
+
+    #[test]
+    fn v0141_response_item_with_metadata_field_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"server_key":"srv-abc123","model_version":"gpt-5.4-preview","trace_id":"trace-xyz"}}}"#;
+        let e = RawEntry::parse(line).expect("response_item with metadata must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        // metadata field must be accessible and preserved round-trip
+        let meta = &e.payload["metadata"];
+        assert!(!meta.is_null(), "metadata field must be present");
+        assert_eq!(meta["server_key"], "srv-abc123");
+        assert_eq!(meta["trace_id"], "trace-xyz");
+    }
+
+    #[test]
+    fn v0141_response_item_without_metadata_is_backward_compatible() {
+        // Pre-v0.141.0 sessions must still parse normally when metadata is absent.
+        let line = r#"{"timestamp":"2026-06-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#;
+        let e = RawEntry::parse(line).expect("response_item without metadata must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "metadata must be absent in pre-v0.141.0 entries"
+        );
+    }
+
+    #[test]
+    fn v0141_function_call_response_item_with_metadata_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-18T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_meta_1","arguments":"{\"cmd\":\"echo hi\"}","metadata":{"priority":"high","request_id":"req-789"}}}"#;
+        let e = RawEntry::parse(line).expect("function_call with metadata must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(e.payload["metadata"]["priority"], "high");
+        assert_eq!(e.payload["metadata"]["request_id"], "req-789");
+    }
+
+    #[test]
+    fn v0141_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-session","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"server_key":"srv-v0141","trace_id":"trace-0141"}}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.141.0");
+        // metadata field must be preserved on the response_item payload
+        let msg_entry = RawEntry::parse(lines[2]).unwrap();
+        assert_eq!(msg_entry.payload["metadata"]["server_key"], "srv-v0141");
+    }
+
     // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
     // oneOf and allOf structures instead of flattening them. Large schemas also keep more
     // shallow structure when compacted.

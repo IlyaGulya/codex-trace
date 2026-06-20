@@ -3282,4 +3282,54 @@ mod tests {
         assert!(tool.arguments.get("options").is_some());
         assert_eq!(tool.output.as_deref(), Some("submitted"));
     }
+
+    // Codex v0.141.0 (PR #28355): ResponseItem gains a new optional top-level `metadata` field.
+    // build_turns must handle response_items carrying a metadata field without error; tool call
+    // extraction and agent message building must be unaffected.
+
+    #[test]
+    fn v0141_response_item_with_metadata_does_not_affect_turn_building() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-turn-meta","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v141","arguments":"{\"cmd\":\"echo hi\"}","metadata":{"priority":"normal","request_id":"req-v141"}}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v141","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(tool.output.as_deref(), Some("hi\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+    }
+
+    #[test]
+    fn v0141_message_response_item_with_metadata_populates_final_answer() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"id":"v0141-msg-meta","timestamp":"2026-06-18T10:01:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done!","metadata":{"server_key":"srv-v141","usage":{"prompt_tokens":10,"completion_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750240863.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        // assistant message response_item populates final_answer; the metadata field must not
+        // prevent the content from being extracted
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Done!"),
+            "message with metadata must populate final_answer"
+        );
+    }
 }
