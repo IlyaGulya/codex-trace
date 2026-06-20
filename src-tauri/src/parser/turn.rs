@@ -1823,6 +1823,29 @@ mod tests {
         assert!(turns[0].tool_calls.is_empty());
     }
 
+    // Codex v0.138.0 (PR #26447): `response.processed` WebSocket request type was removed
+    // from the app-server/exec-server WebSocket protocol. codex-trace is unaffected because
+    // it reads JSONL session files from disk — it never connects to the Codex app-server.
+    // Even if `response.processed` appeared as an event_msg entry in a JSONL file written by
+    // an older Codex version, it would be silently dropped by the wildcard arm in
+    // handle_event_msg. This test guards against regressions that would re-introduce a
+    // dependency on this removed message type.
+    #[test]
+    fn v0138_removed_response_processed_event_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-08T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0138","timestamp":"2026-06-08T10:00:00Z","cli_version":"0.138.0"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:02Z","type":"event_msg","payload":{"type":"response.processed","response_id":"resp-abc","status":"complete"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376803.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
     // Codex v0.129.0 (PR #20540): apply_patch file changes moved from patch_apply_end
     // event into an apply_patch_end response_item (turn item). The PatchApply call is
     // finalized by custom_tool_call_output (exit_code, output) and the file changes are
