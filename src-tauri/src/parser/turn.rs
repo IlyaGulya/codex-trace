@@ -676,6 +676,16 @@ fn handle_event_msg(
         // skipped so they don't corrupt turn data.
         "goal_created" | "goal_updated" | "goal_completed" | "goal_paused" => {}
 
+        // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command emits event_msg
+        // lifecycle events as it imports agent context into the session. These events modify
+        // the thread's initial context but carry no turn-building semantics for codex-trace
+        // — they are treated as pass-through so sessions beginning with imported context
+        // parse correctly without corrupting turn state.
+        "agent_context_import_started"
+        | "agent_context_imported"
+        | "external_agent_import_started"
+        | "external_agent_imported" => {}
+
         _ => {}
     }
 }
@@ -961,6 +971,17 @@ fn handle_response_item(
                 }
             }
         }
+
+        // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command imports setup, project
+        // config, and recent chats from external agents (e.g. Claude Code). The import flow
+        // writes response_items into the session transcript describing imported threads. These
+        // items carry no turn-building semantics for codex-trace — treated as pass-through so
+        // callers never receive a hard error on sessions that include imported context.
+        //
+        // Codex v0.141.0 (PR #28008): external_agent_import_result is an accounting-type
+        // response_item that records token/cost totals for an imported agent context. It has
+        // no effect on turns or tool calls — treated as pass-through.
+        "external_agent_import_result" => {}
 
         // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits the final
         // model response as a "structured_output" response_item whose `content` field holds a
@@ -3281,5 +3302,105 @@ mod tests {
         assert!(!tool.arguments.is_null());
         assert!(tool.arguments.get("options").is_some());
         assert_eq!(tool.output.as_deref(), Some("submitted"));
+    }
+
+    // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command adds external-agent
+    // context import event_msg entries and external_agent_import_result response_items.
+    // Sessions may now begin with import lifecycle events before the first task_started.
+    // Turn boundary detection must not be disrupted by these pre-turn entries.
+    //
+    // Codex v0.141.0 (PR #28008): external_agent_import_result accounting response_items
+    // may appear inside turns; they carry no turn-building semantics.
+
+    #[test]
+    fn v0140_import_event_before_first_turn_does_not_corrupt_turns() {
+        // Import lifecycle events appear before the first task_started.
+        // Verify that turns are built correctly and the import events don't create
+        // spurious synthetic turns or corrupt the first real turn.
+        let lines = [
+            r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-pre-turn-import","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"agent_context_imported","source":"claude-code","thread_count":2}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Imported context loaded, continuing session."}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000004.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        // Exactly one turn must be built — the import event must not create a synthetic turn
+        assert_eq!(
+            turns.len(),
+            1,
+            "import event must not create spurious turns"
+        );
+        assert_eq!(turns[0].turn_id, "turn-1");
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0141_external_agent_import_result_inside_turn_does_not_corrupt_turn() {
+        // external_agent_import_result (v0.141.0, PR #28008) is an accounting response_item
+        // that may appear inside a turn. It must not break tool-call or message extraction.
+        let lines = [
+            r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0141-import-result","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\"}","call_id":"call-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"hi\n"}}"#,
+            // Accounting item — must be silently ignored
+            r#"{"timestamp":"2026-06-15T10:00:04Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","total_tokens":8200}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000006.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        // Tool call is intact
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "exec_command");
+        assert_eq!(turn.tool_calls[0].output.as_deref(), Some("hi\n"));
+        // Agent message is intact
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Done.");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0140_all_standard_entry_types_plus_import_items_build_correct_turns() {
+        // Regression guard: a v0.140.0 session with import events must build the same
+        // turns as an equivalent session without import events.
+        let lines = [
+            r#"{"timestamp":"2026-06-15T10:02:00Z","type":"session_meta","payload":{"id":"v0140-full","timestamp":"2026-06-15T10:02:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
+            // Pre-turn import event
+            r#"{"timestamp":"2026-06-15T10:02:01Z","type":"event_msg","payload":{"type":"external_agent_imported","source":"claude-code","imported_count":3}}"#,
+            r#"{"timestamp":"2026-06-15T10:02:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:02:03Z","type":"event_msg","payload":{"type":"user_message","message":"Continue with imported context"}}"#,
+            r#"{"timestamp":"2026-06-15T10:02:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Understood."}}"#,
+            r#"{"timestamp":"2026-06-15T10:02:05Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            // Accounting item inside the turn
+            r#"{"timestamp":"2026-06-15T10:02:06Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","total_tokens":5100}}"#,
+            r#"{"timestamp":"2026-06-15T10:02:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000927.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1, "import events must not create extra turns");
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(
+            turn.user_message.as_deref(),
+            Some("Continue with imported context")
+        );
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+        // No tool calls — the external_agent_import_result must not be misclassified
+        assert_eq!(turn.tool_calls.len(), 0);
     }
 }

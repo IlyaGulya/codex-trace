@@ -1095,4 +1095,83 @@ mod tests {
         let e = RawEntry::parse(line).expect("session_unarchived must parse");
         assert_eq!(e.entry_type, "session_unarchived");
     }
+
+    // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command imports setup, project
+    // config, and recent chats from external agents (e.g. Claude Code). The import flow
+    // writes new event_msg entries describing the import lifecycle into session transcripts.
+    //
+    // Codex v0.141.0 (PR #28008): external_agent_import_result is a new accounting-type
+    // response_item that records token/cost totals for an imported external agent context.
+    //
+    // RawEntry must parse all of these without panicking; unknown entry types flow through
+    // the parser via the loosely-typed serde_json::Value model.
+
+    #[test]
+    fn v0140_agent_context_import_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-15T10:00:00Z","type":"event_msg","payload":{"type":"agent_context_imported","source":"claude-code","thread_count":3,"token_count":12400}}"#;
+        let e = RawEntry::parse(line).expect("agent_context_imported event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(
+            e.payload.get("type").and_then(|t| t.as_str()),
+            Some("agent_context_imported")
+        );
+        assert_eq!(e.payload["source"], "claude-code");
+    }
+
+    #[test]
+    fn v0141_external_agent_import_result_response_item_parses_correctly() {
+        // v0.141.0 (PR #28008): accounting-type response_item for imported agent context.
+        let line = r#"{"timestamp":"2026-06-15T10:00:01Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","imported_thread_ids":["t1","t2"],"total_tokens":12400}}"#;
+        let e = RawEntry::parse(line).expect("external_agent_import_result must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "external_agent_import_result");
+        assert_eq!(e.payload["source"], "claude-code");
+        assert_eq!(e.payload["total_tokens"], 12400);
+    }
+
+    #[test]
+    fn v0140_all_standard_entry_types_plus_import_items_parse_correctly() {
+        // Regression guard: all standard JSONL entry types plus import-related entries
+        // must parse correctly for a v0.140.0 session that used /import.
+        let lines = [
+            r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-import-session","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
+            // Import lifecycle event preceding the first turn
+            r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"agent_context_imported","source":"claude-code","thread_count":2}}"#,
+            // Standard turn entries
+            r#"{"timestamp":"2026-06-15T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            // v0.141.0 accounting item inside the turn
+            r#"{"timestamp":"2026-06-15T10:00:04Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","total_tokens":12400}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:05Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000006.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.140.0");
+        assert_eq!(meta.payload["id"], "v0140-import-session");
+        // Import event is accessible
+        let import_entry = RawEntry::parse(lines[1]).unwrap();
+        assert_eq!(
+            import_entry.payload.get("type").and_then(|t| t.as_str()),
+            Some("agent_context_imported")
+        );
+        // Accounting item is accessible
+        let accounting_entry = RawEntry::parse(lines[4]).unwrap();
+        assert_eq!(
+            accounting_entry.payload["type"],
+            "external_agent_import_result"
+        );
+    }
 }
