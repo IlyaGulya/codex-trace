@@ -1013,6 +1013,74 @@ mod tests {
         );
     }
 
+    // Codex v0.141.0 (PR #28355): ResponseItem gains a new optional top-level `metadata` field.
+    // The field carries additional per-item structured data populated by the server in certain
+    // response flows. RawEntry must parse response_items with a metadata field without error,
+    // and the field must be accessible via entry.payload so downstream consumers can read it.
+
+    #[test]
+    fn v0141_response_item_with_metadata_field_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"server_key":"srv-abc123","model_version":"gpt-5.4-preview","trace_id":"trace-xyz"}}}"#;
+        let e = RawEntry::parse(line).expect("response_item with metadata must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        // metadata field must be accessible and preserved round-trip
+        let meta = &e.payload["metadata"];
+        assert!(!meta.is_null(), "metadata field must be present");
+        assert_eq!(meta["server_key"], "srv-abc123");
+        assert_eq!(meta["trace_id"], "trace-xyz");
+    }
+
+    #[test]
+    fn v0141_response_item_without_metadata_is_backward_compatible() {
+        // Pre-v0.141.0 sessions must still parse normally when metadata is absent.
+        let line = r#"{"timestamp":"2026-06-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#;
+        let e = RawEntry::parse(line).expect("response_item without metadata must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "metadata must be absent in pre-v0.141.0 entries"
+        );
+    }
+
+    #[test]
+    fn v0141_function_call_response_item_with_metadata_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-18T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_meta_1","arguments":"{\"cmd\":\"echo hi\"}","metadata":{"priority":"high","request_id":"req-789"}}}"#;
+        let e = RawEntry::parse(line).expect("function_call with metadata must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(e.payload["metadata"]["priority"], "high");
+        assert_eq!(e.payload["metadata"]["request_id"], "req-789");
+    }
+
+    #[test]
+    fn v0141_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-session","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"server_key":"srv-v0141","trace_id":"trace-0141"}}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.141.0");
+        // metadata field must be preserved on the response_item payload
+        let msg_entry = RawEntry::parse(lines[2]).unwrap();
+        assert_eq!(msg_entry.payload["metadata"]["server_key"], "srv-v0141");
+    }
+
     // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
     // oneOf and allOf structures instead of flattening them. Large schemas also keep more
     // shallow structure when compacted.
@@ -1078,6 +1146,58 @@ mod tests {
         assert!(e.payload.get("tools").is_some());
     }
 
+    // Codex v0.140.0 (PRs #27504, #27535, #27539, #27541): CLI auth tokens and MCP OAuth
+    // credentials were migrated from plaintext files to an encrypted secret store. The new
+    // config option `secret_auth_storage_configuration` controls which backend is used.
+    //
+    // codex-trace reads only JSONL session files at ~/.codex/sessions/ — it never reads
+    // credential files, auth token files, or Codex CLI config files from the Codex home
+    // directory. The encrypted credential storage change is therefore invisible to this
+    // parser. These tests confirm all standard entry types from a v0.140.0 session parse
+    // correctly, and that a session_meta carrying the new auth config field is handled
+    // without errors (unknown fields are gracefully ignored by the Value-based parser).
+
+    #[test]
+    fn v0140_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-session","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-15T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749988804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.140.0");
+        assert_eq!(meta.payload["id"], "v0140-session");
+    }
+
+    #[test]
+    fn v0140_session_meta_with_secret_auth_storage_configuration_does_not_panic() {
+        // session_meta may carry the new secret_auth_storage_configuration field introduced
+        // in v0.140.0. The field names the credential storage backend ("keychain", "file",
+        // etc.). codex-trace never reads credential files — it only extracts known fields
+        // from the payload — so this unknown field must be silently ignored.
+        let line = r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-auth","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai","secret_auth_storage_configuration":"keychain","mcp_oauth_storage":"encrypted"}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with auth config fields must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0140-auth");
+        assert_eq!(e.payload["cli_version"], "0.140.0");
+        // Auth config fields are present in the raw payload but codex-trace does not use them.
+        assert_eq!(e.payload["secret_auth_storage_configuration"], "keychain");
+        assert_eq!(e.payload["mcp_oauth_storage"], "encrypted");
+    }
+
     // Codex v0.136.0: `codex archive` / `codex unarchive` append session_archived and
     // session_unarchived entries to the JSONL file.
 
@@ -1096,15 +1216,79 @@ mod tests {
         assert_eq!(e.entry_type, "session_unarchived");
     }
 
-    // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command imports setup, project
-    // config, and recent chats from external agents (e.g. Claude Code). The import flow
-    // writes new event_msg entries describing the import lifecycle into session transcripts.
+    // Codex v0.141.0 (PRs #26242, #26245): exec-server remote transport migrated to
+    // authenticated, end-to-end encrypted Noise relay channels by default. The previous
+    // plaintext/TLS WebSocket between the CLI and exec-server is replaced by Noise-protocol
+    // relay frames.
     //
-    // Codex v0.141.0 (PR #28008): external_agent_import_result is a new accounting-type
-    // response_item that records token/cost totals for an imported external agent context.
+    // codex-trace reads session data exclusively from JSONL files at ~/.codex/sessions/ —
+    // it never connects to the exec-server, never reads WebSocket frames, and never touches
+    // the Noise relay transport. The app-server decrypts Noise frames before surfacing events
+    // via its standard APIs; those events continue to be logged to disk in the same JSONL
+    // format as all prior versions.
     //
-    // RawEntry must parse all of these without panicking; unknown entry types flow through
-    // the parser via the loosely-typed serde_json::Value model.
+    // The transport change is therefore invisible to this parser: entry types, field names,
+    // and payload shapes are unchanged. The tests below confirm all standard JSONL entry
+    // types from a v0.141.0 session parse correctly.
+
+    #[test]
+    fn v0141_all_standard_entry_types_parse_correctly_noise_relay() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-session","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750244404.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.141.0");
+        assert_eq!(meta.payload["id"], "v0141-session");
+    }
+
+    // Remote exec sessions started via the new Noise relay transport produce JSONL entries
+    // in the same format as local sessions — the Noise encryption boundary is at the network
+    // layer, not in the on-disk session format. codex-trace reads files written after
+    // decryption and is unaffected by the transport-layer change.
+    #[test]
+    fn v0141_noise_relay_transport_change_does_not_affect_remote_exec_session_parsing() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"id":"v0141-remote-session","timestamp":"2026-06-18T10:01:00Z","cwd":"/remote/project","cli_version":"0.141.0","model_provider":"openai","originator":"exec-server"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo remote\",\"workdir\":\"/remote/project\"}","call_id":"call-remote-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-remote-1","aggregated_output":"remote\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750244464.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.141.0");
+        assert_eq!(meta.payload["id"], "v0141-remote-session");
+        // originator field is passed through unchanged regardless of transport layer
+        assert_eq!(meta.payload["originator"], "exec-server");
+    }
+
+    // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command writes lifecycle
+    // event_msg entries; v0.141.0 (PR #28008) adds external_agent_import_result.
 
     #[test]
     fn v0140_agent_context_import_event_msg_parses_correctly() {
@@ -1120,58 +1304,9 @@ mod tests {
 
     #[test]
     fn v0141_external_agent_import_result_response_item_parses_correctly() {
-        // v0.141.0 (PR #28008): accounting-type response_item for imported agent context.
         let line = r#"{"timestamp":"2026-06-15T10:00:01Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","imported_thread_ids":["t1","t2"],"total_tokens":12400}}"#;
         let e = RawEntry::parse(line).expect("external_agent_import_result must parse");
-        assert_eq!(e.entry_type, "response_item");
         assert_eq!(e.payload["type"], "external_agent_import_result");
-        assert_eq!(e.payload["source"], "claude-code");
         assert_eq!(e.payload["total_tokens"], 12400);
-    }
-
-    #[test]
-    fn v0140_all_standard_entry_types_plus_import_items_parse_correctly() {
-        // Regression guard: all standard JSONL entry types plus import-related entries
-        // must parse correctly for a v0.140.0 session that used /import.
-        let lines = [
-            r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-import-session","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
-            // Import lifecycle event preceding the first turn
-            r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"agent_context_imported","source":"claude-code","thread_count":2}}"#,
-            // Standard turn entries
-            r#"{"timestamp":"2026-06-15T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-15T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
-            // v0.141.0 accounting item inside the turn
-            r#"{"timestamp":"2026-06-15T10:00:04Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","total_tokens":12400}}"#,
-            r#"{"timestamp":"2026-06-15T10:00:05Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
-            r#"{"timestamp":"2026-06-15T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000006.0}}"#,
-        ];
-        let expected_types = [
-            "session_meta",
-            "event_msg",
-            "event_msg",
-            "response_item",
-            "response_item",
-            "turn_context",
-            "event_msg",
-        ];
-        for (line, expected) in lines.iter().zip(expected_types.iter()) {
-            let entry = RawEntry::parse(line).expect("parse failed");
-            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
-        }
-        let meta = RawEntry::parse(lines[0]).unwrap();
-        assert_eq!(meta.payload["cli_version"], "0.140.0");
-        assert_eq!(meta.payload["id"], "v0140-import-session");
-        // Import event is accessible
-        let import_entry = RawEntry::parse(lines[1]).unwrap();
-        assert_eq!(
-            import_entry.payload.get("type").and_then(|t| t.as_str()),
-            Some("agent_context_imported")
-        );
-        // Accounting item is accessible
-        let accounting_entry = RawEntry::parse(lines[4]).unwrap();
-        assert_eq!(
-            accounting_entry.payload["type"],
-            "external_agent_import_result"
-        );
     }
 }

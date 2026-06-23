@@ -1261,4 +1261,36 @@ mod tests {
             "compressed session must be found"
         );
     }
+
+    #[test]
+    fn v0140_discover_sessions_with_secret_auth_storage_configuration_in_session_meta() {
+        // Codex v0.140.0 (PRs #27504, #27535, #27539, #27541): CLI auth and MCP OAuth
+        // credentials are now stored in an encrypted secret namespace. The new config option
+        // `secret_auth_storage_configuration` controls the storage backend. If this value
+        // ever appears in session_meta, discover_sessions must handle it without errors —
+        // the loosely-typed Value parser ignores all fields it does not explicitly consume.
+        // codex-trace never reads credential files; it only reads JSONL session files.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/15");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-15T10-00-00-v0140.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-disc-session","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai","secret_auth_storage_configuration":"keychain","mcp_oauth_storage":"encrypted"}}"#,
+                r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-15T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749988802.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0140-disc-session")
+            .expect("v0.140.0 session must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.140.0"));
+        assert_eq!(session.cwd.as_deref(), Some("/project"));
+        assert!(!session.is_ongoing, "completed session must not be ongoing");
+    }
 }

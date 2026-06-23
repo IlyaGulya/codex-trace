@@ -320,9 +320,15 @@ fn handle_event_msg(
             });
             turns.insert(turn_id.clone(), turn);
             *current_turn_id = Some(turn_id.clone());
-            tool_builders
+            let builder = tool_builders
                 .entry(turn_id)
                 .or_insert_with(ToolCallBuilder::new);
+            // Codex v0.141.0+ (PRs #27365, #27371): parse dynamic_tools and build a tool
+            // registry so namespaced MCP/connector tools can be classified correctly.
+            let registry = parse_dynamic_tools(payload);
+            if !registry.is_empty() {
+                builder.set_dynamic_tool_registry(registry);
+            }
         }
 
         "user_message" => {
@@ -975,12 +981,10 @@ fn handle_response_item(
         // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command imports setup, project
         // config, and recent chats from external agents (e.g. Claude Code). The import flow
         // writes response_items into the session transcript describing imported threads. These
-        // items carry no turn-building semantics for codex-trace — treated as pass-through so
-        // callers never receive a hard error on sessions that include imported context.
+        // items carry no turn-building semantics for codex-trace — treated as pass-through.
         //
         // Codex v0.141.0 (PR #28008): external_agent_import_result is an accounting-type
-        // response_item that records token/cost totals for an imported agent context. It has
-        // no effect on turns or tool calls — treated as pass-through.
+        // response_item that records token/cost totals for an imported agent context.
         "external_agent_import_result" => {}
 
         // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits the final
@@ -1135,6 +1139,54 @@ fn str_field(v: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Parse the `dynamic_tools` field from a `task_started` payload (Codex v0.141.0+).
+///
+/// Returns a registry mapping unqualified tool names to (tool_type, server).
+/// Handles two formats:
+///   {"name": "my_tool", "namespace": "mcp:my-server"}  → key="my_tool", ("mcp","my-server")
+///   {"name": "mcp:my-server/my_tool"}                  → key="my_tool", ("mcp","my-server")
+fn parse_dynamic_tools(payload: &Value) -> HashMap<String, (String, String)> {
+    let Some(tools) = payload.get("dynamic_tools").and_then(|v| v.as_array()) else {
+        return HashMap::new();
+    };
+    let mut registry = HashMap::new();
+    for item in tools {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if let Some(ns) = item
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // Explicit namespace field: "mcp:server" or "connector:plugin"
+            if let Some((tool_type, server)) = ns.split_once(':') {
+                if !tool_type.is_empty() && !server.is_empty() {
+                    registry.insert(
+                        name.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        } else if let Some((tool_type, rest)) = name.split_once(':') {
+            // Qualified name format: "mcp:server/tool_name"
+            if let Some((server, tool)) = rest.split_once('/') {
+                if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
+                    registry.insert(
+                        tool.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    registry
 }
 
 fn spawn_from_function_call_output(
@@ -1835,6 +1887,29 @@ mod tests {
             r#"{"timestamp":"2026-05-07T10:00:02Z","type":"event_msg","payload":{"type":"item/fileChange","path":"/tmp/foo.txt","action":"modified"}}"#,
             r#"{"timestamp":"2026-05-07T10:00:03Z","type":"event_msg","payload":{"type":"outputDelta","delta":"partial output text"}}"#,
             r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746604804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    // Codex v0.138.0 (PR #26447): `response.processed` WebSocket request type was removed
+    // from the app-server/exec-server WebSocket protocol. codex-trace is unaffected because
+    // it reads JSONL session files from disk — it never connects to the Codex app-server.
+    // Even if `response.processed` appeared as an event_msg entry in a JSONL file written by
+    // an older Codex version, it would be silently dropped by the wildcard arm in
+    // handle_event_msg. This test guards against regressions that would re-introduce a
+    // dependency on this removed message type.
+    #[test]
+    fn v0138_removed_response_processed_event_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-08T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0138","timestamp":"2026-06-08T10:00:00Z","cli_version":"0.138.0"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:02Z","type":"event_msg","payload":{"type":"response.processed","response_id":"resp-abc","status":"complete"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376803.0}}"#,
         ]);
 
         let turns = build_turns(&entries);
@@ -3304,19 +3379,163 @@ mod tests {
         assert_eq!(tool.output.as_deref(), Some("submitted"));
     }
 
+    // --- Codex v0.141.0+ dynamic tool namespace tests (PRs #27365, #27371) ---
+
+    #[test]
+    fn parse_dynamic_tools_with_explicit_namespace_field() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({
+            "type": "task_started",
+            "turn_id": "turn-1",
+            "dynamic_tools": [
+                {"name": "my_tool", "namespace": "mcp:my-server"},
+                {"name": "other_tool", "namespace": "connector:plugin-1"}
+            ]
+        });
+        let registry = parse_dynamic_tools(&payload);
+        assert_eq!(
+            registry.get("my_tool"),
+            Some(&("mcp".to_string(), "my-server".to_string()))
+        );
+        assert_eq!(
+            registry.get("other_tool"),
+            Some(&("connector".to_string(), "plugin-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_tools_with_qualified_name_in_name_field() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({
+            "type": "task_started",
+            "turn_id": "turn-1",
+            "dynamic_tools": [
+                {"name": "mcp:my-server/my_tool"}
+            ]
+        });
+        let registry = parse_dynamic_tools(&payload);
+        // Key is the unqualified tool name extracted from the qualified name
+        assert_eq!(
+            registry.get("my_tool"),
+            Some(&("mcp".to_string(), "my-server".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_tools_absent_returns_empty() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({"type": "task_started", "turn_id": "turn-1"});
+        assert!(parse_dynamic_tools(&payload).is_empty());
+    }
+
+    #[test]
+    fn v0141_task_started_dynamic_tools_classifies_mcp_tool_via_registry() {
+        // v0.141.0+: task_started has dynamic_tools; function_call has unqualified name.
+        // Registry lookup must classify the tool as McpTool.
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"session_id":"v0141-dyn","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","dynamic_tools":[{"name":"my_tool","namespace":"mcp:my-server"}]}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-dyn-1","name":"my_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-dyn-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "tool should be classified as McpTool via dynamic_tools registry"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
+    #[test]
+    fn v0141_task_started_dynamic_tools_classifies_mcp_tool_via_qualified_name() {
+        // v0.141.0+: function_call name is "mcp:server/tool" (namespace-qualified).
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"session_id":"v0141-qual","timestamp":"2026-06-18T10:01:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-qual-1","name":"mcp:my-server/my_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-qual-1","output":"done"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750240864.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "namespace-qualified tool name must be classified as McpTool"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
+    // Codex v0.141.0 (PR #28355): ResponseItem gains a new optional top-level `metadata` field.
+
+    #[test]
+    fn v0141_response_item_with_metadata_does_not_affect_turn_building() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"v0141-turn-meta","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v141","arguments":"{\"cmd\":\"echo hi\"}","metadata":{"priority":"normal","request_id":"req-v141"}}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v141","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.output.as_deref(), Some("hi\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
+    #[test]
+    fn v0141_message_response_item_with_metadata_populates_final_answer() {
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"id":"v0141-msg-meta","timestamp":"2026-06-18T10:01:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done!","metadata":{"server_key":"srv-v141","usage":{"prompt_tokens":10,"completion_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750240863.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Done!"),
+            "message with metadata must populate final_answer"
+        );
+    }
+
     // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command adds external-agent
-    // context import event_msg entries and external_agent_import_result response_items.
-    // Sessions may now begin with import lifecycle events before the first task_started.
-    // Turn boundary detection must not be disrupted by these pre-turn entries.
-    //
-    // Codex v0.141.0 (PR #28008): external_agent_import_result accounting response_items
-    // may appear inside turns; they carry no turn-building semantics.
+    // context import event_msg entries. Codex v0.141.0 (PR #28008):
+    // external_agent_import_result accounting response_items may appear inside turns.
 
     #[test]
     fn v0140_import_event_before_first_turn_does_not_corrupt_turns() {
-        // Import lifecycle events appear before the first task_started.
-        // Verify that turns are built correctly and the import events don't create
-        // spurious synthetic turns or corrupt the first real turn.
         let lines = [
             r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0140-pre-turn-import","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"agent_context_imported","source":"claude-code","thread_count":2}}"#,
@@ -3329,7 +3548,6 @@ mod tests {
             .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
             .collect();
         let turns = build_turns(&parsed);
-        // Exactly one turn must be built — the import event must not create a synthetic turn
         assert_eq!(
             turns.len(),
             1,
@@ -3341,14 +3559,11 @@ mod tests {
 
     #[test]
     fn v0141_external_agent_import_result_inside_turn_does_not_corrupt_turn() {
-        // external_agent_import_result (v0.141.0, PR #28008) is an accounting response_item
-        // that may appear inside a turn. It must not break tool-call or message extraction.
         let lines = [
             r#"{"timestamp":"2026-06-15T10:00:00Z","type":"session_meta","payload":{"id":"v0141-import-result","timestamp":"2026-06-15T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-15T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
             r#"{"timestamp":"2026-06-15T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\"}","call_id":"call-1"}}"#,
             r#"{"timestamp":"2026-06-15T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"hi\n"}}"#,
-            // Accounting item — must be silently ignored
             r#"{"timestamp":"2026-06-15T10:00:04Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","total_tokens":8200}}"#,
             r#"{"timestamp":"2026-06-15T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
             r#"{"timestamp":"2026-06-15T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000006.0}}"#,
@@ -3360,47 +3575,11 @@ mod tests {
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
-        // Tool call is intact
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "exec_command");
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("hi\n"));
-        // Agent message is intact
         assert_eq!(turn.agent_messages.len(), 1);
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
-    }
-
-    #[test]
-    fn v0140_all_standard_entry_types_plus_import_items_build_correct_turns() {
-        // Regression guard: a v0.140.0 session with import events must build the same
-        // turns as an equivalent session without import events.
-        let lines = [
-            r#"{"timestamp":"2026-06-15T10:02:00Z","type":"session_meta","payload":{"id":"v0140-full","timestamp":"2026-06-15T10:02:00Z","cwd":"/project","cli_version":"0.140.0","model_provider":"openai"}}"#,
-            // Pre-turn import event
-            r#"{"timestamp":"2026-06-15T10:02:01Z","type":"event_msg","payload":{"type":"external_agent_imported","source":"claude-code","imported_count":3}}"#,
-            r#"{"timestamp":"2026-06-15T10:02:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-15T10:02:03Z","type":"event_msg","payload":{"type":"user_message","message":"Continue with imported context"}}"#,
-            r#"{"timestamp":"2026-06-15T10:02:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Understood."}}"#,
-            r#"{"timestamp":"2026-06-15T10:02:05Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
-            // Accounting item inside the turn
-            r#"{"timestamp":"2026-06-15T10:02:06Z","type":"response_item","payload":{"type":"external_agent_import_result","source":"claude-code","total_tokens":5100}}"#,
-            r#"{"timestamp":"2026-06-15T10:02:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750000927.0}}"#,
-        ];
-        let parsed: Vec<_> = lines
-            .iter()
-            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
-            .collect();
-        let turns = build_turns(&parsed);
-        assert_eq!(turns.len(), 1, "import events must not create extra turns");
-        let turn = &turns[0];
-        assert_eq!(turn.turn_id, "turn-1");
-        assert_eq!(turn.status, super::TurnStatus::Complete);
-        assert_eq!(
-            turn.user_message.as_deref(),
-            Some("Continue with imported context")
-        );
-        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
-        // No tool calls — the external_agent_import_result must not be misclassified
-        assert_eq!(turn.tool_calls.len(), 0);
     }
 }

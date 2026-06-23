@@ -68,6 +68,9 @@ export type ToolKind =
   | "followup_task"
   /** Codex v0.136.0 (PR #24962): shell hook outputs from pre/post-tool lifecycle hooks. */
   | "shell_hook"
+  /** Codex v0.140.0 (PRs #27438, #27488, #27518): built-in runtime tools for querying the
+   * remaining context budget (`token_budget_context`, `context_remaining`, `context_window`). */
+  | "context_query"
   | "unknown";
 
 export interface CodexToolCall {
