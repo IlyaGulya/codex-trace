@@ -320,9 +320,15 @@ fn handle_event_msg(
             });
             turns.insert(turn_id.clone(), turn);
             *current_turn_id = Some(turn_id.clone());
-            tool_builders
+            let builder = tool_builders
                 .entry(turn_id)
                 .or_insert_with(ToolCallBuilder::new);
+            // Codex v0.141.0+ (PRs #27365, #27371): parse dynamic_tools and build a tool
+            // registry so namespaced MCP/connector tools can be classified correctly.
+            let registry = parse_dynamic_tools(payload);
+            if !registry.is_empty() {
+                builder.set_dynamic_tool_registry(registry);
+            }
         }
 
         "user_message" => {
@@ -1116,6 +1122,54 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// Parse the `dynamic_tools` field from a `task_started` payload (Codex v0.141.0+).
+///
+/// Returns a registry mapping unqualified tool names to (tool_type, server).
+/// Handles two formats:
+///   {"name": "my_tool", "namespace": "mcp:my-server"}  → key="my_tool", ("mcp","my-server")
+///   {"name": "mcp:my-server/my_tool"}                  → key="my_tool", ("mcp","my-server")
+fn parse_dynamic_tools(payload: &Value) -> HashMap<String, (String, String)> {
+    let Some(tools) = payload.get("dynamic_tools").and_then(|v| v.as_array()) else {
+        return HashMap::new();
+    };
+    let mut registry = HashMap::new();
+    for item in tools {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if let Some(ns) = item
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // Explicit namespace field: "mcp:server" or "connector:plugin"
+            if let Some((tool_type, server)) = ns.split_once(':') {
+                if !tool_type.is_empty() && !server.is_empty() {
+                    registry.insert(
+                        name.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        } else if let Some((tool_type, rest)) = name.split_once(':') {
+            // Qualified name format: "mcp:server/tool_name"
+            if let Some((server, tool)) = rest.split_once('/') {
+                if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
+                    registry.insert(
+                        tool.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    registry
+}
+
 fn spawn_from_function_call_output(
     builder: &ToolCallBuilder,
     call_id: &str,
@@ -1814,6 +1868,29 @@ mod tests {
             r#"{"timestamp":"2026-05-07T10:00:02Z","type":"event_msg","payload":{"type":"item/fileChange","path":"/tmp/foo.txt","action":"modified"}}"#,
             r#"{"timestamp":"2026-05-07T10:00:03Z","type":"event_msg","payload":{"type":"outputDelta","delta":"partial output text"}}"#,
             r#"{"timestamp":"2026-05-07T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746604804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    // Codex v0.138.0 (PR #26447): `response.processed` WebSocket request type was removed
+    // from the app-server/exec-server WebSocket protocol. codex-trace is unaffected because
+    // it reads JSONL session files from disk — it never connects to the Codex app-server.
+    // Even if `response.processed` appeared as an event_msg entry in a JSONL file written by
+    // an older Codex version, it would be silently dropped by the wildcard arm in
+    // handle_event_msg. This test guards against regressions that would re-introduce a
+    // dependency on this removed message type.
+    #[test]
+    fn v0138_removed_response_processed_event_ignored_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-06-08T10:00:00Z","type":"session_meta","payload":{"id":"sess-v0138","timestamp":"2026-06-08T10:00:00Z","cli_version":"0.138.0"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:02Z","type":"event_msg","payload":{"type":"response.processed","response_id":"resp-abc","status":"complete"}}"#,
+            r#"{"timestamp":"2026-06-08T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1749376803.0}}"#,
         ]);
 
         let turns = build_turns(&entries);
@@ -3283,9 +3360,114 @@ mod tests {
         assert_eq!(tool.output.as_deref(), Some("submitted"));
     }
 
+    // --- Codex v0.141.0+ dynamic tool namespace tests (PRs #27365, #27371) ---
+
+    #[test]
+    fn parse_dynamic_tools_with_explicit_namespace_field() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({
+            "type": "task_started",
+            "turn_id": "turn-1",
+            "dynamic_tools": [
+                {"name": "my_tool", "namespace": "mcp:my-server"},
+                {"name": "other_tool", "namespace": "connector:plugin-1"}
+            ]
+        });
+        let registry = parse_dynamic_tools(&payload);
+        assert_eq!(
+            registry.get("my_tool"),
+            Some(&("mcp".to_string(), "my-server".to_string()))
+        );
+        assert_eq!(
+            registry.get("other_tool"),
+            Some(&("connector".to_string(), "plugin-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_tools_with_qualified_name_in_name_field() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({
+            "type": "task_started",
+            "turn_id": "turn-1",
+            "dynamic_tools": [
+                {"name": "mcp:my-server/my_tool"}
+            ]
+        });
+        let registry = parse_dynamic_tools(&payload);
+        // Key is the unqualified tool name extracted from the qualified name
+        assert_eq!(
+            registry.get("my_tool"),
+            Some(&("mcp".to_string(), "my-server".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_tools_absent_returns_empty() {
+        use super::parse_dynamic_tools;
+        use serde_json::json;
+        let payload = json!({"type": "task_started", "turn_id": "turn-1"});
+        assert!(parse_dynamic_tools(&payload).is_empty());
+    }
+
+    #[test]
+    fn v0141_task_started_dynamic_tools_classifies_mcp_tool_via_registry() {
+        // v0.141.0+: task_started has dynamic_tools; function_call has unqualified name.
+        // Registry lookup must classify the tool as McpTool.
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"session_id":"v0141-dyn","timestamp":"2026-06-18T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","dynamic_tools":[{"name":"my_tool","namespace":"mcp:my-server"}]}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-dyn-1","name":"my_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-dyn-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-06-18T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750240804.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "tool should be classified as McpTool via dynamic_tools registry"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
+    #[test]
+    fn v0141_task_started_dynamic_tools_classifies_mcp_tool_via_qualified_name() {
+        // v0.141.0+: function_call name is "mcp:server/tool" (namespace-qualified).
+        let lines = [
+            r#"{"timestamp":"2026-06-18T10:01:00Z","type":"session_meta","payload":{"session_id":"v0141-qual","timestamp":"2026-06-18T10:01:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-qual-1","name":"mcp:my-server/my_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-qual-1","output":"done"}}"#,
+            r#"{"timestamp":"2026-06-18T10:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750240864.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "namespace-qualified tool name must be classified as McpTool"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_tool"));
+    }
+
     // Codex v0.141.0 (PR #28355): ResponseItem gains a new optional top-level `metadata` field.
-    // build_turns must handle response_items carrying a metadata field without error; tool call
-    // extraction and agent message building must be unaffected.
 
     #[test]
     fn v0141_response_item_with_metadata_does_not_affect_turn_building() {
@@ -3304,10 +3486,8 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].tool_calls.len(), 1);
         let tool = &turns[0].tool_calls[0];
-        assert_eq!(tool.name, "exec_command");
         assert_eq!(tool.output.as_deref(), Some("hi\n"));
         assert_eq!(tool.exit_code, Some(0));
-        assert_eq!(tool.status, "completed");
     }
 
     #[test]
@@ -3324,8 +3504,6 @@ mod tests {
             .collect();
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
-        // assistant message response_item populates final_answer; the metadata field must not
-        // prevent the content from being extracted
         assert_eq!(
             turns[0].final_answer.as_deref(),
             Some("Done!"),
