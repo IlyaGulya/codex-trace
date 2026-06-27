@@ -1629,4 +1629,94 @@ mod tests {
         );
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.142.0 (PR #29432, PR #29457): persistent log verbosity reduced.
+    //
+    // PR #29432: Responses WebSocket events are no longer logged on every message.
+    // PR #29457: Noisy/duplicated telemetry targets are filtered from persistent logs.
+    //
+    // codex-trace reads session data exclusively from JSONL rollout files at
+    // ~/.codex/sessions/ — not from persistent log files or WebSocket streams. Turn
+    // reconstruction uses task_started/task_complete boundaries and response_item entries;
+    // it does not depend on per-WebSocket-message events or telemetry entries. The sparser
+    // JSONL produced by v0.142.0+ is fully handled by the existing parser.
+
+    #[test]
+    fn v0142_parse_session_correctly() {
+        // v0.142.0 session: JSONL is sparser — no per-WebSocket-message event_msg entries.
+        // parse_session must reconstruct the full session from task_started, response_item,
+        // exec_command_end, and task_complete alone.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-06-22T10-00-00-v0142.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hello\",\"workdir\":\"/project\"}","call_id":"call-v0142-1"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v0142-1","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122404.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0142-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.142.0"));
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.name, "exec_command");
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0142_parse_session_with_ws_events_in_old_format_produces_correct_turns() {
+        // Pre-v0.142.0 sessions may contain per-WebSocket-message event_msg entries that
+        // v0.142.0 (PR #29432) no longer writes. parse_session must handle both formats:
+        // older sessions with these events and newer sessions without them.
+        // The unknown event_msg payload types fall through the wildcard arm and are discarded;
+        // turn structure is determined solely by task_started/task_complete/response_item.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-22T10-01-00-v0142-ws.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-ws-session","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                // Pre-v0.142.0 per-WebSocket-message events: dropped by wildcard arm, no effect on turns
+                r#"{"timestamp":"2026-06-22T10:01:02Z","type":"event_msg","payload":{"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"response.output_item.done","item":{"type":"message","content":"Hello"}}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:04Z","type":"event_msg","payload":{"type":"response.done","response_id":"resp-v142","status":"completed"}}"#,
+                // Telemetry entry (PR #29457): also dropped, no effect on turns
+                r#"{"timestamp":"2026-06-22T10:01:05Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"metrics","batch_size":12}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122467.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0142-ws-session");
+        assert_eq!(session.cli_version.as_deref(), Some("0.142.0"));
+        assert_eq!(
+            session.turns.len(),
+            1,
+            "WebSocket and telemetry events must not create spurious turns"
+        );
+        assert_eq!(session.turns[0].tool_calls.len(), 0);
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("Done"),
+            "final_answer must be populated from response_item despite preceding WS events"
+        );
+        assert!(!session.is_ongoing);
+    }
 }

@@ -1309,4 +1309,96 @@ mod tests {
         assert_eq!(e.payload["type"], "external_agent_import_result");
         assert_eq!(e.payload["total_tokens"], 12400);
     }
+
+    // Codex v0.142.0 (PR #29432): Responses WebSocket events are no longer logged on every
+    // message. Previously, per-message Responses API WebSocket streaming events (e.g.
+    // response.output_item.added, response.done) were written as event_msg entries to the
+    // JSONL session file on every message. v0.142.0 removes this per-message logging, making
+    // the session JSONL sparser.
+    //
+    // Codex v0.142.0 (PR #29457): Noisy/duplicated telemetry targets are filtered from
+    // persistent logs entirely.
+    //
+    // codex-trace reads session data exclusively from JSONL rollout files at
+    // ~/.codex/sessions/. It reconstructs sessions from task_started/task_complete turn
+    // boundaries, response_item tool calls, and turn_context — none of which depend on
+    // per-WebSocket-message event log entries or telemetry entries. The sparser log stream
+    // from v0.142.0+ has no effect on codex-trace's session reconstruction.
+    //
+    // The tests below confirm: (1) all standard entry types from a v0.142.0 session parse
+    // correctly, and (2) any WebSocket response event entries or telemetry entries that may
+    // appear in JSONL files from pre-v0.142.0 sessions are gracefully ignored.
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122404.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.0");
+        assert_eq!(meta.payload["id"], "v0142-session");
+    }
+
+    #[test]
+    fn v0142_responses_ws_per_message_events_if_present_in_old_format_are_ignored_gracefully() {
+        // Pre-v0.142.0 session JSONL files may contain per-WebSocket-message event_msg entries
+        // for Responses API streaming events (e.g. response.output_item.added, response.done).
+        // v0.142.0 (PR #29432) stops writing these. RawEntry must pass them through as
+        // event_msg entries without error, so old sessions remain parseable.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-ws-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // These WebSocket streaming events would have appeared in pre-v0.142.0 JSONL files.
+            // v0.142.0 stops writing them; codex-trace must handle both their presence and absence.
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":"Hello"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"response.done","response_id":"resp-abc","status":"completed"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122406.0}}"#,
+        ];
+        for line in &lines {
+            RawEntry::parse(line)
+                .unwrap_or_else(|| panic!("entry must parse without error: {line}"));
+        }
+        // Specifically confirm the WebSocket event lines parse as event_msg
+        let ws_added = RawEntry::parse(lines[2]).unwrap();
+        assert_eq!(ws_added.entry_type, "event_msg");
+        assert_eq!(
+            event_msg_type(&ws_added.payload),
+            Some("response.output_item.added")
+        );
+
+        let ws_done = RawEntry::parse(lines[4]).unwrap();
+        assert_eq!(ws_done.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&ws_done.payload), Some("response.done"));
+    }
+
+    #[test]
+    fn v0142_telemetry_events_filtered_from_logs_handled_gracefully() {
+        // Codex v0.142.0 (PR #29457): noisy/duplicated telemetry targets are filtered from
+        // persistent logs. Any telemetry-style event_msg entries that may appear in pre-v0.142.0
+        // JSONL files must be parsed without error and ignored by downstream consumers.
+        let telemetry_line = r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"metrics","batch_size":42,"dropped":3}}"#;
+        let e = RawEntry::parse(telemetry_line)
+            .expect("telemetry event_msg entry must parse without error");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("telemetry_flush"));
+        // The payload fields flow through to Value for downstream use (which drops them via _ => {})
+        assert_eq!(e.payload["batch_size"], 42);
+    }
 }

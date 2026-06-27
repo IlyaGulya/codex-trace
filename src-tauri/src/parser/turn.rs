@@ -3582,4 +3582,113 @@ mod tests {
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
+
+    // Codex v0.142.0 (PR #29432, PR #29457): persistent log verbosity reduced.
+    //
+    // PR #29432: Responses WebSocket events are no longer logged on every message.
+    // Previously, per-message Responses API WebSocket streaming events were written as
+    // event_msg entries. v0.142.0 removes this — the session JSONL is now sparser.
+    //
+    // PR #29457: Noisy/duplicated telemetry targets are filtered from persistent logs.
+    //
+    // codex-trace reconstructs turns from task_started/task_complete turn boundaries and
+    // response_item entries. It does NOT depend on per-WebSocket-message event_msg entries
+    // or telemetry entries. Sparser logs do not affect turn reconstruction.
+    //
+    // Unknown event_msg payload types (including Responses API streaming events and telemetry
+    // entries) fall through the wildcard arm in handle_event_msg and are silently discarded.
+
+    #[test]
+    fn v0142_all_standard_entry_types_build_turns_correctly() {
+        // v0.142.0 session with sparser JSONL (no per-WebSocket-message events).
+        // Turn must be built correctly from task_started, response_item, and task_complete.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-turn-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"echo hi\"}"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122404.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].output.as_deref(), Some("hi\n"));
+        assert_eq!(turns[0].tool_calls[0].exit_code, Some(0));
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0142_responses_ws_per_message_events_silently_dropped_turn_structure_intact() {
+        // Pre-v0.142.0 sessions may contain per-WebSocket-message event_msg entries that
+        // v0.142.0 (PR #29432) no longer writes. These fall through the wildcard arm in
+        // handle_event_msg and are discarded. Turn structure must be identical whether or
+        // not the WebSocket streaming events are present.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-ws-turn","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // Per-message WebSocket events from Responses API streaming (no longer logged in v0.142.0)
+            r#"{"timestamp":"2026-06-22T10:01:02Z","type":"event_msg","payload":{"type":"response.output_item.added","item":{"type":"function_call","name":"exec_command","call_id":"call-v142-ws"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"response.output_item.done","item":{"type":"function_call","name":"exec_command","call_id":"call-v142-ws","arguments":"{\"cmd\":\"ls\"}"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:04Z","type":"event_msg","payload":{"type":"response.done","response_id":"resp-v142-ws","status":"completed"}}"#,
+            // Actual response_item and end event that codex-trace uses for turn building
+            r#"{"timestamp":"2026-06-22T10:01:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142-ws","arguments":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:06Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142-ws","aggregated_output":"file.txt\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":5000000}}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122467.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "WebSocket events must not create spurious turns"
+        );
+        assert_eq!(
+            turns[0].tool_calls.len(),
+            1,
+            "exactly one tool call must be built from response_item"
+        );
+        assert_eq!(turns[0].tool_calls[0].name, "exec_command");
+        assert_eq!(turns[0].tool_calls[0].output.as_deref(), Some("file.txt\n"));
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0142_telemetry_events_filtered_silently_dropped_turn_structure_intact() {
+        // Codex v0.142.0 (PR #29457): telemetry entries are filtered from persistent logs.
+        // Any telemetry-style event_msg entries fall through the wildcard arm and are discarded.
+        // Turn structure must be unaffected.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:02:00Z","type":"session_meta","payload":{"id":"v0142-telemetry-turn","timestamp":"2026-06-22T10:02:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // Telemetry events that v0.142.0 (PR #29457) filters from logs
+            r#"{"timestamp":"2026-06-22T10:02:02Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"metrics","batch_size":5,"dropped":0}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:03Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"traces","batch_size":2,"dropped":0}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"All done."}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122525.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "telemetry events must not create spurious turns"
+        );
+        assert_eq!(turns[0].tool_calls.len(), 0);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("All done."),
+            "final_answer must be populated despite preceding telemetry events"
+        );
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
 }

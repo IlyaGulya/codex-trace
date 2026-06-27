@@ -1262,6 +1262,90 @@ mod tests {
         );
     }
 
+    // Codex v0.142.0 (PR #29432, PR #29457): persistent log verbosity reduced.
+    //
+    // PR #29432: Responses WebSocket events are no longer logged on every message.
+    // PR #29457: Noisy/duplicated telemetry targets are filtered from persistent logs.
+    //
+    // codex-trace reads session data from JSONL rollout files at ~/.codex/sessions/ — it does
+    // not read persistent log files or WebSocket streams. Session reconstruction relies on
+    // task_started/task_complete turn boundaries, response_item entries, and turn_context; none
+    // of these depend on the per-WebSocket-message events or telemetry entries that v0.142.0
+    // stops writing. discover_sessions must work correctly even when the event stream is sparser.
+
+    #[test]
+    fn discover_sessions_v0142_sparse_session_discovered_correctly() {
+        // v0.142.0 session: no per-WebSocket-message event_msg entries (PR #29432 stops
+        // writing them). Session reconstruction works purely from task_started, response_item,
+        // and task_complete. discover_sessions must populate all fields correctly.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/22");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-22T10-00-00-v0142.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-disc-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122404.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0142-disc-session")
+            .expect("v0.142.0 session must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.142.0"));
+        assert_eq!(session.cwd.as_deref(), Some("/project"));
+        assert_eq!(session.turn_count, 1);
+        assert!(!session.is_ongoing, "completed session must not be ongoing");
+    }
+
+    #[test]
+    fn discover_sessions_v0142_responses_ws_events_in_old_format_do_not_corrupt_discovery() {
+        // Pre-v0.142.0 sessions may contain per-WebSocket-message event_msg entries
+        // (response.output_item.added, response.done, etc.) that v0.142.0 no longer writes.
+        // discover_sessions must index these sessions correctly — unknown event_msg payload
+        // types are ignored by the scanner's match arms, leaving turn_count intact.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/06/22");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-22T10-01-00-v0142-ws.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-ws-disc","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0"}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                // WebSocket streaming events that v0.142.0 no longer logs — must be harmlessly skipped
+                r#"{"timestamp":"2026-06-22T10:01:02Z","type":"event_msg","payload":{"type":"response.output_item.added","item":{"type":"message"}}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"response.done","response_id":"resp-1","status":"completed"}}"#,
+                // Telemetry entry that v0.142.0 filters (PR #29457) — must also be skipped
+                r#"{"timestamp":"2026-06-22T10:01:04Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"metrics","batch_size":7}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+                r#"{"timestamp":"2026-06-22T10:01:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122466.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0142-ws-disc")
+            .expect("session with WebSocket events must be discoverable");
+        assert_eq!(session.cli_version.as_deref(), Some("0.142.0"));
+        assert_eq!(
+            session.turn_count, 1,
+            "WebSocket events must not inflate turn_count"
+        );
+        assert!(!session.is_ongoing);
+    }
+
     #[test]
     fn v0140_discover_sessions_with_secret_auth_storage_configuration_in_session_meta() {
         // Codex v0.140.0 (PRs #27504, #27535, #27539, #27541): CLI auth and MCP OAuth
