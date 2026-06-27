@@ -135,6 +135,17 @@ export interface CodexTurn {
   memories?: MemorySummary[];
 }
 
+/**
+ * Session JSONL response_item types that appear only in archive sessions recorded before
+ * Codex v0.140.0 (PR #27801 removed the experimental /realtime voice subsystem from the TUI):
+ *   - `speech_append`      — raw audio bytes appended during a voice turn
+ *   - `realtime_handoff`   — handoff event from text to realtime voice session
+ *   - `audio_transcript`   — server-side transcript of recognised speech
+ * These item types are never produced by Codex ≥ v0.140.0 and carry no turn-building
+ * semantics for codex-trace. The Rust parser silently skips them so that old session
+ * archives continue to open without error.
+ */
+
 export interface CodexSession {
   id: string;
   timestamp: string;

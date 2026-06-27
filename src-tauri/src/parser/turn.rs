@@ -1016,6 +1016,12 @@ fn handle_response_item(
             }
         }
 
+        // Archive-only: Codex < v0.140.0 (PR #27801 removed the experimental /realtime voice
+        // subsystem from the TUI). These item types only appear in sessions recorded before
+        // v0.140.0 and are never produced by newly-captured sessions. They carry no
+        // turn-building semantics for codex-trace and are intentionally skipped here.
+        "speech_append" | "realtime_handoff" | "audio_transcript" => {}
+
         _ => {}
     }
 }
@@ -3575,6 +3581,37 @@ mod tests {
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "exec_command");
+        assert_eq!(turn.tool_calls[0].output.as_deref(), Some("hi\n"));
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Done.");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex < v0.140.0 (PR #27801) experimental /realtime voice items.
+    // These archive-only items must be silently skipped — not panic, not corrupt the turn.
+    #[test]
+    fn pre_v0140_realtime_voice_items_in_archive_session_are_silently_skipped() {
+        let lines = [
+            r#"{"timestamp":"2026-01-10T10:00:00Z","type":"session_meta","payload":{"id":"archive-voice-session","timestamp":"2026-01-10T10:00:00Z","cwd":"/project","cli_version":"0.139.5","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:02Z","type":"response_item","payload":{"type":"speech_append","audio_bytes":"dGVzdA=="}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:03Z","type":"response_item","payload":{"type":"realtime_handoff","session_id":"rt-sess-xyz","model":"gpt-4o-realtime-preview"}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:04Z","type":"response_item","payload":{"type":"audio_transcript","text":"Hello from voice mode"}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\"}","call_id":"call-1"}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"hi\n"}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:07Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+            r#"{"timestamp":"2026-01-10T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1736503208.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1, "voice items must not create spurious turns");
+        let turn = &turns[0];
+        // Voice items are skipped; only the exec_command tool call is recorded
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "exec_command");
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("hi\n"));
