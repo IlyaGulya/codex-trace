@@ -365,9 +365,8 @@ fn handle_event_msg(
                 if let Some(turn) = turns.get_mut(tid) {
                     let text = payload
                         .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .map(extract_message_text)
+                        .unwrap_or_default();
                     if !text.is_empty() {
                         let phase = payload
                             .get("phase")
@@ -1139,6 +1138,40 @@ fn str_field(v: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Extract displayable text from an `agent_message` payload's `message` field.
+///
+/// Codex v0.142.0 (PR #28368) changed multi-agent v2 inter-agent messages from
+/// plain strings to typed envelopes `{"type": "<kind>", "content": "..."}`.
+/// This function handles both formats so old and new sessions parse correctly.
+fn extract_message_text(message: &Value) -> String {
+    // Legacy format (pre-v0.142.0): message is a plain string.
+    if let Some(s) = message.as_str() {
+        return s.to_string();
+    }
+
+    // v0.142.0+ typed envelope: dispatch on the "type" discriminant.
+    if let Some(envelope_type) = message.get("type").and_then(|t| t.as_str()) {
+        match envelope_type {
+            // "text" envelope: content is in the "content" field.
+            "text" => {
+                return message
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            // Other envelope types: try "content" as a best-effort fallback.
+            _ => {
+                if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+                    return content.to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
 }
 
 /// Parse the `dynamic_tools` field from a `task_started` payload (Codex v0.141.0+).
@@ -3581,5 +3614,118 @@ mod tests {
         assert_eq!(turn.agent_messages.len(), 1);
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.142.0 (PR #28368): multi-agent v2 inter-agent messages now use typed
+    // envelopes instead of plain string payloads. The `message` field in `agent_message`
+    // events is now an object `{"type": "<kind>", "content": "..."}` rather than a raw
+    // string. The parser must read the type discriminant and dispatch to the correct decoder.
+
+    #[test]
+    fn v0142_agent_message_with_typed_text_envelope_extracts_content() {
+        // v0.142.0 typed envelope: {"type": "text", "content": "..."}.
+        // The parser must read the type discriminant and return the content string.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Hello from the subagent."},"phase":"main"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Hello from the subagent.");
+        assert_eq!(turn.agent_messages[0].phase.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn v0142_agent_message_plain_string_still_parses_correctly() {
+        // Pre-v0.142.0 sessions with a plain-string `message` must continue to parse.
+        // The backward-compatible path must not break when upgrading.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"pre-v0142","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Plain text message.","phase":"main"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "Plain text message.");
+    }
+
+    #[test]
+    fn v0142_agent_message_typed_envelope_final_answer_phase_sets_final_answer() {
+        // Typed envelope with phase "final_answer" must populate turn.final_answer.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-final","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"The answer is 42."},"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "The answer is 42.");
+        assert_eq!(turn.final_answer.as_deref(), Some("The answer is 42."));
+    }
+
+    #[test]
+    fn v0142_agent_message_unknown_envelope_type_falls_back_to_content_field() {
+        // Unknown envelope types must fall back to the "content" field rather than silently
+        // dropping the message. This ensures forward-compatibility with future envelope types.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-unk","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"rich_text","content":"Rendered output."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "Rendered output.");
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types from a v0.142.0 session
+        // must parse correctly. Includes a typed-envelope agent_message.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-full","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Processing your request."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593605.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Processing your request.");
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
     }
 }

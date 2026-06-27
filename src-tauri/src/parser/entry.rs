@@ -1182,6 +1182,56 @@ mod tests {
         assert_eq!(meta.payload["id"], "v0140-session");
     }
 
+    // Codex v0.142.0 (PR #28368): multi-agent v2 inter-agent messages now use typed
+    // envelopes. The `agent_message` event_msg payload's `message` field changed from a
+    // plain string to a typed object `{"type": "<kind>", "content": "..."}`. The RawEntry
+    // parser must pass the payload through without error — payload extraction is unaffected
+    // because RawEntry is Value-based. The type-aware decoding happens in turn.rs.
+
+    #[test]
+    fn v0142_agent_message_with_typed_envelope_parses_as_event_msg() {
+        let line = r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Hello from the subagent."},"phase":"main"}}"#;
+        let e = RawEntry::parse(line).expect("typed-envelope agent_message must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("agent_message"));
+        // The typed envelope is accessible as a Value for downstream decoding.
+        let msg = &e.payload["message"];
+        assert!(msg.is_object(), "message must be an object in v0.142.0+");
+        assert_eq!(msg["type"], "text");
+        assert_eq!(msg["content"], "Hello from the subagent.");
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Processing."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593605.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.0");
+        assert_eq!(meta.payload["id"], "v0142-session");
+        // Verify the typed-envelope agent_message payload is accessible.
+        let agent_msg = RawEntry::parse(lines[4]).unwrap();
+        assert_eq!(agent_msg.payload["message"]["type"], "text");
+        assert_eq!(agent_msg.payload["message"]["content"], "Processing.");
+    }
+
     #[test]
     fn v0140_session_meta_with_secret_auth_storage_configuration_does_not_panic() {
         // session_meta may carry the new secret_auth_storage_configuration field introduced
