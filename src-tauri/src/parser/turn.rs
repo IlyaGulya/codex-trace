@@ -3530,6 +3530,52 @@ mod tests {
         );
     }
 
+    // Codex v0.142.0 (PR #28968): `metadata` on chat message response_items renamed to
+    // `internal_chat_message_metadata_passthrough`. Turn building must be unaffected (content
+    // is still read from the `content` field), and sessions using the new field name must parse.
+
+    #[test]
+    fn v0142_message_response_item_with_internal_passthrough_populates_final_answer() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-msg-meta","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done v0142!","internal_chat_message_metadata_passthrough":{"server_key":"srv-v142","usage":{"prompt_tokens":10,"completion_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750327263.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Done v0142!"),
+            "message with internal_chat_message_metadata_passthrough must still populate final_answer"
+        );
+    }
+
+    #[test]
+    fn v0142_function_call_with_internal_passthrough_does_not_affect_turn_building() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:02:00Z","type":"session_meta","payload":{"id":"v0142-fc-meta","timestamp":"2026-06-22T10:02:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"echo hi\"}","internal_chat_message_metadata_passthrough":{"priority":"normal","request_id":"req-v142"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750327324.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.output.as_deref(), Some("hi\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
     // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command adds external-agent
     // context import event_msg entries. Codex v0.141.0 (PR #28008):
     // external_agent_import_result accounting response_items may appear inside turns.

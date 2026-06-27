@@ -1081,6 +1081,74 @@ mod tests {
         assert_eq!(msg_entry.payload["metadata"]["server_key"], "srv-v0141");
     }
 
+    // Codex v0.142.0 (PR #28968): the `metadata` field on chat message response_items was
+    // renamed to `internal_chat_message_metadata_passthrough` to make the internal-passthrough
+    // nature of the field explicit. Sessions written by v0.142.0+ will carry the new key;
+    // pre-v0.142.0 sessions retain the old `metadata` key (backward compat — both must parse).
+
+    #[test]
+    fn v0142_chat_message_metadata_renamed_to_internal_passthrough() {
+        // Regression: new key must be present and old `metadata` key must be absent.
+        let line = r#"{"timestamp":"2026-06-22T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello v0142","internal_chat_message_metadata_passthrough":{"server_key":"srv-v0142","trace_id":"trace-v0142","model_version":"gpt-5.4-preview"}}}"#;
+        let e = RawEntry::parse(line)
+            .expect("response_item with internal_chat_message_metadata_passthrough must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        // New field must be accessible.
+        let meta = &e.payload["internal_chat_message_metadata_passthrough"];
+        assert!(
+            !meta.is_null(),
+            "internal_chat_message_metadata_passthrough must be present"
+        );
+        assert_eq!(meta["server_key"], "srv-v0142");
+        assert_eq!(meta["trace_id"], "trace-v0142");
+        // Old field must be absent — the key was renamed, not aliased.
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "old `metadata` key must be absent in v0.142.0+ chat message items"
+        );
+    }
+
+    #[test]
+    fn v0142_function_call_response_item_with_internal_passthrough_parses_correctly() {
+        // function_call items also use internal_chat_message_metadata_passthrough in v0.142.0+.
+        let line = r#"{"timestamp":"2026-06-22T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"ls\"}","internal_chat_message_metadata_passthrough":{"priority":"high","request_id":"req-v142"}}}"#;
+        let e = RawEntry::parse(line)
+            .expect("function_call with internal_chat_message_metadata_passthrough must parse");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(
+            e.payload["internal_chat_message_metadata_passthrough"]["priority"],
+            "high"
+        );
+        assert_eq!(
+            e.payload["internal_chat_message_metadata_passthrough"]["request_id"],
+            "req-v142"
+        );
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "old `metadata` key must be absent in v0.142.0+ function_call items"
+        );
+    }
+
+    #[test]
+    fn v0142_pre_v0142_sessions_with_old_metadata_key_remain_backward_compatible() {
+        // Sessions written before v0.142.0 carry the old `metadata` key — they must still parse.
+        let line = r#"{"timestamp":"2026-06-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"server_key":"srv-abc123","trace_id":"trace-xyz"}}}"#;
+        let e = RawEntry::parse(line).expect("pre-v0.142.0 response_item must still parse");
+        let meta = &e.payload["metadata"];
+        assert!(
+            !meta.is_null(),
+            "old metadata key must remain accessible for pre-v0.142.0 sessions"
+        );
+        assert_eq!(meta["server_key"], "srv-abc123");
+        assert!(
+            e.payload
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none(),
+            "new field must be absent in pre-v0.142.0 sessions"
+        );
+    }
+
     // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
     // oneOf and allOf structures instead of flattening them. Large schemas also keep more
     // shallow structure when compacted.

@@ -1629,4 +1629,42 @@ mod tests {
         );
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.142.0 (PR #28968): `metadata` on chat message response_items renamed to
+    // `internal_chat_message_metadata_passthrough`. Sessions written by v0.142.0+ must parse
+    // correctly; final_answer must still be populated from `content`, not the metadata field.
+
+    #[test]
+    fn v0142_parse_session_with_internal_chat_message_metadata_passthrough() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-06-22T10-00-00-v0142meta.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-meta-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142-meta","arguments":"{\"cmd\":\"echo hello\"}","internal_chat_message_metadata_passthrough":{"priority":"normal","request_id":"req-meta-v142"}}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142-meta","aggregated_output":"hello\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":20000000}}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done v0142","internal_chat_message_metadata_passthrough":{"server_key":"srv-0142","usage":{"prompt_tokens":5,"completion_tokens":2}}}}"#,
+                r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750327205.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0142-meta-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        let tool = &session.turns[0].tool_calls[0];
+        assert_eq!(tool.output.as_deref(), Some("hello\n"));
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("Done v0142"),
+            "message with internal_chat_message_metadata_passthrough must populate final_answer"
+        );
+        assert!(!session.is_ongoing);
+    }
 }
