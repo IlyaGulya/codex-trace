@@ -483,6 +483,37 @@ fn handle_event_msg(
             }
         }
 
+        // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+        // token_budget_abort fires when the rollout budget is fully exhausted; it terminates
+        // the turn just like turn_aborted. The reason field carries "token_budget_exhausted"
+        // or similar — record it so the UI can explain why the turn stopped.
+        "token_budget_abort" => {
+            let turn_id_field = payload
+                .get("turn_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(current_turn_id.as_deref().unwrap_or(""))
+                .to_string();
+            let target_id = if !turn_id_field.is_empty() {
+                turn_id_field
+            } else {
+                current_turn_id.clone().unwrap_or_default()
+            };
+            if let Some(turn) = turns.get_mut(&target_id) {
+                turn.status = TurnStatus::Aborted;
+                turn.aborted_reason = payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| Some("token_budget_exhausted".to_string()));
+                turn.completed_at = payload
+                    .get("completed_at")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as u64)
+                    .or_else(|| entry.timestamp.as_deref().and_then(parse_timestamp_secs));
+                turn.duration_ms = payload.get("duration_ms").and_then(|v| v.as_u64());
+            }
+        }
+
         "inference_stream_cancelled" => {
             let turn_id_field = payload
                 .get("turn_id")
@@ -691,6 +722,12 @@ fn handle_event_msg(
         | "agent_context_imported"
         | "external_agent_import_started"
         | "external_agent_imported" => {}
+
+        // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+        // token_budget_reminder is emitted when usage crosses a configured threshold percentage.
+        // It carries no turn-building semantics — skipped so it doesn't corrupt turn data.
+        // token_budget_abort is handled above as a turn termination signal.
+        "token_budget_reminder" => {}
 
         _ => {}
     }
@@ -986,6 +1023,12 @@ fn handle_response_item(
         // Codex v0.141.0 (PR #28008): external_agent_import_result is an accounting-type
         // response_item that records token/cost totals for an imported agent context.
         "external_agent_import_result" => {}
+
+        // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+        // token_budget_compaction_reminder is a configurable response_item emitted when the
+        // runtime suggests compaction due to proximity to the rollout budget limit. It carries
+        // no turn-building semantics — skipped so it doesn't corrupt turn data.
+        "token_budget_compaction_reminder" => {}
 
         // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits the final
         // model response as a "structured_output" response_item whose `content` field holds a
@@ -3581,5 +3624,180 @@ mod tests {
         assert_eq!(turn.agent_messages.len(), 1);
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+    // Rollout token budgets emit reminder and abort events when usage crosses thresholds.
+
+    #[test]
+    fn v0142_token_budget_reminder_does_not_corrupt_turn_state() {
+        // token_budget_reminder is a notification event with no turn-building semantics —
+        // it must not affect turn status, tool calls, or agent messages.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-budget-reminder","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_reminder","threshold_pct":80,"tokens_used":8000,"tokens_budget":10000}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Continuing despite budget reminder."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593604.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "budget reminder must not create spurious turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(
+            turn.status,
+            super::TurnStatus::Complete,
+            "token_budget_reminder must not change turn status"
+        );
+        assert_eq!(
+            turn.final_answer.as_deref(),
+            Some("Continuing despite budget reminder.")
+        );
+    }
+
+    #[test]
+    fn v0142_token_budget_abort_sets_turn_aborted_status() {
+        // token_budget_abort fires when the rollout budget is exhausted — must terminate
+        // the turn with Aborted status, just like turn_aborted.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-budget-abort","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working on the task..."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","reason":"token_budget_exhausted","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(
+            turn.status,
+            super::TurnStatus::Aborted,
+            "token_budget_abort must set turn status to Aborted"
+        );
+        assert!(
+            turn.aborted_reason.is_some(),
+            "token_budget_abort must populate aborted_reason"
+        );
+        assert!(
+            turn.aborted_reason
+                .as_deref()
+                .unwrap()
+                .contains("token_budget"),
+            "aborted_reason must reference the budget: {:?}",
+            turn.aborted_reason
+        );
+    }
+
+    #[test]
+    fn v0142_token_budget_abort_without_reason_field_uses_default_reason() {
+        // token_budget_abort without an explicit reason field should still populate
+        // aborted_reason with a sensible default so the UI can explain the termination.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-abort-no-reason","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1"}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, super::TurnStatus::Aborted);
+        assert_eq!(
+            turn.aborted_reason.as_deref(),
+            Some("token_budget_exhausted"),
+            "default reason must be token_budget_exhausted when reason field is absent"
+        );
+    }
+
+    #[test]
+    fn v0142_token_budget_compaction_reminder_does_not_corrupt_turn() {
+        // token_budget_compaction_reminder is a response_item type emitted when the runtime
+        // suggests compaction due to budget proximity. It must not affect turn state.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-compaction-reminder","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Analysing the codebase."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"token_budget_compaction_reminder","threshold_pct":90,"message":"Consider running /compact to free context."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593604.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "compaction reminder must not create spurious turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(
+            turn.status,
+            super::TurnStatus::Complete,
+            "token_budget_compaction_reminder must not change turn status"
+        );
+        assert_eq!(
+            turn.tool_calls.len(),
+            0,
+            "compaction reminder must not produce tool calls"
+        );
+        assert_eq!(
+            turn.final_answer.as_deref(),
+            Some("Analysing the codebase.")
+        );
+    }
+
+    #[test]
+    fn v0142_all_budget_event_types_parse_in_complete_session() {
+        // Regression guard: all three new v0.142.0 budget event types must parse correctly
+        // in a realistic session that goes: reminder → work → compaction hint → abort.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-full","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_reminder","threshold_pct":75,"tokens_used":7500,"tokens_budget":10000}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"response_item","payload":{"type":"token_budget_compaction_reminder","threshold_pct":90,"message":"Context approaching budget limit."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","aggregated_output":"file.txt\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:06Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","reason":"token_budget_exhausted","completed_at":1750593606.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(
+            turn.status,
+            super::TurnStatus::Aborted,
+            "token_budget_abort must terminate the turn"
+        );
+        assert_eq!(
+            turn.tool_calls.len(),
+            1,
+            "exec_command tool call must be recorded"
+        );
+        assert_eq!(turn.tool_calls[0].name, "exec_command");
+        assert_eq!(
+            turn.aborted_reason.as_deref(),
+            Some("token_budget_exhausted")
+        );
     }
 }

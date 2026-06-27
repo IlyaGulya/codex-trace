@@ -1309,4 +1309,67 @@ mod tests {
         assert_eq!(e.payload["type"], "external_agent_import_result");
         assert_eq!(e.payload["total_tokens"], 12400);
     }
+
+    // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+    // Configurable rollout token budgets emit reminder, abort, and compaction-reminder events.
+
+    #[test]
+    fn v0142_token_budget_reminder_parses_as_event_msg() {
+        let line = r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_reminder","threshold_pct":80,"tokens_used":8000,"tokens_budget":10000}}"#;
+        let e = RawEntry::parse(line).expect("token_budget_reminder must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("token_budget_reminder"));
+        assert_eq!(e.payload["threshold_pct"], 80);
+        assert_eq!(e.payload["tokens_used"], 8000);
+    }
+
+    #[test]
+    fn v0142_token_budget_abort_parses_as_event_msg() {
+        let line = r#"{"timestamp":"2026-06-22T10:00:06Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","reason":"token_budget_exhausted","completed_at":1750593606.0}}"#;
+        let e = RawEntry::parse(line).expect("token_budget_abort must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("token_budget_abort"));
+        assert_eq!(e.payload["reason"], "token_budget_exhausted");
+        assert_eq!(e.payload["turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn v0142_token_budget_compaction_reminder_parses_as_response_item() {
+        let line = r#"{"timestamp":"2026-06-22T10:00:04Z","type":"response_item","payload":{"type":"token_budget_compaction_reminder","threshold_pct":90,"message":"Consider running /compact to free context."}}"#;
+        let e = RawEntry::parse(line).expect("token_budget_compaction_reminder must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "token_budget_compaction_reminder");
+        assert_eq!(e.payload["threshold_pct"], 90);
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types must parse under v0.142.0,
+        // including the three new budget event types introduced in this version.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_reminder","threshold_pct":75,"tokens_used":7500,"tokens_budget":10000}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"response_item","payload":{"type":"token_budget_compaction_reminder","threshold_pct":90,"message":"Context approaching budget limit."}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:06Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","reason":"token_budget_exhausted","completed_at":1750593606.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.0");
+        assert_eq!(meta.payload["id"], "v0142-session");
+    }
 }
