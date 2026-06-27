@@ -1309,4 +1309,71 @@ mod tests {
         assert_eq!(e.payload["type"], "external_agent_import_result");
         assert_eq!(e.payload["total_tokens"], 12400);
     }
+
+    // Codex v0.142.2 (PR #28360): ResponseItem gains a `turn_id` field on its `metadata`
+    // object. The field allows downstream consumers to correlate response items to turns
+    // by explicit ID rather than by positional heuristics. The loosely-typed RawEntry
+    // model passes the metadata through unchanged; turn.rs reads metadata.turn_id to
+    // prefer the explicit signal over current_turn_id when both are available.
+
+    #[test]
+    fn v0142_response_item_with_metadata_turn_id_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-25T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"turn_id":"turn-abc","trace_id":"trace-xyz"}}}"#;
+        let e = RawEntry::parse(line).expect("response_item with metadata.turn_id must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        // metadata.turn_id must be accessible for downstream turn correlation
+        assert_eq!(e.payload["metadata"]["turn_id"], "turn-abc");
+        assert_eq!(e.payload["metadata"]["trace_id"], "trace-xyz");
+    }
+
+    #[test]
+    fn v0142_function_call_response_item_with_metadata_turn_id_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-25T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"echo hi\"}","metadata":{"turn_id":"turn-abc"}}}"#;
+        let e = RawEntry::parse(line).expect("function_call with metadata.turn_id must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(e.payload["metadata"]["turn_id"], "turn-abc");
+    }
+
+    #[test]
+    fn v0142_response_item_without_metadata_turn_id_is_backward_compatible() {
+        // Pre-v0.142.2 response items carry no metadata.turn_id — must parse normally.
+        let line = r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#;
+        let e = RawEntry::parse(line).expect("response_item without metadata.turn_id must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "metadata must be absent in pre-v0.142.2 entries"
+        );
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard entry types from a v0.142.2 session must parse.
+        // response_items carry metadata.turn_id; other entry types are unchanged.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"turn_id":"turn-1","trace_id":"trace-001"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000004.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.2");
+        // metadata.turn_id must be accessible on response_item payload
+        let msg_entry = RawEntry::parse(lines[2]).unwrap();
+        assert_eq!(msg_entry.payload["metadata"]["turn_id"], "turn-1");
+    }
 }

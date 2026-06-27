@@ -713,13 +713,24 @@ fn handle_response_item(
         None => return,
     };
 
-    let tid = match current_turn_id {
+    // Codex v0.142.2 (PR #28360): turn_id is now stored in ResponseItem metadata.
+    // Prefer the explicit metadata.turn_id over positional current_turn_id — the
+    // metadata field allows correct correlation even when response items are emitted
+    // for non-contiguous turns.
+    let metadata_turn_id = payload
+        .get("metadata")
+        .and_then(|m| m.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tid: &str = match metadata_turn_id.as_deref().or(current_turn_id.as_deref()) {
         Some(t) => t,
         None => return,
     };
 
     let builder = tool_builders
-        .entry(tid.clone())
+        .entry(tid.to_string())
         .or_insert_with(ToolCallBuilder::new);
 
     match item_type {
@@ -3581,5 +3592,99 @@ mod tests {
         assert_eq!(turn.agent_messages.len(), 1);
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.142.2 (PR #28360): turn_id field added to ResponseItem metadata.
+    // handle_response_item must prefer metadata.turn_id over positional current_turn_id
+    // so that response items are attributed to the correct turn even in non-contiguous
+    // session layouts.
+
+    #[test]
+    fn v0142_response_item_with_metadata_turn_id_attributed_to_correct_turn() {
+        // Two turns. The second response_item carries metadata.turn_id = "turn-1" but arrives
+        // during turn-2 (positional current_turn_id is "turn-2"). It must be attributed to
+        // turn-1 because the explicit metadata signal takes precedence.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-meta-tid","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000002.0}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            // This response_item carries metadata.turn_id = "turn-1" — it belongs to turn-1
+            // even though current_turn_id is now "turn-2".
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Answer from turn 1","metadata":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1751000005.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 2);
+
+        let turn1 = turns.iter().find(|t| t.turn_id == "turn-1").unwrap();
+        let turn2 = turns.iter().find(|t| t.turn_id == "turn-2").unwrap();
+
+        // The response_item must be attributed to turn-1 via metadata.turn_id
+        assert_eq!(
+            turn1.final_answer.as_deref(),
+            Some("Answer from turn 1"),
+            "metadata.turn_id must override positional current_turn_id"
+        );
+        assert_eq!(
+            turn2.final_answer, None,
+            "turn-2 must not receive the response_item that explicitly declares turn-1"
+        );
+    }
+
+    #[test]
+    fn v0142_response_item_without_metadata_turn_id_falls_back_to_current_turn_id() {
+        // Pre-v0.142.2 response items carry no metadata.turn_id. Verify the positional
+        // current_turn_id fallback continues to work correctly for older sessions.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-no-meta-tid","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello from legacy turn"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000003.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, "turn-1");
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Hello from legacy turn"),
+            "positional current_turn_id fallback must work for pre-v0.142.2 entries"
+        );
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_build_turns_correctly() {
+        // Regression guard: a full v0.142.2 session with metadata.turn_id on response items
+        // must produce one correct turn with the expected tool call and final answer.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-full","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"echo hello\"}","metadata":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-v142","output":"hello\n","metadata":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done!","metadata":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:05Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000006.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "exec_command");
+        assert_eq!(turn.tool_calls[0].output.as_deref(), Some("hello\n"));
+        assert_eq!(turn.final_answer.as_deref(), Some("Done!"));
     }
 }
