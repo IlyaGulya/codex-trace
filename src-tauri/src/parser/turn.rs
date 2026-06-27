@@ -837,6 +837,22 @@ fn handle_response_item(
             builder.backfill_patch_result(&call_id, success, changes);
         }
 
+        // Codex v0.142.2 (PR #29486): MCP tools are now discovered via tool-search calls
+        // rather than being enumerated upfront in task_started.dynamic_tools. The model issues
+        // a tool_search_call mid-turn; matching tools are returned in tool_search_call_output.
+        // Parse the output and merge the discovered tools into the current turn's dynamic tool
+        // registry so that subsequent function_call entries are classified as McpTool correctly.
+        "tool_search_call" => {
+            // Search request — tool definitions arrive in the paired tool_search_call_output.
+        }
+
+        "tool_search_call_output" => {
+            let extra = parse_tool_search_results(payload);
+            if !extra.is_empty() {
+                builder.extend_dynamic_tool_registry(extra);
+            }
+        }
+
         // Codex v0.129.0 (PR #20677): MCP tool calls are now emitted as first-class
         // response_item turn entries with dedicated types instead of reusing function_call
         // with an mcp__ namespace. Wire them into the existing ToolCallBuilder paths so
@@ -1176,6 +1192,61 @@ fn parse_dynamic_tools(payload: &Value) -> HashMap<String, (String, String)> {
             }
         } else if let Some((tool_type, rest)) = name.split_once(':') {
             // Qualified name format: "mcp:server/tool_name"
+            if let Some((server, tool)) = rest.split_once('/') {
+                if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
+                    registry.insert(
+                        tool.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    registry
+}
+
+/// Parse tool definitions from a `tool_search_call_output` payload (Codex v0.142.2+, PR #29486).
+///
+/// The `tools` array may contain entries in the same formats as `dynamic_tools`:
+///   {"name": "my_tool", "server": "my-server"}           → key="my_tool", ("mcp","my-server")
+///   {"name": "my_tool", "namespace": "mcp:my-server"}    → key="my_tool", ("mcp","my-server")
+///   {"name": "mcp:my-server/my_tool"}                    → key="my_tool", ("mcp","my-server")
+fn parse_tool_search_results(payload: &Value) -> HashMap<String, (String, String)> {
+    let Some(tools) = payload.get("tools").and_then(|v| v.as_array()) else {
+        return HashMap::new();
+    };
+    let mut registry = HashMap::new();
+    for item in tools {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // Explicit server field: {"name": "my_tool", "server": "my-server"}
+        if let Some(server) = item
+            .get("server")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            registry.insert(name.to_string(), ("mcp".to_string(), server.to_string()));
+        } else if let Some(ns) = item
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // Namespace field: "mcp:server" or "connector:plugin"
+            if let Some((tool_type, server)) = ns.split_once(':') {
+                if !tool_type.is_empty() && !server.is_empty() {
+                    registry.insert(
+                        name.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        } else if let Some((tool_type, rest)) = name.split_once(':') {
+            // Qualified name: "mcp:server/tool_name"
             if let Some((server, tool)) = rest.split_once('/') {
                 if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
                     registry.insert(
@@ -3581,5 +3652,256 @@ mod tests {
         assert_eq!(turn.agent_messages.len(), 1);
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.142.2 (PR #29486): MCP tools are now discovered via tool-search calls
+    // rather than being enumerated upfront in task_started.dynamic_tools. When the model
+    // supports it (default for compatible models/providers), tool discovery happens mid-turn
+    // via tool_search_call items and the matching tools are returned in tool_search_call_output.
+
+    #[test]
+    fn v0142_tool_search_call_output_with_server_field_classifies_mcp_tool() {
+        // tool_search_call_output with explicit server field; subsequent function_call must be
+        // classified as McpTool via the dynamically built registry.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-ts-server","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-1","query":"file operations"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-1","tools":[{"name":"read_file","server":"filesystem","description":"Read a file"}]}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"call-mcp-1","name":"read_file","arguments":"{\"path\":\"/tmp/foo.txt\"}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-mcp-1","output":"file contents\n"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845606.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1, "exactly one MCP tool call");
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(
+            tool.kind,
+            crate::parser::toolcall::ToolKind::McpTool,
+            "tool discovered via tool-search must be classified as McpTool"
+        );
+        assert_eq!(tool.mcp_server.as_deref(), Some("filesystem"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("read_file"));
+        assert_eq!(tool.output.as_deref(), Some("file contents\n"));
+    }
+
+    #[test]
+    fn v0142_tool_search_call_output_with_namespace_field_classifies_mcp_tool() {
+        // tool_search_call_output using namespace field format (same as dynamic_tools).
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:01:00Z","type":"session_meta","payload":{"id":"v0142-ts-ns","timestamp":"2026-06-25T10:01:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:01:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-2","query":"github"}}"#,
+            r#"{"timestamp":"2026-06-25T10:01:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-2","tools":[{"name":"create_pr","namespace":"mcp:github"}]}}"#,
+            r#"{"timestamp":"2026-06-25T10:01:04Z","type":"response_item","payload":{"type":"function_call","call_id":"call-mcp-2","name":"create_pr","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:01:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-mcp-2","output":"PR #42 created"}}"#,
+            r#"{"timestamp":"2026-06-25T10:01:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845666.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, crate::parser::toolcall::ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("github"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("create_pr"));
+    }
+
+    #[test]
+    fn v0142_tool_search_call_output_with_qualified_name_classifies_mcp_tool() {
+        // tool_search_call_output using "mcp:server/tool" qualified name format.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:02:00Z","type":"session_meta","payload":{"id":"v0142-ts-qname","timestamp":"2026-06-25T10:02:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-3","query":"slack"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-3","tools":[{"name":"mcp:slack/post_message"}]}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:04Z","type":"response_item","payload":{"type":"function_call","call_id":"call-mcp-3","name":"post_message","arguments":"{\"channel\":\"general\",\"text\":\"hello\"}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-mcp-3","output":"ok"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845726.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, crate::parser::toolcall::ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("slack"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("post_message"));
+    }
+
+    #[test]
+    fn v0142_multiple_tool_searches_within_turn_accumulate_registry() {
+        // Multiple tool_search_call_output items in the same turn must all contribute
+        // to the registry so tools from all searches are classified correctly.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:03:00Z","type":"session_meta","payload":{"id":"v0142-multi-ts","timestamp":"2026-06-25T10:03:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            // First search: discovers filesystem tools
+            r#"{"timestamp":"2026-06-25T10:03:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-a","query":"filesystem"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-a","tools":[{"name":"read_file","server":"filesystem"}]}}"#,
+            // Second search: discovers github tools
+            r#"{"timestamp":"2026-06-25T10:03:04Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-b","query":"github pr"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:05Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-b","tools":[{"name":"create_pr","server":"github"}]}}"#,
+            // Both tools used after discovery
+            r#"{"timestamp":"2026-06-25T10:03:06Z","type":"response_item","payload":{"type":"function_call","call_id":"call-fs","name":"read_file","arguments":"{\"path\":\"/tmp/a.txt\"}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-fs","output":"content"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:08Z","type":"response_item","payload":{"type":"function_call","call_id":"call-gh","name":"create_pr","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:09Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-gh","output":"PR created"}}"#,
+            r#"{"timestamp":"2026-06-25T10:03:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845790.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 2, "both tools must be captured");
+        let fs_tool = turns[0]
+            .tool_calls
+            .iter()
+            .find(|t| t.name == "read_file")
+            .expect("read_file tool call must be present");
+        assert_eq!(fs_tool.kind, crate::parser::toolcall::ToolKind::McpTool);
+        assert_eq!(fs_tool.mcp_server.as_deref(), Some("filesystem"));
+        let gh_tool = turns[0]
+            .tool_calls
+            .iter()
+            .find(|t| t.name == "create_pr")
+            .expect("create_pr tool call must be present");
+        assert_eq!(gh_tool.kind, crate::parser::toolcall::ToolKind::McpTool);
+        assert_eq!(gh_tool.mcp_server.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn v0142_tool_search_call_items_parse_without_panic_in_entry_rs() {
+        // RawEntry must parse tool_search_call and tool_search_call_output without panicking.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:04:00Z","type":"session_meta","payload":{"id":"v0142-parse-guard","timestamp":"2026-06-25T10:04:00Z","cwd":"/tmp","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:04:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:04:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-x","query":"anything"}}"#,
+            r#"{"timestamp":"2026-06-25T10:04:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-x","tools":[{"name":"some_tool","server":"some-server"}]}}"#,
+            r#"{"timestamp":"2026-06-25T10:04:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845844.0}}"#,
+        ];
+        let entries: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        // All five lines must parse; tool_search items are response_items
+        assert_eq!(
+            entries.len(),
+            5,
+            "all entries including tool_search items must parse"
+        );
+        assert_eq!(entries[2].entry_type, "response_item");
+        assert_eq!(entries[2].payload["type"], "tool_search_call");
+        assert_eq!(entries[3].entry_type, "response_item");
+        assert_eq!(entries[3].payload["type"], "tool_search_call_output");
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types from a v0.142.2 session that uses
+        // tool-search for MCP discovery must parse correctly without panicking.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:05:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-25T10:05:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-reg","query":"tools"}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-reg","tools":[{"name":"my_mcp_tool","server":"my-server"}]}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:04Z","type":"response_item","payload":{"type":"function_call","call_id":"call-reg","name":"my_mcp_tool","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-reg","output":"done"}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:06Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-25T10:05:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845907.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, crate::parser::toolcall::ToolKind::McpTool);
+        assert_eq!(tool.mcp_server.as_deref(), Some("my-server"));
+        assert_eq!(tool.mcp_tool.as_deref(), Some("my_mcp_tool"));
+    }
+
+    // parse_tool_search_results unit tests
+    #[test]
+    fn parse_tool_search_results_with_server_field() {
+        use super::parse_tool_search_results;
+        use serde_json::json;
+        let payload = json!({
+            "type": "tool_search_call_output",
+            "tools": [
+                {"name": "read_file", "server": "filesystem"},
+                {"name": "write_file", "server": "filesystem"}
+            ]
+        });
+        let registry = parse_tool_search_results(&payload);
+        assert_eq!(
+            registry.get("read_file"),
+            Some(&("mcp".to_string(), "filesystem".to_string()))
+        );
+        assert_eq!(
+            registry.get("write_file"),
+            Some(&("mcp".to_string(), "filesystem".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_tool_search_results_with_namespace_field() {
+        use super::parse_tool_search_results;
+        use serde_json::json;
+        let payload = json!({
+            "tools": [
+                {"name": "create_pr", "namespace": "mcp:github"},
+                {"name": "list_prs", "namespace": "mcp:github"}
+            ]
+        });
+        let registry = parse_tool_search_results(&payload);
+        assert_eq!(
+            registry.get("create_pr"),
+            Some(&("mcp".to_string(), "github".to_string()))
+        );
+        assert_eq!(
+            registry.get("list_prs"),
+            Some(&("mcp".to_string(), "github".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_tool_search_results_with_qualified_name() {
+        use super::parse_tool_search_results;
+        use serde_json::json;
+        let payload = json!({
+            "tools": [
+                {"name": "mcp:slack/post_message"}
+            ]
+        });
+        let registry = parse_tool_search_results(&payload);
+        assert_eq!(
+            registry.get("post_message"),
+            Some(&("mcp".to_string(), "slack".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_tool_search_results_absent_tools_array_returns_empty() {
+        use super::parse_tool_search_results;
+        use serde_json::json;
+        let payload = json!({"type": "tool_search_call_output", "call_id": "x"});
+        assert!(parse_tool_search_results(&payload).is_empty());
     }
 }

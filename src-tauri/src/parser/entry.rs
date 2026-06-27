@@ -1309,4 +1309,63 @@ mod tests {
         assert_eq!(e.payload["type"], "external_agent_import_result");
         assert_eq!(e.payload["total_tokens"], 12400);
     }
+
+    // Codex v0.142.2 (PR #29486): MCP tools are now discovered via tool-search calls rather
+    // than being enumerated upfront. tool_search_call and tool_search_call_output appear as
+    // response_item entries mid-turn. RawEntry must parse both without panicking.
+
+    #[test]
+    fn v0142_tool_search_call_response_item_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-25T10:00:00Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-1","query":"file operations"}}"#;
+        let e = RawEntry::parse(line).expect("tool_search_call must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "tool_search_call");
+        assert_eq!(e.payload["call_id"], "search-1");
+        assert_eq!(e.payload["query"], "file operations");
+    }
+
+    #[test]
+    fn v0142_tool_search_call_output_response_item_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-25T10:00:01Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-1","tools":[{"name":"read_file","server":"filesystem","description":"Read a file"}]}}"#;
+        let e = RawEntry::parse(line).expect("tool_search_call_output must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "tool_search_call_output");
+        assert_eq!(e.payload["call_id"], "search-1");
+        let tools = e.payload["tools"].as_array().expect("tools must be array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "read_file");
+        assert_eq!(tools[0]["server"], "filesystem");
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types from a v0.142.2 session must parse.
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:02:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-25T10:02:00Z","cwd":"/tmp","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:02Z","type":"response_item","payload":{"type":"tool_search_call","call_id":"search-reg","query":"tools"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:03Z","type":"response_item","payload":{"type":"tool_search_call_output","call_id":"search-reg","tools":[{"name":"my_tool","server":"my-server"}]}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:04Z","type":"response_item","payload":{"type":"function_call","name":"my_tool","call_id":"call-1","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:06Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-06-25T10:02:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750845727.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "response_item",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.2");
+        assert_eq!(meta.payload["id"], "v0142-session");
+    }
 }

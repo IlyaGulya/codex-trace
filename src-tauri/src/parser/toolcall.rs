@@ -106,6 +106,12 @@ impl ToolCallBuilder {
         self.dynamic_tool_registry = registry;
     }
 
+    /// Extend the dynamic tool registry with tools discovered via tool-search (Codex v0.142.2+).
+    /// Called when a `tool_search_call_output` response item is encountered mid-turn.
+    pub fn extend_dynamic_tool_registry(&mut self, extra: HashMap<String, (String, String)>) {
+        self.dynamic_tool_registry.extend(extra);
+    }
+
     /// Register a function_call (response_item).
     pub fn add_function_call(
         &mut self,
