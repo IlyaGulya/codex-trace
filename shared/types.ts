@@ -42,6 +42,10 @@ export interface CompactionMeta {
   summary: string | null;
   /** What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested). Null for sessions that predate this field. */
   compaction_trigger: string | null;
+  /** Codex v0.142.0 (PR #29256): opaque ID linking this context window to its compaction
+   * ancestor, enabling lineage reconstruction across compaction boundaries.
+   * Null for sessions predating v0.142.0. Context window IDs use UUIDv7 format (PR #28953). */
+  lineage_id: string | null;
 }
 
 export interface CollabSpawn {

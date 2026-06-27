@@ -1309,4 +1309,74 @@ mod tests {
         assert_eq!(e.payload["type"], "external_agent_import_result");
         assert_eq!(e.payload["total_tokens"], 12400);
     }
+
+    // Codex v0.142.0 (PR #28953): context window IDs changed to UUIDv7 format.
+    // codex-trace treats all IDs as opaque strings — no UUID-specific validation is
+    // performed, so UUIDv7 values must parse identically to any other string ID.
+    // Codex v0.142.0 (PR #29256): lineage_id added to session/turn data to track
+    // compaction ancestry. The RawEntry parser must pass this field through without error.
+
+    #[test]
+    fn v0142_session_meta_with_uuidv7_id_parses_correctly() {
+        // v0.142.0 PR #28953: context window IDs are now UUIDv7 (version nibble == 7).
+        // The session ID field uses the same opaque-string treatment — no format
+        // validation occurs, so a UUIDv7 value is accepted exactly like any other string.
+        let line = r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"019033a5-1bc7-7a4d-8f12-3456789abcde","timestamp":"2026-06-22T10:00:00Z","cwd":"/tmp","cli_version":"0.142.0","model_provider":"openai"}}"#;
+        let e = RawEntry::parse(line).expect("session_meta with UUIDv7 id must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "019033a5-1bc7-7a4d-8f12-3456789abcde");
+        assert_eq!(e.payload["cli_version"], "0.142.0");
+    }
+
+    #[test]
+    fn v0142_task_started_with_uuidv7_turn_id_and_lineage_id_parses_correctly() {
+        // v0.142.0: turn_id now uses UUIDv7 format; lineage_id added inside the
+        // compaction object (PR #29256) to track the ancestry of this context window.
+        // Both fields are treated as opaque strings — no UUID-specific parsing.
+        let line = r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019033a5-1bc7-7000-8f12-3456789abcde","compaction":{"tokens_before":120000,"tokens_after":40000,"lineage_id":"019033a5-1bc7-7000-8f12-000000000000","compaction_trigger":"auto"}}}"#;
+        let e = RawEntry::parse(line).expect("task_started with UUIDv7 fields must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(
+            e.payload.get("type").and_then(|t| t.as_str()),
+            Some("task_started")
+        );
+        // turn_id and lineage_id flow through the payload value unchanged.
+        assert_eq!(e.payload["turn_id"], "019033a5-1bc7-7000-8f12-3456789abcde");
+        assert_eq!(
+            e.payload["compaction"]["lineage_id"],
+            "019033a5-1bc7-7000-8f12-000000000000"
+        );
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types must parse under v0.142.0.
+        // turn_id now uses UUIDv7 format; task_started carries a lineage_id in compaction.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"019033a5-1bc7-7a4d-8f12-3456789abcde","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019033a5-1bc7-7000-8f12-3456789abcde","compaction":{"tokens_before":120000,"tokens_after":40000,"lineage_id":"019033a4-ffff-7000-0000-000000000000","compaction_trigger":"auto"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019033a5-1bc7-7000-8f12-3456789abcde","completed_at":1750593604.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.0");
+        // lineage_id in compaction is accessible via the raw payload
+        let task_started = RawEntry::parse(lines[1]).unwrap();
+        assert_eq!(
+            task_started.payload["compaction"]["lineage_id"],
+            "019033a4-ffff-7000-0000-000000000000"
+        );
+    }
 }

@@ -67,6 +67,10 @@ pub struct CompactionMeta {
     /// What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested).
     /// Null for sessions that predate this field.
     pub compaction_trigger: Option<String>,
+    /// Codex v0.142.0 (PR #29256): opaque ID linking this context window to its compaction
+    /// ancestor, enabling lineage reconstruction across compaction boundaries.
+    /// Null for sessions predating v0.142.0.
+    pub lineage_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +308,7 @@ fn handle_event_msg(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             // Codex v0.135.0 (PR #24368): compaction metadata for context-window accounting.
+            // Codex v0.142.0 (PR #29256): lineage_id added to track compaction ancestry.
             turn.compaction_meta = payload.get("compaction").map(|c| CompactionMeta {
                 tokens_before: c.get("tokens_before").and_then(|v| v.as_u64()),
                 tokens_after: c.get("tokens_after").and_then(|v| v.as_u64()),
@@ -314,6 +319,11 @@ fn handle_event_msg(
                     .map(|s| s.to_string()),
                 compaction_trigger: c
                     .get("compaction_trigger")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                lineage_id: c
+                    .get("lineage_id")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
@@ -3581,5 +3591,131 @@ mod tests {
         assert_eq!(turn.agent_messages.len(), 1);
         assert_eq!(turn.agent_messages[0].text, "Done.");
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.142.0 (PR #28953): context window IDs changed to UUIDv7 format.
+    // Codex v0.142.0 (PR #29256): lineage_id added inside the compaction object on
+    // task_started events, tracking compaction ancestry for context-window lineage.
+    //
+    // codex-trace treats all IDs as opaque strings — no UUID-specific validation is
+    // performed. UUIDv7 turn IDs and lineage IDs must parse identically to any other
+    // string ID.
+
+    #[test]
+    fn v0142_task_started_with_uuidv7_turn_id_parses_correctly() {
+        // v0.142.0 PR #28953: context window IDs (including turn_id) now use UUIDv7.
+        // The parser treats turn_id as an opaque string — format is irrelevant.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"019033a5-1bc7-7a4d-8f12-3456789abcde","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019033a5-1bc7-7000-8f12-3456789abcde"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019033a5-1bc7-7000-8f12-3456789abcde","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "UUIDv7 turn_id must produce exactly one turn"
+        );
+        assert_eq!(turns[0].turn_id, "019033a5-1bc7-7000-8f12-3456789abcde");
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0142_compaction_lineage_id_extracted_from_task_started() {
+        // v0.142.0 PR #29256: lineage_id added inside the compaction object on task_started.
+        // It tracks which context window snapshot this turn was compacted from.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-lineage","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":120000,"tokens_after":40000,"lineage_id":"019033a4-ffff-7000-0000-000000000000","compaction_trigger":"auto"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Continuing after compaction"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert!(
+            turn.has_compaction || turn.compaction_meta.is_some(),
+            "turn must show compaction"
+        );
+        let meta = turn
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.tokens_before, Some(120000));
+        assert_eq!(meta.tokens_after, Some(40000));
+        assert_eq!(
+            meta.lineage_id.as_deref(),
+            Some("019033a4-ffff-7000-0000-000000000000"),
+            "lineage_id must be extracted from compaction object"
+        );
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn v0142_compaction_without_lineage_id_backward_compatible() {
+        // Pre-v0.142.0 sessions: compaction object has no lineage_id.
+        // lineage_id must be None — not an error.
+        let lines = [
+            r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"v0135-no-lineage","timestamp":"2026-05-28T10:00:00Z","cwd":"/project","cli_version":"0.135.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","compaction":{"tokens_before":90000,"tokens_after":30000,"compaction_trigger":"manual"}}}"#,
+            r#"{"timestamp":"2026-05-28T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1748426402.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let meta = turns[0]
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert!(
+            meta.lineage_id.is_none(),
+            "lineage_id must be None for pre-v0.142.0 sessions"
+        );
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types must parse under v0.142.0.
+        // turn_id uses UUIDv7 format; task_started carries lineage_id in its compaction object.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"019033a5-1bc7-7a4d-8f12-3456789abcde","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019033a5-1bc7-7000-8f12-aabbccddeeff","compaction":{"tokens_before":100000,"tokens_after":35000,"lineage_id":"019033a4-0000-7000-0000-aabbccddeeff","compaction_trigger":"auto"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019033a5-1bc7-7000-8f12-aabbccddeeff","completed_at":1750593604.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "019033a5-1bc7-7000-8f12-aabbccddeeff");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        let meta = turn
+            .compaction_meta
+            .as_ref()
+            .expect("compaction_meta must be present");
+        assert_eq!(meta.tokens_before, Some(100000));
+        assert_eq!(meta.tokens_after, Some(35000));
+        assert_eq!(
+            meta.lineage_id.as_deref(),
+            Some("019033a4-0000-7000-0000-aabbccddeeff")
+        );
+        assert_eq!(meta.compaction_trigger.as_deref(), Some("auto"));
     }
 }
