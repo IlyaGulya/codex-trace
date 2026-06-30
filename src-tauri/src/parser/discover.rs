@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
+use std::io::BufRead;
 use std::path::Path;
 use std::time::SystemTime;
 
-use super::compression::read_session_file;
+use super::compression::open_session_reader;
 use super::entry::{extract_session_id, RawEntry};
 use super::spawn::parse_spawn_agent_output;
 
@@ -118,19 +119,26 @@ fn date_group_from_path(path: &Path) -> String {
 }
 
 /// Quickly scan a JSONL file for session metadata without full parsing.
+///
+/// Streams the file line-by-line (decompressing zstd transparently) so peak
+/// memory stays bounded to a single line — session files can be hundreds of
+/// megabytes, and slurping every file into memory during discovery spiked RSS.
 fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
-    let content = read_session_file(path).ok()?;
-    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let reader = open_session_reader(path).ok()?;
+    let mut lines = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty());
 
     let first_line = lines.next()?;
-    let first: Value = serde_json::from_str(first_line).ok()?;
+    let first: Value = serde_json::from_str(&first_line).ok()?;
 
     // Skip state placeholders
     if first.get("record_type").and_then(|t| t.as_str()) == Some("state") {
         return None;
     }
 
-    let entry = RawEntry::parse(first_line)?;
+    let entry = RawEntry::parse(&first_line)?;
     let payload = &entry.payload;
     let raw = &entry.raw;
 
@@ -244,7 +252,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = match serde_json::from_str(line) {
+        let v: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
