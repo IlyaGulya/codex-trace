@@ -67,6 +67,10 @@ pub struct CompactionMeta {
     /// What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested).
     /// Null for sessions that predate this field.
     pub compaction_trigger: Option<String>,
+    /// Codex v0.142.0 (PR #29256): opaque ID linking this context window to its compaction
+    /// ancestor, enabling lineage reconstruction across compaction boundaries.
+    /// Null for sessions predating v0.142.0.
+    pub lineage_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +321,11 @@ fn handle_event_msg(
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
+                lineage_id: c
+                    .get("lineage_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
             });
             turns.insert(turn_id.clone(), turn);
             *current_turn_id = Some(turn_id.clone());
@@ -365,9 +374,8 @@ fn handle_event_msg(
                 if let Some(turn) = turns.get_mut(tid) {
                     let text = payload
                         .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .map(extract_message_text)
+                        .unwrap_or_default();
                     if !text.is_empty() {
                         let phase = payload
                             .get("phase")
@@ -474,6 +482,37 @@ fn handle_event_msg(
                     .get("reason")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                turn.completed_at = payload
+                    .get("completed_at")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as u64)
+                    .or_else(|| entry.timestamp.as_deref().and_then(parse_timestamp_secs));
+                turn.duration_ms = payload.get("duration_ms").and_then(|v| v.as_u64());
+            }
+        }
+
+        // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+        // token_budget_abort fires when the rollout budget is fully exhausted; it terminates
+        // the turn just like turn_aborted. The reason field carries "token_budget_exhausted"
+        // or similar — record it so the UI can explain why the turn stopped.
+        "token_budget_abort" => {
+            let turn_id_field = payload
+                .get("turn_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(current_turn_id.as_deref().unwrap_or(""))
+                .to_string();
+            let target_id = if !turn_id_field.is_empty() {
+                turn_id_field
+            } else {
+                current_turn_id.clone().unwrap_or_default()
+            };
+            if let Some(turn) = turns.get_mut(&target_id) {
+                turn.status = TurnStatus::Aborted;
+                turn.aborted_reason = payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| Some("token_budget_exhausted".to_string()));
                 turn.completed_at = payload
                     .get("completed_at")
                     .and_then(|v| v.as_f64())
@@ -692,6 +731,11 @@ fn handle_event_msg(
         | "external_agent_import_started"
         | "external_agent_imported" => {}
 
+        // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+        // token_budget_reminder is emitted when usage crosses a threshold percentage.
+        // No turn-building semantics — silently skip.
+        "token_budget_reminder" => {}
+
         _ => {}
     }
 }
@@ -713,13 +757,24 @@ fn handle_response_item(
         None => return,
     };
 
-    let tid = match current_turn_id {
+    // Codex v0.142.2 (PR #28360): turn_id is now stored in ResponseItem metadata.
+    // Prefer the explicit metadata.turn_id over positional current_turn_id — the
+    // metadata field allows correct correlation even when response items are emitted
+    // for non-contiguous turns.
+    let metadata_turn_id = payload
+        .get("metadata")
+        .and_then(|m| m.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tid: &str = match metadata_turn_id.as_deref().or(current_turn_id.as_deref()) {
         Some(t) => t,
         None => return,
     };
 
     let builder = tool_builders
-        .entry(tid.clone())
+        .entry(tid.to_string())
         .or_insert_with(ToolCallBuilder::new);
 
     match item_type {
@@ -835,6 +890,22 @@ fn handle_response_item(
             let success = payload.get("success").and_then(|v| v.as_bool());
             let changes = payload.get("changes").cloned();
             builder.backfill_patch_result(&call_id, success, changes);
+        }
+
+        // Codex v0.142.2 (PR #29486): MCP tools are now discovered via tool-search calls
+        // rather than enumerated upfront in task_started.dynamic_tools. The model issues a
+        // tool_search_call mid-turn; matching tools are returned in tool_search_call_output.
+        // Merge the discovered tools into the current turn's dynamic tool registry so
+        // subsequent function_call entries are classified as McpTool correctly.
+        "tool_search_call" => {
+            // Search request — tool definitions arrive in the paired tool_search_call_output.
+        }
+
+        "tool_search_call_output" => {
+            let extra = parse_tool_search_results(payload);
+            if !extra.is_empty() {
+                builder.extend_dynamic_tool_registry(extra);
+            }
         }
 
         // Codex v0.129.0 (PR #20677): MCP tool calls are now emitted as first-class
@@ -986,6 +1057,16 @@ fn handle_response_item(
         // Codex v0.141.0 (PR #28008): external_agent_import_result is an accounting-type
         // response_item that records token/cost totals for an imported agent context.
         "external_agent_import_result" => {}
+
+        // Pre-Codex v0.140.0 archive-only response_items from the experimental /realtime
+        // voice subsystem removed in PR #27801. Will never appear in sessions recorded
+        // with Codex ≥ v0.140.0, but old archives may still contain them. Silently skip.
+        "speech_append" | "realtime_handoff" | "audio_transcript" => {}
+
+        // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
+        // token_budget_compaction_reminder is a response_item that suggests compaction
+        // due to budget proximity. No turn-building semantics — silently skip.
+        "token_budget_compaction_reminder" => {}
 
         // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits the final
         // model response as a "structured_output" response_item whose `content` field holds a
@@ -1141,6 +1222,40 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// Extract displayable text from an `agent_message` payload's `message` field.
+///
+/// Codex v0.142.0 (PR #28368) changed multi-agent v2 inter-agent messages from
+/// plain strings to typed envelopes `{"type": "<kind>", "content": "..."}`.
+/// This function handles both formats so old and new sessions parse correctly.
+fn extract_message_text(message: &Value) -> String {
+    // Legacy format (pre-v0.142.0): message is a plain string.
+    if let Some(s) = message.as_str() {
+        return s.to_string();
+    }
+
+    // v0.142.0+ typed envelope: dispatch on the "type" discriminant.
+    if let Some(envelope_type) = message.get("type").and_then(|t| t.as_str()) {
+        match envelope_type {
+            // "text" envelope: content is in the "content" field.
+            "text" => {
+                return message
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            // Other envelope types: try "content" as a best-effort fallback.
+            _ => {
+                if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+                    return content.to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
+}
+
 /// Parse the `dynamic_tools` field from a `task_started` payload (Codex v0.141.0+).
 ///
 /// Returns a registry mapping unqualified tool names to (tool_type, server).
@@ -1176,6 +1291,61 @@ fn parse_dynamic_tools(payload: &Value) -> HashMap<String, (String, String)> {
             }
         } else if let Some((tool_type, rest)) = name.split_once(':') {
             // Qualified name format: "mcp:server/tool_name"
+            if let Some((server, tool)) = rest.split_once('/') {
+                if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
+                    registry.insert(
+                        tool.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    registry
+}
+
+/// Parse tool definitions from a `tool_search_call_output` payload (Codex v0.142.2+, PR #29486).
+///
+/// The `tools` array may contain entries in the same formats as `dynamic_tools`:
+///   {"name": "my_tool", "server": "my-server"}           → key="my_tool", ("mcp","my-server")
+///   {"name": "my_tool", "namespace": "mcp:my-server"}    → key="my_tool", ("mcp","my-server")
+///   {"name": "mcp:my-server/my_tool"}                    → key="my_tool", ("mcp","my-server")
+fn parse_tool_search_results(payload: &Value) -> HashMap<String, (String, String)> {
+    let Some(tools) = payload.get("tools").and_then(|v| v.as_array()) else {
+        return HashMap::new();
+    };
+    let mut registry = HashMap::new();
+    for item in tools {
+        let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // Explicit server field: {"name": "my_tool", "server": "my-server"}
+        if let Some(server) = item
+            .get("server")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            registry.insert(name.to_string(), ("mcp".to_string(), server.to_string()));
+        } else if let Some(ns) = item
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // Namespace field: "mcp:server" or "connector:plugin"
+            if let Some((tool_type, server)) = ns.split_once(':') {
+                if !tool_type.is_empty() && !server.is_empty() {
+                    registry.insert(
+                        name.to_string(),
+                        (tool_type.to_string(), server.to_string()),
+                    );
+                }
+            }
+        } else if let Some((tool_type, rest)) = name.split_once(':') {
+            // Qualified name: "mcp:server/tool_name"
             if let Some((server, tool)) = rest.split_once('/') {
                 if !tool_type.is_empty() && !server.is_empty() && !tool.is_empty() {
                     registry.insert(
@@ -3530,6 +3700,52 @@ mod tests {
         );
     }
 
+    // Codex v0.142.0 (PR #28968): `metadata` on chat message response_items renamed to
+    // `internal_chat_message_metadata_passthrough`. Turn building must be unaffected (content
+    // is still read from the `content` field), and sessions using the new field name must parse.
+
+    #[test]
+    fn v0142_message_response_item_with_internal_passthrough_populates_final_answer() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-msg-meta","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done v0142!","internal_chat_message_metadata_passthrough":{"server_key":"srv-v142","usage":{"prompt_tokens":10,"completion_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750327263.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Done v0142!"),
+            "message with internal_chat_message_metadata_passthrough must still populate final_answer"
+        );
+    }
+
+    #[test]
+    fn v0142_function_call_with_internal_passthrough_does_not_affect_turn_building() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:02:00Z","type":"session_meta","payload":{"id":"v0142-fc-meta","timestamp":"2026-06-22T10:02:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"echo hi\"}","internal_chat_message_metadata_passthrough":{"priority":"normal","request_id":"req-v142"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750327324.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.output.as_deref(), Some("hi\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
     // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command adds external-agent
     // context import event_msg entries. Codex v0.141.0 (PR #28008):
     // external_agent_import_result accounting response_items may appear inside turns.
@@ -3583,31 +3799,20 @@ mod tests {
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 
-    // Codex v0.142.0 (PR #29432, PR #29457): persistent log verbosity reduced.
-    //
-    // PR #29432: Responses WebSocket events are no longer logged on every message.
-    // Previously, per-message Responses API WebSocket streaming events were written as
-    // event_msg entries. v0.142.0 removes this — the session JSONL is now sparser.
-    //
-    // PR #29457: Noisy/duplicated telemetry targets are filtered from persistent logs.
-    //
-    // codex-trace reconstructs turns from task_started/task_complete turn boundaries and
-    // response_item entries. It does NOT depend on per-WebSocket-message event_msg entries
-    // or telemetry entries. Sparser logs do not affect turn reconstruction.
-    //
-    // Unknown event_msg payload types (including Responses API streaming events and telemetry
-    // entries) fall through the wildcard arm in handle_event_msg and are silently discarded.
+    // Codex v0.142.0 (PR #28368): multi-agent v2 inter-agent messages now use typed
+    // envelopes instead of plain string payloads. The `message` field in `agent_message`
+    // events is now an object `{"type": "<kind>", "content": "..."}` rather than a raw
+    // string. The parser must read the type discriminant and dispatch to the correct decoder.
 
     #[test]
-    fn v0142_all_standard_entry_types_build_turns_correctly() {
-        // v0.142.0 session with sparser JSONL (no per-WebSocket-message events).
-        // Turn must be built correctly from task_started, response_item, and task_complete.
+    fn v0142_agent_message_with_typed_text_envelope_extracts_content() {
+        // v0.142.0 typed envelope: {"type": "text", "content": "..."}.
+        // The parser must read the type discriminant and return the content string.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-turn-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"echo hi\"}"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122404.0}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Hello from the subagent."},"phase":"main"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -3615,80 +3820,174 @@ mod tests {
             .collect();
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].tool_calls.len(), 1);
-        assert_eq!(turns[0].tool_calls[0].output.as_deref(), Some("hi\n"));
-        assert_eq!(turns[0].tool_calls[0].exit_code, Some(0));
-        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+        let turn = &turns[0];
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Hello from the subagent.");
+        assert_eq!(turn.agent_messages[0].phase.as_deref(), Some("main"));
     }
 
     #[test]
-    fn v0142_responses_ws_per_message_events_silently_dropped_turn_structure_intact() {
-        // Pre-v0.142.0 sessions may contain per-WebSocket-message event_msg entries that
-        // v0.142.0 (PR #29432) no longer writes. These fall through the wildcard arm in
-        // handle_event_msg and are discarded. Turn structure must be identical whether or
-        // not the WebSocket streaming events are present.
+    fn v0142_agent_message_plain_string_still_parses_correctly() {
+        // Pre-v0.142.0 sessions with a plain-string `message` must continue to parse.
+        // The backward-compatible path must not break when upgrading.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-ws-turn","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            // Per-message WebSocket events from Responses API streaming (no longer logged in v0.142.0)
-            r#"{"timestamp":"2026-06-22T10:01:02Z","type":"event_msg","payload":{"type":"response.output_item.added","item":{"type":"function_call","name":"exec_command","call_id":"call-v142-ws"}}}"#,
-            r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"response.output_item.done","item":{"type":"function_call","name":"exec_command","call_id":"call-v142-ws","arguments":"{\"cmd\":\"ls\"}"}}}"#,
-            r#"{"timestamp":"2026-06-22T10:01:04Z","type":"event_msg","payload":{"type":"response.done","response_id":"resp-v142-ws","status":"completed"}}"#,
-            // Actual response_item and end event that codex-trace uses for turn building
-            r#"{"timestamp":"2026-06-22T10:01:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142-ws","arguments":"{\"cmd\":\"ls\"}"}}"#,
-            r#"{"timestamp":"2026-06-22T10:01:06Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142-ws","aggregated_output":"file.txt\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":5000000}}}"#,
-            r#"{"timestamp":"2026-06-22T10:01:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122467.0}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"pre-v0142","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Plain text message.","phase":"main"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
             .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
             .collect();
         let turns = build_turns(&parsed);
-        assert_eq!(
-            turns.len(),
-            1,
-            "WebSocket events must not create spurious turns"
-        );
-        assert_eq!(
-            turns[0].tool_calls.len(),
-            1,
-            "exactly one tool call must be built from response_item"
-        );
-        assert_eq!(turns[0].tool_calls[0].name, "exec_command");
-        assert_eq!(turns[0].tool_calls[0].output.as_deref(), Some("file.txt\n"));
-        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "Plain text message.");
     }
 
     #[test]
-    fn v0142_telemetry_events_filtered_silently_dropped_turn_structure_intact() {
-        // Codex v0.142.0 (PR #29457): telemetry entries are filtered from persistent logs.
-        // Any telemetry-style event_msg entries fall through the wildcard arm and are discarded.
-        // Turn structure must be unaffected.
+    fn v0142_agent_message_typed_envelope_final_answer_phase_sets_final_answer() {
+        // Typed envelope with phase "final_answer" must populate turn.final_answer.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:02:00Z","type":"session_meta","payload":{"id":"v0142-telemetry-turn","timestamp":"2026-06-22T10:02:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-06-22T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            // Telemetry events that v0.142.0 (PR #29457) filters from logs
-            r#"{"timestamp":"2026-06-22T10:02:02Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"metrics","batch_size":5,"dropped":0}}"#,
-            r#"{"timestamp":"2026-06-22T10:02:03Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"traces","batch_size":2,"dropped":0}}"#,
-            r#"{"timestamp":"2026-06-22T10:02:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"All done."}}"#,
-            r#"{"timestamp":"2026-06-22T10:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122525.0}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-final","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"The answer is 42."},"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
             .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
             .collect();
         let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "The answer is 42.");
+        assert_eq!(turn.final_answer.as_deref(), Some("The answer is 42."));
+    }
+
+    #[test]
+    fn v0142_agent_message_unknown_envelope_type_falls_back_to_content_field() {
+        // Unknown envelope types must fall back to the "content" field rather than silently
+        // dropping the message. This ensures forward-compatibility with future envelope types.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-unk","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"rich_text","content":"Rendered output."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "Rendered output.");
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types from a v0.142.0 session
+        // must parse correctly. Includes a typed-envelope agent_message.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-full","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Processing your request."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593605.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Processing your request.");
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+    }
+
+    // Codex v0.142.2 (PR #28360): turn_id field added to ResponseItem metadata.
+
+    #[test]
+    fn v0142_response_item_with_metadata_turn_id_attributed_to_correct_turn() {
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-meta-tid","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000002.0}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Answer from turn 1","metadata":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1751000005.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 2);
+        let turn1 = turns.iter().find(|t| t.turn_id == "turn-1").unwrap();
+        let turn2 = turns.iter().find(|t| t.turn_id == "turn-2").unwrap();
         assert_eq!(
-            turns.len(),
-            1,
-            "telemetry events must not create spurious turns"
+            turn1.final_answer.as_deref(),
+            Some("Answer from turn 1"),
+            "metadata.turn_id must override positional current_turn_id"
         );
-        assert_eq!(turns[0].tool_calls.len(), 0);
+        assert_eq!(turn2.final_answer, None);
+    }
+
+    #[test]
+    fn v0142_response_item_without_metadata_turn_id_falls_back_to_current_turn_id() {
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-no-meta-tid","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello from legacy turn"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000003.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].final_answer.as_deref(),
-            Some("All done."),
-            "final_answer must be populated despite preceding telemetry events"
+            Some("Hello from legacy turn")
         );
-        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.140.0 (PR #27801): /realtime voice subsystem removed. Sessions recorded
+    // before that may contain `speech_append`, `realtime_handoff`, `audio_transcript`
+    // response_items. They carry no turn-building semantics and must be silently skipped.
+
+    #[test]
+    fn pre_v0140_realtime_voice_items_in_archive_session_are_silently_skipped() {
+        let lines = [
+            r#"{"timestamp":"2026-03-01T10:00:00Z","type":"session_meta","payload":{"id":"v0139-rt","timestamp":"2026-03-01T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:02Z","type":"response_item","payload":{"type":"speech_append","audio_b64":"AAAA"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-rt","arguments":"{\"cmd\":\"echo ok\"}"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:04Z","type":"response_item","payload":{"type":"realtime_handoff","handoff_id":"h1"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-rt","output":"ok\n"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:06Z","type":"response_item","payload":{"type":"audio_transcript","transcript":"hello there"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1740825607.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        // Exactly one turn — voice items must not create synthetic turns
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        // The real exec_command tool call must survive intact
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "exec_command");
+        assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
+        assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 }

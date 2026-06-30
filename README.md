@@ -1,3 +1,7 @@
+<p align="center"> 
+  <img src="icon.png" alt="Codex Trace app icon" width="128" />
+</p>
+
 # Codex Trace
 
 [![CI](https://github.com/PixelPaw-Labs/codex-trace/actions/workflows/ci.yml/badge.svg)](https://github.com/PixelPaw-Labs/codex-trace/actions/workflows/ci.yml)

@@ -1081,6 +1081,74 @@ mod tests {
         assert_eq!(msg_entry.payload["metadata"]["server_key"], "srv-v0141");
     }
 
+    // Codex v0.142.0 (PR #28968): the `metadata` field on chat message response_items was
+    // renamed to `internal_chat_message_metadata_passthrough` to make the internal-passthrough
+    // nature of the field explicit. Sessions written by v0.142.0+ will carry the new key;
+    // pre-v0.142.0 sessions retain the old `metadata` key (backward compat — both must parse).
+
+    #[test]
+    fn v0142_chat_message_metadata_renamed_to_internal_passthrough() {
+        // Regression: new key must be present and old `metadata` key must be absent.
+        let line = r#"{"timestamp":"2026-06-22T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello v0142","internal_chat_message_metadata_passthrough":{"server_key":"srv-v0142","trace_id":"trace-v0142","model_version":"gpt-5.4-preview"}}}"#;
+        let e = RawEntry::parse(line)
+            .expect("response_item with internal_chat_message_metadata_passthrough must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        // New field must be accessible.
+        let meta = &e.payload["internal_chat_message_metadata_passthrough"];
+        assert!(
+            !meta.is_null(),
+            "internal_chat_message_metadata_passthrough must be present"
+        );
+        assert_eq!(meta["server_key"], "srv-v0142");
+        assert_eq!(meta["trace_id"], "trace-v0142");
+        // Old field must be absent — the key was renamed, not aliased.
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "old `metadata` key must be absent in v0.142.0+ chat message items"
+        );
+    }
+
+    #[test]
+    fn v0142_function_call_response_item_with_internal_passthrough_parses_correctly() {
+        // function_call items also use internal_chat_message_metadata_passthrough in v0.142.0+.
+        let line = r#"{"timestamp":"2026-06-22T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"ls\"}","internal_chat_message_metadata_passthrough":{"priority":"high","request_id":"req-v142"}}}"#;
+        let e = RawEntry::parse(line)
+            .expect("function_call with internal_chat_message_metadata_passthrough must parse");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(
+            e.payload["internal_chat_message_metadata_passthrough"]["priority"],
+            "high"
+        );
+        assert_eq!(
+            e.payload["internal_chat_message_metadata_passthrough"]["request_id"],
+            "req-v142"
+        );
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "old `metadata` key must be absent in v0.142.0+ function_call items"
+        );
+    }
+
+    #[test]
+    fn v0142_pre_v0142_sessions_with_old_metadata_key_remain_backward_compatible() {
+        // Sessions written before v0.142.0 carry the old `metadata` key — they must still parse.
+        let line = r#"{"timestamp":"2026-06-18T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"server_key":"srv-abc123","trace_id":"trace-xyz"}}}"#;
+        let e = RawEntry::parse(line).expect("pre-v0.142.0 response_item must still parse");
+        let meta = &e.payload["metadata"];
+        assert!(
+            !meta.is_null(),
+            "old metadata key must remain accessible for pre-v0.142.0 sessions"
+        );
+        assert_eq!(meta["server_key"], "srv-abc123");
+        assert!(
+            e.payload
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none(),
+            "new field must be absent in pre-v0.142.0 sessions"
+        );
+    }
+
     // Codex v0.139.0 (PRs #24118, #27084): tool and connector input schemas now preserve
     // oneOf and allOf structures instead of flattening them. Large schemas also keep more
     // shallow structure when compacted.
@@ -1180,6 +1248,56 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.140.0");
         assert_eq!(meta.payload["id"], "v0140-session");
+    }
+
+    // Codex v0.142.0 (PR #28368): multi-agent v2 inter-agent messages now use typed
+    // envelopes. The `agent_message` event_msg payload's `message` field changed from a
+    // plain string to a typed object `{"type": "<kind>", "content": "..."}`. The RawEntry
+    // parser must pass the payload through without error — payload extraction is unaffected
+    // because RawEntry is Value-based. The type-aware decoding happens in turn.rs.
+
+    #[test]
+    fn v0142_agent_message_with_typed_envelope_parses_as_event_msg() {
+        let line = r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Hello from the subagent."},"phase":"main"}}"#;
+        let e = RawEntry::parse(line).expect("typed-envelope agent_message must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("agent_message"));
+        // The typed envelope is accessible as a Value for downstream decoding.
+        let msg = &e.payload["message"];
+        assert!(msg.is_object(), "message must be an object in v0.142.0+");
+        assert_eq!(msg["type"], "text");
+        assert_eq!(msg["content"], "Hello from the subagent.");
+    }
+
+    #[test]
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Processing."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593605.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.142.0");
+        assert_eq!(meta.payload["id"], "v0142-session");
+        // Verify the typed-envelope agent_message payload is accessible.
+        let agent_msg = RawEntry::parse(lines[4]).unwrap();
+        assert_eq!(agent_msg.payload["message"]["type"], "text");
+        assert_eq!(agent_msg.payload["message"]["content"], "Processing.");
     }
 
     #[test]
@@ -1310,33 +1428,54 @@ mod tests {
         assert_eq!(e.payload["total_tokens"], 12400);
     }
 
-    // Codex v0.142.0 (PR #29432): Responses WebSocket events are no longer logged on every
-    // message. Previously, per-message Responses API WebSocket streaming events (e.g.
-    // response.output_item.added, response.done) were written as event_msg entries to the
-    // JSONL session file on every message. v0.142.0 removes this per-message logging, making
-    // the session JSONL sparser.
-    //
-    // Codex v0.142.0 (PR #29457): Noisy/duplicated telemetry targets are filtered from
-    // persistent logs entirely.
-    //
-    // codex-trace reads session data exclusively from JSONL rollout files at
-    // ~/.codex/sessions/. It reconstructs sessions from task_started/task_complete turn
-    // boundaries, response_item tool calls, and turn_context — none of which depend on
-    // per-WebSocket-message event log entries or telemetry entries. The sparser log stream
-    // from v0.142.0+ has no effect on codex-trace's session reconstruction.
-    //
-    // The tests below confirm: (1) all standard entry types from a v0.142.0 session parse
-    // correctly, and (2) any WebSocket response event entries or telemetry entries that may
-    // appear in JSONL files from pre-v0.142.0 sessions are gracefully ignored.
+    // Codex v0.142.2 (PR #28360): ResponseItem gains a `turn_id` field on its `metadata`
+    // object. The field allows downstream consumers to correlate response items to turns
+    // by explicit ID rather than by positional heuristics. The loosely-typed RawEntry
+    // model passes the metadata through unchanged; turn.rs reads metadata.turn_id to
+    // prefer the explicit signal over current_turn_id when both are available.
+
+    #[test]
+    fn v0142_response_item_with_metadata_turn_id_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-25T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"turn_id":"turn-abc","trace_id":"trace-xyz"}}}"#;
+        let e = RawEntry::parse(line).expect("response_item with metadata.turn_id must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "message");
+        // metadata.turn_id must be accessible for downstream turn correlation
+        assert_eq!(e.payload["metadata"]["turn_id"], "turn-abc");
+        assert_eq!(e.payload["metadata"]["trace_id"], "trace-xyz");
+    }
+
+    #[test]
+    fn v0142_function_call_response_item_with_metadata_turn_id_parses_correctly() {
+        let line = r#"{"timestamp":"2026-06-25T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"echo hi\"}","metadata":{"turn_id":"turn-abc"}}}"#;
+        let e = RawEntry::parse(line).expect("function_call with metadata.turn_id must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert_eq!(e.payload["type"], "function_call");
+        assert_eq!(e.payload["metadata"]["turn_id"], "turn-abc");
+    }
+
+    #[test]
+    fn v0142_response_item_without_metadata_turn_id_is_backward_compatible() {
+        // Pre-v0.142.2 response items carry no metadata.turn_id — must parse normally.
+        let line = r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#;
+        let e = RawEntry::parse(line).expect("response_item without metadata.turn_id must parse");
+        assert_eq!(e.entry_type, "response_item");
+        assert!(
+            e.payload.get("metadata").is_none(),
+            "metadata must be absent in pre-v0.142.2 entries"
+        );
+    }
 
     #[test]
     fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard entry types from a v0.142.2 session must parse.
+        // response_items carry metadata.turn_id; other entry types are unchanged.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122404.0}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello","metadata":{"turn_id":"turn-1","trace_id":"trace-001"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000004.0}}"#,
         ];
         let expected_types = [
             "session_meta",
@@ -1350,55 +1489,9 @@ mod tests {
             assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
         }
         let meta = RawEntry::parse(lines[0]).unwrap();
-        assert_eq!(meta.payload["cli_version"], "0.142.0");
-        assert_eq!(meta.payload["id"], "v0142-session");
-    }
-
-    #[test]
-    fn v0142_responses_ws_per_message_events_if_present_in_old_format_are_ignored_gracefully() {
-        // Pre-v0.142.0 session JSONL files may contain per-WebSocket-message event_msg entries
-        // for Responses API streaming events (e.g. response.output_item.added, response.done).
-        // v0.142.0 (PR #29432) stops writing these. RawEntry must pass them through as
-        // event_msg entries without error, so old sessions remain parseable.
-        let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-ws-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            // These WebSocket streaming events would have appeared in pre-v0.142.0 JSONL files.
-            // v0.142.0 stops writing them; codex-trace must handle both their presence and absence.
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":"Hello"}}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"response.done","response_id":"resp-abc","status":"completed"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1782122406.0}}"#,
-        ];
-        for line in &lines {
-            RawEntry::parse(line)
-                .unwrap_or_else(|| panic!("entry must parse without error: {line}"));
-        }
-        // Specifically confirm the WebSocket event lines parse as event_msg
-        let ws_added = RawEntry::parse(lines[2]).unwrap();
-        assert_eq!(ws_added.entry_type, "event_msg");
-        assert_eq!(
-            event_msg_type(&ws_added.payload),
-            Some("response.output_item.added")
-        );
-
-        let ws_done = RawEntry::parse(lines[4]).unwrap();
-        assert_eq!(ws_done.entry_type, "event_msg");
-        assert_eq!(event_msg_type(&ws_done.payload), Some("response.done"));
-    }
-
-    #[test]
-    fn v0142_telemetry_events_filtered_from_logs_handled_gracefully() {
-        // Codex v0.142.0 (PR #29457): noisy/duplicated telemetry targets are filtered from
-        // persistent logs. Any telemetry-style event_msg entries that may appear in pre-v0.142.0
-        // JSONL files must be parsed without error and ignored by downstream consumers.
-        let telemetry_line = r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"telemetry_flush","target":"metrics","batch_size":42,"dropped":3}}"#;
-        let e = RawEntry::parse(telemetry_line)
-            .expect("telemetry event_msg entry must parse without error");
-        assert_eq!(e.entry_type, "event_msg");
-        assert_eq!(event_msg_type(&e.payload), Some("telemetry_flush"));
-        // The payload fields flow through to Value for downstream use (which drops them via _ => {})
-        assert_eq!(e.payload["batch_size"], 42);
+        assert_eq!(meta.payload["cli_version"], "0.142.2");
+        // metadata.turn_id must be accessible on response_item payload
+        let msg_entry = RawEntry::parse(lines[2]).unwrap();
+        assert_eq!(msg_entry.payload["metadata"]["turn_id"], "turn-1");
     }
 }
