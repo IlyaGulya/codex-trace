@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn v0142_all_standard_entry_types_parse_correctly() {
+    fn v0142_2_all_standard_entry_types_parse_correctly_with_metadata_turn_id() {
         // Regression guard: all standard entry types from a v0.142.2 session must parse.
         // response_items carry metadata.turn_id; other entry types are unchanged.
         let lines = [
