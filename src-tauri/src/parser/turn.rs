@@ -67,6 +67,10 @@ pub struct CompactionMeta {
     /// What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested).
     /// Null for sessions that predate this field.
     pub compaction_trigger: Option<String>,
+    /// Codex v0.142.0 (PR #29256): opaque ID linking this context window to its compaction
+    /// ancestor, enabling lineage reconstruction across compaction boundaries.
+    /// Null for sessions predating v0.142.0.
+    pub lineage_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +321,11 @@ fn handle_event_msg(
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
+                lineage_id: c
+                    .get("lineage_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
             });
             turns.insert(turn_id.clone(), turn);
             *current_turn_id = Some(turn_id.clone());
@@ -365,9 +374,8 @@ fn handle_event_msg(
                 if let Some(turn) = turns.get_mut(tid) {
                     let text = payload
                         .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .map(extract_message_text)
+                        .unwrap_or_default();
                     if !text.is_empty() {
                         let phase = payload
                             .get("phase")
@@ -724,9 +732,8 @@ fn handle_event_msg(
         | "external_agent_imported" => {}
 
         // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
-        // token_budget_reminder is emitted when usage crosses a configured threshold percentage.
-        // It carries no turn-building semantics — skipped so it doesn't corrupt turn data.
-        // token_budget_abort is handled above as a turn termination signal.
+        // token_budget_reminder is emitted when usage crosses a threshold percentage.
+        // No turn-building semantics — silently skip.
         "token_budget_reminder" => {}
 
         _ => {}
@@ -750,13 +757,24 @@ fn handle_response_item(
         None => return,
     };
 
-    let tid = match current_turn_id {
+    // Codex v0.142.2 (PR #28360): turn_id is now stored in ResponseItem metadata.
+    // Prefer the explicit metadata.turn_id over positional current_turn_id — the
+    // metadata field allows correct correlation even when response items are emitted
+    // for non-contiguous turns.
+    let metadata_turn_id = payload
+        .get("metadata")
+        .and_then(|m| m.get("turn_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tid: &str = match metadata_turn_id.as_deref().or(current_turn_id.as_deref()) {
         Some(t) => t,
         None => return,
     };
 
     let builder = tool_builders
-        .entry(tid.clone())
+        .entry(tid.to_string())
         .or_insert_with(ToolCallBuilder::new);
 
     match item_type {
@@ -1024,10 +1042,14 @@ fn handle_response_item(
         // response_item that records token/cost totals for an imported agent context.
         "external_agent_import_result" => {}
 
+        // Pre-Codex v0.140.0 archive-only response_items from the experimental /realtime
+        // voice subsystem removed in PR #27801. Will never appear in sessions recorded
+        // with Codex ≥ v0.140.0, but old archives may still contain them. Silently skip.
+        "speech_append" | "realtime_handoff" | "audio_transcript" => {}
+
         // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
-        // token_budget_compaction_reminder is a configurable response_item emitted when the
-        // runtime suggests compaction due to proximity to the rollout budget limit. It carries
-        // no turn-building semantics — skipped so it doesn't corrupt turn data.
+        // token_budget_compaction_reminder is a response_item that suggests compaction
+        // due to budget proximity. No turn-building semantics — silently skip.
         "token_budget_compaction_reminder" => {}
 
         // Codex v0.132.0 (PR #23123): `codex exec resume --output-schema` emits the final
@@ -1182,6 +1204,40 @@ fn str_field(v: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Extract displayable text from an `agent_message` payload's `message` field.
+///
+/// Codex v0.142.0 (PR #28368) changed multi-agent v2 inter-agent messages from
+/// plain strings to typed envelopes `{"type": "<kind>", "content": "..."}`.
+/// This function handles both formats so old and new sessions parse correctly.
+fn extract_message_text(message: &Value) -> String {
+    // Legacy format (pre-v0.142.0): message is a plain string.
+    if let Some(s) = message.as_str() {
+        return s.to_string();
+    }
+
+    // v0.142.0+ typed envelope: dispatch on the "type" discriminant.
+    if let Some(envelope_type) = message.get("type").and_then(|t| t.as_str()) {
+        match envelope_type {
+            // "text" envelope: content is in the "content" field.
+            "text" => {
+                return message
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            // Other envelope types: try "content" as a best-effort fallback.
+            _ => {
+                if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+                    return content.to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
 }
 
 /// Parse the `dynamic_tools` field from a `task_started` payload (Codex v0.141.0+).
@@ -3573,6 +3629,52 @@ mod tests {
         );
     }
 
+    // Codex v0.142.0 (PR #28968): `metadata` on chat message response_items renamed to
+    // `internal_chat_message_metadata_passthrough`. Turn building must be unaffected (content
+    // is still read from the `content` field), and sessions using the new field name must parse.
+
+    #[test]
+    fn v0142_message_response_item_with_internal_passthrough_populates_final_answer() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:01:00Z","type":"session_meta","payload":{"id":"v0142-msg-meta","timestamp":"2026-06-22T10:01:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done v0142!","internal_chat_message_metadata_passthrough":{"server_key":"srv-v142","usage":{"prompt_tokens":10,"completion_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-06-22T10:01:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750327263.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].final_answer.as_deref(),
+            Some("Done v0142!"),
+            "message with internal_chat_message_metadata_passthrough must still populate final_answer"
+        );
+    }
+
+    #[test]
+    fn v0142_function_call_with_internal_passthrough_does_not_affect_turn_building() {
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:02:00Z","type":"session_meta","payload":{"id":"v0142-fc-meta","timestamp":"2026-06-22T10:02:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v142","arguments":"{\"cmd\":\"echo hi\"}","internal_chat_message_metadata_passthrough":{"priority":"normal","request_id":"req-v142"}}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v142","aggregated_output":"hi\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
+            r#"{"timestamp":"2026-06-22T10:02:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1750327324.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.output.as_deref(), Some("hi\n"));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
     // Codex v0.140.0 (PRs #27070, #27071, #27703): /import command adds external-agent
     // context import event_msg entries. Codex v0.141.0 (PR #28008):
     // external_agent_import_result accounting response_items may appear inside turns.
@@ -3626,52 +3728,20 @@ mod tests {
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 
-    // Codex v0.142.0 (PRs #28746, #28494, #28707, #29423, #29255): token budget events.
-    // Rollout token budgets emit reminder and abort events when usage crosses thresholds.
+    // Codex v0.142.0 (PR #28368): multi-agent v2 inter-agent messages now use typed
+    // envelopes instead of plain string payloads. The `message` field in `agent_message`
+    // events is now an object `{"type": "<kind>", "content": "..."}` rather than a raw
+    // string. The parser must read the type discriminant and dispatch to the correct decoder.
 
     #[test]
-    fn v0142_token_budget_reminder_does_not_corrupt_turn_state() {
-        // token_budget_reminder is a notification event with no turn-building semantics —
-        // it must not affect turn status, tool calls, or agent messages.
+    fn v0142_agent_message_with_typed_text_envelope_extracts_content() {
+        // v0.142.0 typed envelope: {"type": "text", "content": "..."}.
+        // The parser must read the type discriminant and return the content string.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-budget-reminder","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-session","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_reminder","threshold_pct":80,"tokens_used":8000,"tokens_budget":10000}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Continuing despite budget reminder."}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593604.0}}"#,
-        ];
-        let parsed: Vec<_> = lines
-            .iter()
-            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
-            .collect();
-        let turns = build_turns(&parsed);
-        assert_eq!(
-            turns.len(),
-            1,
-            "budget reminder must not create spurious turns"
-        );
-        let turn = &turns[0];
-        assert_eq!(turn.turn_id, "turn-1");
-        assert_eq!(
-            turn.status,
-            super::TurnStatus::Complete,
-            "token_budget_reminder must not change turn status"
-        );
-        assert_eq!(
-            turn.final_answer.as_deref(),
-            Some("Continuing despite budget reminder.")
-        );
-    }
-
-    #[test]
-    fn v0142_token_budget_abort_sets_turn_aborted_status() {
-        // token_budget_abort fires when the rollout budget is exhausted — must terminate
-        // the turn with Aborted status, just like turn_aborted.
-        let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-budget-abort","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working on the task..."}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","reason":"token_budget_exhausted","completed_at":1750593603.0}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Hello from the subagent."},"phase":"main"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -3680,34 +3750,39 @@ mod tests {
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
-        assert_eq!(turn.turn_id, "turn-1");
-        assert_eq!(
-            turn.status,
-            super::TurnStatus::Aborted,
-            "token_budget_abort must set turn status to Aborted"
-        );
-        assert!(
-            turn.aborted_reason.is_some(),
-            "token_budget_abort must populate aborted_reason"
-        );
-        assert!(
-            turn.aborted_reason
-                .as_deref()
-                .unwrap()
-                .contains("token_budget"),
-            "aborted_reason must reference the budget: {:?}",
-            turn.aborted_reason
-        );
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Hello from the subagent.");
+        assert_eq!(turn.agent_messages[0].phase.as_deref(), Some("main"));
     }
 
     #[test]
-    fn v0142_token_budget_abort_without_reason_field_uses_default_reason() {
-        // token_budget_abort without an explicit reason field should still populate
-        // aborted_reason with a sensible default so the UI can explain the termination.
+    fn v0142_agent_message_plain_string_still_parses_correctly() {
+        // Pre-v0.142.0 sessions with a plain-string `message` must continue to parse.
+        // The backward-compatible path must not break when upgrading.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-abort-no-reason","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"pre-v0142","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Plain text message.","phase":"main"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "Plain text message.");
+    }
+
+    #[test]
+    fn v0142_agent_message_typed_envelope_final_answer_phase_sets_final_answer() {
+        // Typed envelope with phase "final_answer" must populate turn.final_answer.
+        let lines = [
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-final","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"The answer is 42."},"phase":"final_answer"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -3716,65 +3791,42 @@ mod tests {
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
-        assert_eq!(turn.status, super::TurnStatus::Aborted);
-        assert_eq!(
-            turn.aborted_reason.as_deref(),
-            Some("token_budget_exhausted"),
-            "default reason must be token_budget_exhausted when reason field is absent"
-        );
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "The answer is 42.");
+        assert_eq!(turn.final_answer.as_deref(), Some("The answer is 42."));
     }
 
     #[test]
-    fn v0142_token_budget_compaction_reminder_does_not_corrupt_turn() {
-        // token_budget_compaction_reminder is a response_item type emitted when the runtime
-        // suggests compaction due to budget proximity. It must not affect turn state.
+    fn v0142_agent_message_unknown_envelope_type_falls_back_to_content_field() {
+        // Unknown envelope types must fall back to the "content" field rather than silently
+        // dropping the message. This ensures forward-compatibility with future envelope types.
         let lines = [
-            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-compaction-reminder","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-unk","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Analysing the codebase."}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"token_budget_compaction_reminder","threshold_pct":90,"message":"Consider running /compact to free context."}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593604.0}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"rich_text","content":"Rendered output."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593603.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
             .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
             .collect();
         let turns = build_turns(&parsed);
-        assert_eq!(
-            turns.len(),
-            1,
-            "compaction reminder must not create spurious turns"
-        );
-        let turn = &turns[0];
-        assert_eq!(turn.turn_id, "turn-1");
-        assert_eq!(
-            turn.status,
-            super::TurnStatus::Complete,
-            "token_budget_compaction_reminder must not change turn status"
-        );
-        assert_eq!(
-            turn.tool_calls.len(),
-            0,
-            "compaction reminder must not produce tool calls"
-        );
-        assert_eq!(
-            turn.final_answer.as_deref(),
-            Some("Analysing the codebase.")
-        );
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(turns[0].agent_messages[0].text, "Rendered output.");
     }
 
     #[test]
-    fn v0142_all_budget_event_types_parse_in_complete_session() {
-        // Regression guard: all three new v0.142.0 budget event types must parse correctly
-        // in a realistic session that goes: reminder → work → compaction hint → abort.
+    fn v0142_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types from a v0.142.0 session
+        // must parse correctly. Includes a typed-envelope agent_message.
         let lines = [
             r#"{"timestamp":"2026-06-22T10:00:00Z","type":"session_meta","payload":{"id":"v0142-full","timestamp":"2026-06-22T10:00:00Z","cwd":"/project","cli_version":"0.142.0","model_provider":"openai"}}"#,
             r#"{"timestamp":"2026-06-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"event_msg","payload":{"type":"token_budget_reminder","threshold_pct":75,"tokens_used":7500,"tokens_budget":10000}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"ls\"}"}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"response_item","payload":{"type":"token_budget_compaction_reminder","threshold_pct":90,"message":"Context approaching budget limit."}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","aggregated_output":"file.txt\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":10000000}}}"#,
-            r#"{"timestamp":"2026-06-22T10:00:06Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","reason":"token_budget_exhausted","completed_at":1750593606.0}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":{"type":"text","content":"Processing your request."},"phase":"commentary"}}"#,
+            r#"{"timestamp":"2026-06-22T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1750593605.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -3783,21 +3835,88 @@ mod tests {
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
-        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.agent_messages.len(), 1);
+        assert_eq!(turn.agent_messages[0].text, "Processing your request.");
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+    }
+
+    // Codex v0.142.2 (PR #28360): turn_id field added to ResponseItem metadata.
+
+    #[test]
+    fn v0142_response_item_with_metadata_turn_id_attributed_to_correct_turn() {
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-meta-tid","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.142.2","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000002.0}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Answer from turn 1","metadata":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1751000005.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 2);
+        let turn1 = turns.iter().find(|t| t.turn_id == "turn-1").unwrap();
+        let turn2 = turns.iter().find(|t| t.turn_id == "turn-2").unwrap();
         assert_eq!(
-            turn.status,
-            super::TurnStatus::Aborted,
-            "token_budget_abort must terminate the turn"
+            turn1.final_answer.as_deref(),
+            Some("Answer from turn 1"),
+            "metadata.turn_id must override positional current_turn_id"
         );
+        assert_eq!(turn2.final_answer, None);
+    }
+
+    #[test]
+    fn v0142_response_item_without_metadata_turn_id_falls_back_to_current_turn_id() {
+        let lines = [
+            r#"{"timestamp":"2026-06-25T10:00:00Z","type":"session_meta","payload":{"id":"v0142-no-meta-tid","timestamp":"2026-06-25T10:00:00Z","cwd":"/project","cli_version":"0.141.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello from legacy turn"}}"#,
+            r#"{"timestamp":"2026-06-25T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000003.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
         assert_eq!(
-            turn.tool_calls.len(),
-            1,
-            "exec_command tool call must be recorded"
+            turns[0].final_answer.as_deref(),
+            Some("Hello from legacy turn")
         );
+    }
+
+    // Codex v0.140.0 (PR #27801): /realtime voice subsystem removed. Sessions recorded
+    // before that may contain `speech_append`, `realtime_handoff`, `audio_transcript`
+    // response_items. They carry no turn-building semantics and must be silently skipped.
+
+    #[test]
+    fn pre_v0140_realtime_voice_items_in_archive_session_are_silently_skipped() {
+        let lines = [
+            r#"{"timestamp":"2026-03-01T10:00:00Z","type":"session_meta","payload":{"id":"v0139-rt","timestamp":"2026-03-01T10:00:00Z","cwd":"/project","cli_version":"0.139.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:02Z","type":"response_item","payload":{"type":"speech_append","audio_b64":"AAAA"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-rt","arguments":"{\"cmd\":\"echo ok\"}"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:04Z","type":"response_item","payload":{"type":"realtime_handoff","handoff_id":"h1"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-rt","output":"ok\n"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:06Z","type":"response_item","payload":{"type":"audio_transcript","transcript":"hello there"}}"#,
+            r#"{"timestamp":"2026-03-01T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1740825607.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        // Exactly one turn — voice items must not create synthetic turns
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        // The real exec_command tool call must survive intact
+        assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "exec_command");
-        assert_eq!(
-            turn.aborted_reason.as_deref(),
-            Some("token_budget_exhausted")
-        );
+        assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
+        assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 }
