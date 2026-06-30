@@ -4,6 +4,37 @@ All notable changes to codex-trace are documented here. Versions follow
 [semantic versioning](https://semver.org/), and this file follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.4.0] — 2026-06-28
+
+A fresh app icon in codex green, a quieter macOS install, and a much lighter startup.
+codex-trace no longer balloons memory while it scans your session history, and the macOS
+bundle identifier no longer trips a system warning on launch.
+
+### Added
+
+- **Codex-green app icon**
+  ([`1abd896`](https://github.com/PixelPaw-Labs/codex-trace/commit/1abd896)). The app
+  icon's iris is recolored from orange to codex green (`#10a37f`) across every asset —
+  the macOS `.icns`, the Windows `.ico` and Store tiles, and all PNG sizes — so the
+  installed app, dock, and taskbar all show the new mark. The README header now carries
+  the icon too.
+
+### Fixed
+
+- **Startup no longer spikes memory on large session histories**
+  ([`20d85f4`](https://github.com/PixelPaw-Labs/codex-trace/commit/20d85f4)). The
+  discovery scan used to load each session file fully into memory, so peak usage jumped
+  to the size of your largest rollout file (often hundreds of MB) before settling. The
+  scan now streams each file line by line — decompressing zstd on the fly — so memory
+  during discovery is bounded to a single line regardless of session size.
+- **macOS install no longer warns about the bundle identifier**
+  ([`2b49ff9`](https://github.com/PixelPaw-Labs/codex-trace/commit/2b49ff9)). The bundle
+  identifier ended in `.app`, which macOS flags as conflicting with the application
+  bundle extension. It is now `com.codextrace.desktop`, so installing and launching the
+  app is clean.
+
+[0.4.0]: https://github.com/PixelPaw-Labs/codex-trace/releases/tag/v0.4.0
+
 ## [0.3.0] — 2026-06-28
 
 Patch tool calls now read like a real code review, and the parser keeps pace with the

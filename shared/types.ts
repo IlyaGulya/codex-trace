@@ -42,6 +42,10 @@ export interface CompactionMeta {
   summary: string | null;
   /** What triggered the compaction: `"auto"` (threshold-based) or `"manual"` (user-requested). Null for sessions that predate this field. */
   compaction_trigger: string | null;
+  /** Codex v0.142.0 (PR #29256): opaque ID linking this context window to its compaction
+   * ancestor, enabling lineage reconstruction across compaction boundaries.
+   * Null for sessions predating v0.142.0. Context window IDs use UUIDv7 format (PR #28953). */
+  lineage_id: string | null;
 }
 
 export interface CollabSpawn {
@@ -134,6 +138,17 @@ export interface CodexTurn {
    * Items carry an optional version field (Codex v0.132.0+, PR #23148). Empty for older sessions. */
   memories?: MemorySummary[];
 }
+
+/**
+ * Session JSONL response_item types that appear only in archive sessions recorded before
+ * Codex v0.140.0 (PR #27801 removed the experimental /realtime voice subsystem from the TUI):
+ *   - `speech_append`      — raw audio bytes appended during a voice turn
+ *   - `realtime_handoff`   — handoff event from text to realtime voice session
+ *   - `audio_transcript`   — server-side transcript of recognised speech
+ * These item types are never produced by Codex ≥ v0.140.0 and carry no turn-building
+ * semantics for codex-trace. The Rust parser silently skips them so that old session
+ * archives continue to open without error.
+ */
 
 export interface CodexSession {
   id: string;

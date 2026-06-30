@@ -1,7 +1,7 @@
 {
   "productName": "Codex Trace",
-  "version": "0.3.0",
-  "identifier": "com.codextrace.app",
+  "version": "0.4.0",
+  "identifier": "com.codextrace.desktop",
   "build": {
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist",
