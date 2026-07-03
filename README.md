@@ -42,7 +42,7 @@ Use Codex Trace when you want to:
 - **Collaboration tracking** — links orchestrator and worker sessions
 - **Token visibility** — shows token counts where available in Codex CLI session data
 - **Multiple Codex JSONL formats** — supports new (≥0.44), mid, and oldest (2025/08) session metadata formats
-- **Desktop and web modes** — run as a native desktop app or browser-based viewer
+- **Desktop, web, and terminal modes** — run as a native desktop app, browser-based viewer, or in-terminal TUI
 - **Docker support** — run headless web mode on port 1422
 
 ## Why use Codex Trace?
@@ -68,6 +68,7 @@ cd codex-trace
 #   macOS:  open -a "Codex Trace"   (or from Launchpad/Applications)
 #   Linux:  codex-trace
 codex-trace --web         # web mode (opens browser)
+codex-trace --tui         # terminal UI (SSH-friendly, no browser/GUI needed)
 ```
 
 ### Run from source without installing
@@ -108,6 +109,30 @@ Codex Trace reads session files from this default path:
 ```
 
 The sidebar reflects the folder structure exactly. Date groups in `YYYY/MM/DD` format can be collapsed and expanded, with Codex CLI sessions shown underneath.
+
+## Terminal UI
+
+```bash
+codex-trace --tui
+```
+
+Browses the same `~/.codex/sessions/` data as the desktop and web UI, entirely in the terminal — useful over SSH or when no display is available. Sessions from an active run are re-read automatically while the session is open.
+
+| Screen         | Keys           | Action                                           |
+| -------------- | -------------- | ------------------------------------------------ |
+| Session Picker | `j` / `k`      | Move selection                                   |
+| Session Picker | `Enter`        | Open a session, or expand/collapse a date group  |
+| Session Picker | `/`            | Search sessions (`Esc` clears, `Enter` keeps it) |
+| Session Picker | `r`            | Rescan the sessions directory                    |
+| Session Detail | `j` / `k`      | Move selection (list) or scroll (detail)         |
+| Session Detail | `Tab`          | Expand/collapse a tool call inline               |
+| Session Detail | `e` / `c`      | Expand / collapse all tool calls                 |
+| Session Detail | `Enter`        | Open full detail, or drill into a spawned agent  |
+| Session Detail | `h` / `l`      | Switch Request / Response panel in detail view   |
+| Session Detail | `r`            | Reload the session from disk                     |
+| Session Detail | `Esc` / `q`    | Back to the list, or back to the picker          |
+| All screens    | `?`            | Toggle keybinding help                           |
+| All screens    | `q` / `Ctrl+C` | Quit                                             |
 
 ## Configuration
 

@@ -5,6 +5,7 @@ mod http_api;
 mod parser;
 mod settings;
 mod state;
+mod tui;
 mod watcher;
 
 use std::sync::Arc;
@@ -15,8 +16,28 @@ pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     let web_only = args.iter().any(|a| a == "--web");
     let headless = args.iter().any(|a| a == "--headless");
+    let tui_mode = args.iter().any(|a| a == "--tui");
     let no_open = args.iter().any(|a| a == "--no-open");
-    let desktop = !web_only && !headless;
+    let desktop = !web_only && !headless && !tui_mode;
+
+    // TUI mode: skip Tauri/WebKit and the HTTP server entirely — a terminal-only
+    // session browser for use over SSH or in place of the desktop/web UI.
+    if tui_mode {
+        let settings = settings::load_settings();
+        let sessions_dir =
+            match parser::session::resolve_sessions_dir(settings.sessions_dir.as_deref()) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("codex-trace --tui: {e}");
+                    std::process::exit(1);
+                }
+            };
+        if let Err(e) = tui::run_tui(sessions_dir) {
+            eprintln!("codex-trace --tui: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Headless mode: skip Tauri/WebKit entirely — run only the HTTP server.
     // This eliminates the WebKitWebProcess + WebKitNetworkProcess that Tauri
