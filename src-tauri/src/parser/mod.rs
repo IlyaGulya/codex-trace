@@ -1,8 +1,10 @@
 pub mod cache;
 pub mod compression;
+pub mod diff;
 pub mod discover;
 pub mod entry;
 pub mod ongoing;
+pub mod patch;
 pub mod session;
 pub mod spawn;
 pub mod toolcall;

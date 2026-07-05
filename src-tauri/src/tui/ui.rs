@@ -1,12 +1,14 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::parser::diff::{DiffLine, DiffLineKind};
 use crate::parser::discover::CodexSessionInfo;
+use crate::parser::patch::{parse_apply_patch, PatchFile, PatchFileOp};
 use crate::parser::session::CodexSession;
-use crate::parser::toolcall::ToolCall;
+use crate::parser::toolcall::{ToolCall, ToolKind};
 use crate::parser::turn::TurnStatus;
 
 use super::app::{App, DetailFocus, ItemPanel, OpenSession, PickerRow, Row, Screen};
@@ -167,7 +169,8 @@ fn draw_detail_list(f: &mut Frame, open: &mut OpenSession, depth: usize) {
         session.turns.len(),
         session.cwd.clone().unwrap_or_default()
     );
-    let header = Paragraph::new("").block(Block::default().borders(Borders::ALL).title(title));
+    let header = Paragraph::new(info_bar_line(session))
+        .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(header, chunks[0]);
 
     let items = detail_items(open);
@@ -336,7 +339,7 @@ fn draw_detail_item(f: &mut Frame, open: &OpenSession) {
         ])
         .split(area);
 
-    let header = Paragraph::new("").block(
+    let header = Paragraph::new(info_bar_line(&open.session)).block(
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", content.heading)),
@@ -375,8 +378,8 @@ fn draw_detail_item(f: &mut Frame, open: &OpenSession) {
 struct ItemContent {
     heading: String,
     primary_title: String,
-    primary: String,
-    secondary: Option<(String, String)>,
+    primary: Text<'static>,
+    secondary: Option<(String, Text<'static>)>,
 }
 
 fn item_content(session: &CodexSession, row: Row) -> ItemContent {
@@ -385,7 +388,7 @@ fn item_content(session: &CodexSession, row: Row) -> ItemContent {
         Row::UserMessage(t) => ItemContent {
             heading: format!("Turn {} — User Message", t + 1),
             primary_title: "Message".to_string(),
-            primary: session.turns[t].user_message.clone().unwrap_or_default(),
+            primary: Text::raw(session.turns[t].user_message.clone().unwrap_or_default()),
             secondary: None,
         },
         Row::Agent(t, m) => {
@@ -403,7 +406,7 @@ fn item_content(session: &CodexSession, row: Row) -> ItemContent {
             ItemContent {
                 heading: format!("Turn {} — {kind}{phase}", t + 1),
                 primary_title: kind.to_string(),
-                primary: msg.text.clone(),
+                primary: Text::raw(msg.text.clone()),
                 secondary: None,
             }
         }
@@ -482,7 +485,7 @@ fn turn_item_content(session: &CodexSession, t: usize) -> ItemContent {
     ItemContent {
         heading: format!("Turn {}", t + 1),
         primary_title: "Details".to_string(),
-        primary: lines.join("\n"),
+        primary: Text::raw(lines.join("\n")),
         secondary: None,
     }
 }
@@ -520,14 +523,12 @@ fn tool_item_content(session: &CodexSession, t: usize, tc: usize) -> ItemContent
     if let Some(name) = &tool.subagent_name {
         req.push(format!("subagent_name: {name}"));
     }
-    if let Some(text) = &tool.input_text {
-        req.push(String::new());
-        req.push("input:".to_string());
-        req.push(text.clone());
-    } else if let Some(pretty) = pretty_json(&tool.arguments) {
-        req.push(String::new());
-        req.push("arguments:".to_string());
-        req.push(pretty);
+
+    let mut primary_lines: Vec<Line<'static>> = req.into_iter().map(Line::raw).collect();
+    let body = tool_body_lines(tool);
+    if !body.is_empty() {
+        primary_lines.push(Line::default());
+        primary_lines.extend(body);
     }
 
     let mut resp = vec![format!("status: {}", tool.status)];
@@ -569,9 +570,132 @@ fn tool_item_content(session: &CodexSession, t: usize, tc: usize) -> ItemContent
     ItemContent {
         heading: format!("Turn {} — {}", t + 1, tool.name),
         primary_title: "Request".to_string(),
-        primary: req.join("\n"),
-        secondary: Some(("Response".to_string(), resp.join("\n"))),
+        primary: Text::from(primary_lines),
+        secondary: Some(("Response".to_string(), Text::raw(resp.join("\n")))),
     }
+}
+
+/// Body of the Request panel: a structured red/green diff for `apply_patch`
+/// calls (mirroring the web frontend's `PatchDiff`/`DiffLines`), falling back
+/// to a plain `patch_changes.unified_diff` dump and then to the raw input
+/// text when the body isn't a recognisable patch. Non-patch tool calls just
+/// get their input/arguments dumped as before.
+fn tool_body_lines(tool: &ToolCall) -> Vec<Line<'static>> {
+    if tool.kind == ToolKind::PatchApply {
+        if let Some(text) = &tool.input_text {
+            if let Some(files) = parse_apply_patch(text) {
+                return render_patch_diff(&files);
+            }
+        }
+        if let Some(changes) = &tool.patch_changes {
+            let lines = render_patch_changes_fallback(changes);
+            if !lines.is_empty() {
+                return lines;
+            }
+        }
+    }
+    if let Some(text) = &tool.input_text {
+        let mut lines = vec![Line::raw("input:")];
+        lines.extend(text.lines().map(|l| Line::raw(l.to_string())));
+        lines
+    } else if let Some(pretty) = pretty_json(&tool.arguments) {
+        let mut lines = vec![Line::raw("arguments:")];
+        lines.extend(pretty.lines().map(|l| Line::raw(l.to_string())));
+        lines
+    } else {
+        Vec::new()
+    }
+}
+
+fn patch_op_label_color(op: PatchFileOp) -> (&'static str, Color) {
+    match op {
+        PatchFileOp::Add => ("add", Color::Green),
+        PatchFileOp::Update => ("update", Color::Yellow),
+        PatchFileOp::Delete => ("delete", Color::Red),
+    }
+}
+
+/// Render parsed patch files as per-file, per-hunk diff lines with +/-
+/// markers, red/green line tinting, and bold+underline on word-level changed
+/// spans — the terminal equivalent of the web UI's `PatchDiff`/`DiffLines`.
+fn render_patch_diff(files: &[PatchFile]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for file in files {
+        let (op_label, op_color) = patch_op_label_color(file.op);
+        let mut header = vec![
+            Span::styled(
+                format!("[{op_label}] "),
+                Style::default().fg(op_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(file.path.clone(), Style::default().fg(Color::Cyan)),
+        ];
+        if let Some(mv) = &file.move_path {
+            header.push(Span::raw(format!(" → {mv}")));
+        }
+        lines.push(Line::from(header));
+        for hunk in &file.hunks {
+            if !hunk.header.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("@@ {}", hunk.header),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.extend(hunk.lines.iter().map(diff_line_to_line));
+        }
+        lines.push(Line::default());
+    }
+    lines
+}
+
+fn diff_line_to_line(dl: &DiffLine) -> Line<'static> {
+    let (marker, base_color) = match dl.kind {
+        DiffLineKind::Context => (" ", Color::DarkGray),
+        DiffLineKind::Removed => ("-", Color::Red),
+        DiffLineKind::Added => ("+", Color::Green),
+    };
+    let mut spans = vec![Span::styled(marker, Style::default().fg(base_color))];
+    for seg in &dl.segments {
+        let style = if seg.changed {
+            Style::default()
+                .fg(base_color)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(base_color)
+        };
+        spans.push(Span::styled(seg.text.clone(), style));
+    }
+    Line::from(spans)
+}
+
+/// Plain (uncoloured) per-file dump of `tool.patch_changes` for when the raw
+/// patch body wasn't parseable — mirrors the web UI's fallback view.
+fn render_patch_changes_fallback(changes: &serde_json::Value) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(map) = changes.as_object() else {
+        return lines;
+    };
+    for (file, change) in map {
+        let change_type = change
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("update");
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{change_type}] "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(file.clone(), Style::default().fg(Color::Cyan)),
+        ]));
+        if let Some(diff_text) = change.get("unified_diff").and_then(|v| v.as_str()) {
+            lines.extend(diff_text.lines().map(|l| Line::raw(l.to_string())));
+        } else if let Some(content) = change.get("content").and_then(|v| v.as_str()) {
+            lines.extend(content.lines().map(|l| Line::raw(l.to_string())));
+        }
+        lines.push(Line::default());
+    }
+    lines
 }
 
 fn draw_help(f: &mut Frame, screen: Screen) {
@@ -625,6 +749,84 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+/// Persistent status line shown under the panel title on every Detail
+/// screen: git branch · model · context-window usage (color-coded) · token
+/// count — the terminal equivalent of the web/TUI reference's `InfoBar`.
+fn info_bar_line(session: &CodexSession) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push_field = |spans: &mut Vec<Span<'static>>, span: Span<'static>| {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(span);
+    };
+
+    if let Some(branch) = session.git.as_ref().and_then(|g| g.branch.as_deref()) {
+        push_field(
+            &mut spans,
+            Span::styled(format!("* {branch}"), Style::default().fg(Color::Magenta)),
+        );
+    }
+    if let Some(model) = last_turn_model(session) {
+        push_field(
+            &mut spans,
+            Span::styled(model, Style::default().fg(Color::Cyan)),
+        );
+    }
+    if let Some((pct, used, window)) = last_context_usage(session) {
+        push_field(
+            &mut spans,
+            Span::styled(
+                format!("ctx {pct}%"),
+                Style::default().fg(context_color(pct)),
+            ),
+        );
+        push_field(
+            &mut spans,
+            Span::styled(
+                format!("{}/{} tok", format_count(used), format_count(window)),
+                dim,
+            ),
+        );
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled("(no session metadata)", dim));
+    }
+    Line::from(spans)
+}
+
+fn context_color(pct: u8) -> Color {
+    if pct < 50 {
+        Color::Green
+    } else if pct <= 80 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn last_turn_model(session: &CodexSession) -> Option<String> {
+    session.turns.iter().rev().find_map(|t| t.model.clone())
+}
+
+/// Context-window usage from the most recent turn that reported one — the
+/// running KV-cache state, not the session-wide token total.
+fn last_context_usage(session: &CodexSession) -> Option<(u8, u64, u64)> {
+    session.turns.iter().rev().find_map(|t| {
+        let info = t.total_tokens.as_ref()?;
+        let used = info.context_window_tokens?;
+        let window = info.model_context_window;
+        if window == 0 {
+            return None;
+        }
+        let pct = ((used as f64 / window as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        Some((pct, used, window))
+    })
 }
 
 fn turn_status_color(status: &TurnStatus) -> Color {
@@ -711,5 +913,164 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patch_tool_call(
+        input_text: Option<&str>,
+        patch_changes: Option<serde_json::Value>,
+    ) -> ToolCall {
+        ToolCall {
+            call_id: "call1".to_string(),
+            kind: ToolKind::PatchApply,
+            name: "apply_patch".to_string(),
+            arguments: serde_json::Value::Null,
+            input_text: input_text.map(str::to_string),
+            output: None,
+            exit_code: None,
+            command: None,
+            cwd: None,
+            duration_secs: None,
+            mcp_server: None,
+            mcp_tool: None,
+            plugin_id: None,
+            patch_success: None,
+            patch_changes,
+            web_query: None,
+            web_url: None,
+            image_prompt: None,
+            image_file_path: None,
+            worker_session: None,
+            status: "success".to_string(),
+            subagent_id: None,
+            subagent_name: None,
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn tool_body_lines_renders_a_parseable_patch_as_a_colored_diff() {
+        let patch = [
+            "*** Begin Patch",
+            "*** Update File: src/main.rs",
+            "@@",
+            "-    println!(\"old\");",
+            "+    println!(\"new\");",
+            "*** End Patch",
+        ]
+        .join("\n");
+        let tool = patch_tool_call(Some(&patch), None);
+        let lines = tool_body_lines(&tool);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts.iter().any(|t| t.contains("[update] src/main.rs")));
+        assert!(texts.iter().any(|t| t.contains("-    println!(\"old\");")));
+        assert!(texts.iter().any(|t| t.contains("+    println!(\"new\");")));
+        // The changed word should carry a distinct (bold+underlined) style
+        // from the rest of the line, not just plain text.
+        let added_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("println!(\"new\");"))
+            .expect("added line present");
+        assert!(added_line
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn tool_body_lines_falls_back_to_patch_changes_unified_diff_when_input_is_not_a_patch() {
+        let changes = serde_json::json!({
+            "src/main.rs": { "type": "update", "unified_diff": "-old\n+new" }
+        });
+        let tool = patch_tool_call(Some("not a patch body"), Some(changes));
+        let lines = tool_body_lines(&tool);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts.iter().any(|t| t.contains("[update] src/main.rs")));
+        assert!(texts.iter().any(|t| t == "-old"));
+        assert!(texts.iter().any(|t| t == "+new"));
+    }
+
+    #[test]
+    fn tool_body_lines_falls_back_to_raw_input_text_when_nothing_is_parseable() {
+        let tool = patch_tool_call(Some("just some output text"), None);
+        let lines = tool_body_lines(&tool);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec!["input:".to_string(), "just some output text".to_string()]
+        );
+    }
+
+    #[test]
+    fn context_color_is_green_below_50_yellow_in_band_red_above_80() {
+        assert_eq!(context_color(0), Color::Green);
+        assert_eq!(context_color(49), Color::Green);
+        assert_eq!(context_color(50), Color::Yellow);
+        assert_eq!(context_color(80), Color::Yellow);
+        assert_eq!(context_color(81), Color::Red);
+        assert_eq!(context_color(100), Color::Red);
+    }
+
+    fn write_session_with_git_and_context(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("rollout-2026-06-01T00-00-00-infobar.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-06-01T00:00:00Z","type":"session_meta","payload":{"id":"infobar","timestamp":"2026-06-01T00:00:00Z","cwd":"/tmp/my-project","git":{"branch":"feature/x"}}}"#,
+                r#"{"timestamp":"2026-06-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-06-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-5.4","cwd":"/tmp/my-project"}}"#,
+                r#"{"timestamp":"2026-06-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2},"last_token_usage":{"input_tokens":40000,"cached_input_tokens":10000,"output_tokens":1000,"reasoning_output_tokens":0,"total_tokens":51000},"model_context_window":100000}}}"#,
+                r#"{"timestamp":"2026-06-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1780357204.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn info_bar_line_shows_branch_model_and_context_percent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session_with_git_and_context(tmp.path());
+        let session = crate::parser::session::parse_session(&path).unwrap();
+
+        assert_eq!(last_context_usage(&session), Some((51, 51_000, 100_000)));
+        let line = info_bar_line(&session);
+        let text = line_text(&line);
+        assert!(text.contains("* feature/x"), "expected branch in {text:?}");
+        assert!(text.contains("gpt-5.4"), "expected model in {text:?}");
+        assert!(text.contains("ctx 51%"), "expected context pct in {text:?}");
+    }
+
+    #[test]
+    fn info_bar_line_placeholder_when_session_has_no_metadata() {
+        let session = crate::parser::session::CodexSession {
+            id: "bare".to_string(),
+            timestamp: String::new(),
+            cwd: None,
+            originator: None,
+            cli_version: None,
+            model_provider: None,
+            git: None,
+            instructions: None,
+            turns: Vec::new(),
+            is_ongoing: false,
+            total_tokens: None,
+            thread_name: None,
+            spawned_worker_ids: Vec::new(),
+            path: String::new(),
+            ai_title: None,
+            is_headless: false,
+            has_missing_spawn_metadata: false,
+        };
+        let text = line_text(&info_bar_line(&session));
+        assert_eq!(text, "(no session metadata)");
     }
 }
