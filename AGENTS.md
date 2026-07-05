@@ -7,6 +7,7 @@
 npm run dev              # Vite dev server
 npm run tauri dev        # Full Tauri desktop app
 npm run dev:web          # Web mode (opens browser)
+npm run dev:tui          # Terminal UI (cargo run --bin codex-trace -- --tui)
 
 # Lint
 npx oxlint              # JS/TS lint

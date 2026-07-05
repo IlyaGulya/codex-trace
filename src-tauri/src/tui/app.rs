@@ -18,6 +18,7 @@ pub enum Screen {
 pub enum DetailFocus {
     List,
     Item,
+    Team,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +30,17 @@ pub enum ItemPanel {
 #[derive(Debug, Clone)]
 pub enum PickerRow {
     DateHeader(String),
+    ProjectHeader(String),
     Session(usize),
+}
+
+/// How the Session Picker groups sessions — toggled with `p` (mirrors the
+/// project sidebar in the web/TUI reference, adapted to Codex's flat
+/// date-based session layout by grouping on each session's recorded `cwd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupMode {
+    Date,
+    Project,
 }
 
 /// One selectable line in a session's detail list. Turn headers, the user
@@ -52,6 +63,7 @@ pub struct OpenSession {
     pub focus: DetailFocus,
     pub item_panel: ItemPanel,
     pub item_scroll: u16,
+    pub team_state: ListState,
     last_mtime: Option<std::time::SystemTime>,
 }
 
@@ -72,6 +84,7 @@ impl OpenSession {
             focus: DetailFocus::List,
             item_panel: ItemPanel::Primary,
             item_scroll: 0,
+            team_state: ListState::default(),
             last_mtime,
         }
     }
@@ -150,6 +163,50 @@ impl OpenSession {
         }
         tool.worker_session.as_ref().map(|b| b.as_ref().clone())
     }
+
+    /// `(turn_idx, tool_idx)` of every `spawn_agent` call across the session —
+    /// the roster shown by the Team board (`t` key), mirroring the collab
+    /// tracking the desktop/web UI shows per-turn but flattened into a single
+    /// cross-turn view.
+    pub fn team_rows(&self) -> Vec<(usize, usize)> {
+        self.session
+            .turns
+            .iter()
+            .enumerate()
+            .flat_map(|(t, turn)| {
+                turn.tool_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tc)| tc.kind == ToolKind::SpawnAgent)
+                    .map(move |(tc, _)| (t, tc))
+            })
+            .collect()
+    }
+
+    fn enter_team_view(&mut self) {
+        self.focus = DetailFocus::Team;
+        if self.team_state.selected().is_none() && !self.team_rows().is_empty() {
+            self.team_state.select(Some(0));
+        }
+    }
+
+    fn move_team_selection(&mut self, delta: i32) {
+        let len = self.team_rows().len() as i32;
+        if len == 0 {
+            return;
+        }
+        let current = self.team_state.selected().unwrap_or(0) as i32;
+        let next = (current + delta).clamp(0, len - 1);
+        self.team_state.select(Some(next as usize));
+    }
+
+    /// The worker session embedded on the currently selected Team board row,
+    /// if one was resolved during parsing (see `selected_worker_session`).
+    fn selected_team_worker_session(&self) -> Option<CodexSession> {
+        let (t, tc) = *self.team_rows().get(self.team_state.selected()?)?;
+        let tool = self.session.turns.get(t)?.tool_calls.get(tc)?;
+        tool.worker_session.as_ref().map(|b| b.as_ref().clone())
+    }
 }
 
 /// Flatten a session's turns into a linear list of rows, interleaving agent
@@ -200,6 +257,7 @@ pub struct App {
     pub picker_state: ListState,
     pub search_mode: bool,
     pub search_query: String,
+    pub group_mode: GroupMode,
     pub screen: Screen,
     pub stack: Vec<OpenSession>,
     pub show_help: bool,
@@ -217,6 +275,7 @@ impl App {
             picker_state: ListState::default(),
             search_mode: false,
             search_query: String::new(),
+            group_mode: GroupMode::Date,
             screen: Screen::Picker,
             stack: Vec::new(),
             show_help: false,
@@ -243,13 +302,29 @@ impl App {
 
     fn rebuild_picker_rows(&mut self) {
         let query = self.search_query.to_lowercase();
+        self.filtered_rows = match self.group_mode {
+            GroupMode::Date => self.build_rows_by_date(&query),
+            GroupMode::Project => self.build_rows_by_project(&query),
+        };
+        let len = self.filtered_rows.len();
+        match self.picker_state.selected() {
+            Some(sel) if sel >= len => self.picker_state.select(len.checked_sub(1)),
+            None if len > 0 => self.picker_state.select(Some(0)),
+            _ => {}
+        }
+    }
+
+    /// Sessions are already newest-first and contiguous per `date_group`
+    /// (the filename's ISO timestamp sorts that way), so a single pass groups
+    /// them without re-sorting.
+    fn build_rows_by_date(&self, query: &str) -> Vec<PickerRow> {
         let mut rows = Vec::new();
         let mut i = 0;
         while i < self.sessions.len() {
             let group = self.sessions[i].date_group.clone();
             let mut group_indices = Vec::new();
             while i < self.sessions.len() && self.sessions[i].date_group == group {
-                if query.is_empty() || session_matches(&self.sessions[i], &query) {
+                if query.is_empty() || session_matches(&self.sessions[i], query) {
                     group_indices.push(i);
                 }
                 i += 1;
@@ -262,13 +337,35 @@ impl App {
                 rows.extend(group_indices.into_iter().map(PickerRow::Session));
             }
         }
-        self.filtered_rows = rows;
-        let len = self.filtered_rows.len();
-        match self.picker_state.selected() {
-            Some(sel) if sel >= len => self.picker_state.select(len.checked_sub(1)),
-            None if len > 0 => self.picker_state.select(Some(0)),
-            _ => {}
+        rows
+    }
+
+    /// Groups by each session's recorded `cwd` rather than by date. Unlike
+    /// date groups, a project's sessions aren't contiguous in `self.sessions`
+    /// (newest-first overall, not per-project), so this collects into a
+    /// sorted map first; insertion order per key still preserves the
+    /// newest-first ordering within each project.
+    fn build_rows_by_project(&self, query: &str) -> Vec<PickerRow> {
+        let mut by_project: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            if !query.is_empty() && !session_matches(s, query) {
+                continue;
+            }
+            let key = s
+                .cwd
+                .clone()
+                .unwrap_or_else(|| "(unknown project)".to_string());
+            by_project.entry(key).or_default().push(i);
         }
+        let mut rows = Vec::new();
+        for (project, indices) in by_project {
+            rows.push(PickerRow::ProjectHeader(project.clone()));
+            if !self.collapsed_groups.contains(&project) {
+                rows.extend(indices.into_iter().map(PickerRow::Session));
+            }
+        }
+        rows
     }
 
     pub fn on_tick(&mut self) {
@@ -336,6 +433,7 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('/') => self.search_mode = true,
             KeyCode::Char('r') => self.reload_sessions(),
+            KeyCode::Char('p') => self.toggle_group_mode(),
             KeyCode::Down | KeyCode::Char('j') => self.move_picker(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_picker(-1),
             KeyCode::PageDown => self.move_picker(10),
@@ -373,7 +471,7 @@ impl App {
             return;
         };
         match row {
-            PickerRow::DateHeader(group) => {
+            PickerRow::DateHeader(group) | PickerRow::ProjectHeader(group) => {
                 if !self.collapsed_groups.remove(&group) {
                     self.collapsed_groups.insert(group);
                 }
@@ -381,6 +479,15 @@ impl App {
             }
             PickerRow::Session(idx) => self.open_session_by_index(idx),
         }
+    }
+
+    fn toggle_group_mode(&mut self) {
+        self.group_mode = match self.group_mode {
+            GroupMode::Date => GroupMode::Project,
+            GroupMode::Project => GroupMode::Date,
+        };
+        self.collapsed_groups.clear();
+        self.rebuild_picker_rows();
     }
 
     fn open_session_by_index(&mut self, idx: usize) {
@@ -409,6 +516,7 @@ impl App {
         match self.stack.last().unwrap().focus {
             DetailFocus::List => self.on_key_detail_list(code),
             DetailFocus::Item => self.on_key_detail_item(code),
+            DetailFocus::Team => self.on_key_detail_team(code),
         }
     }
 
@@ -435,6 +543,7 @@ impl App {
             KeyCode::Tab => self.stack.last_mut().unwrap().toggle_expand_selected(),
             KeyCode::Char('e') => self.stack.last_mut().unwrap().set_all_expanded(true),
             KeyCode::Char('c') => self.stack.last_mut().unwrap().set_all_expanded(false),
+            KeyCode::Char('t') => self.stack.last_mut().unwrap().enter_team_view(),
             KeyCode::Enter => {
                 let worker = self.stack.last().unwrap().selected_worker_session();
                 if let Some(session) = worker {
@@ -442,6 +551,28 @@ impl App {
                     self.stack.push(OpenSession::new(session, path));
                 } else {
                     self.stack.last_mut().unwrap().enter_item_view();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_detail_team(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('t') => {
+                self.stack.last_mut().unwrap().focus = DetailFocus::List;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.stack.last_mut().unwrap().move_team_selection(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.stack.last_mut().unwrap().move_team_selection(-1)
+            }
+            KeyCode::Enter => {
+                let worker = self.stack.last().unwrap().selected_team_worker_session();
+                if let Some(session) = worker {
+                    let path = PathBuf::from(&session.path);
+                    self.stack.push(OpenSession::new(session, path));
                 }
             }
             _ => {}
@@ -509,6 +640,7 @@ mod tests {
             picker_state: ListState::default(),
             search_mode: false,
             search_query: String::new(),
+            group_mode: GroupMode::Date,
             screen: Screen::Picker,
             stack: Vec::new(),
             show_help: false,
@@ -539,6 +671,70 @@ mod tests {
         assert!(matches!(&app.filtered_rows[0], PickerRow::DateHeader(g) if g == "2026/05/08"));
         assert!(matches!(app.filtered_rows[1], PickerRow::Session(0)));
         assert!(matches!(&app.filtered_rows[2], PickerRow::DateHeader(g) if g == "2026/05/07"));
+    }
+
+    #[test]
+    fn toggle_group_mode_switches_from_date_to_project_grouping() {
+        let mut sessions = vec![
+            sample_session_info("s1", "2026/05/08", "2026-05-08T00:00:00Z"),
+            sample_session_info("s2", "2026/05/07", "2026-05-07T00:00:00Z"),
+        ];
+        sessions[0].cwd = Some("/repo/a".to_string());
+        sessions[1].cwd = Some("/repo/b".to_string());
+        let mut app = test_app(sessions);
+        assert_eq!(app.group_mode, GroupMode::Date);
+
+        app.toggle_group_mode();
+        assert_eq!(app.group_mode, GroupMode::Project);
+        // Sorted alphabetically by cwd (BTreeMap), unlike date grouping which
+        // preserves newest-first order.
+        assert_eq!(app.filtered_rows.len(), 4); // 2 project headers + 2 sessions
+        assert!(matches!(&app.filtered_rows[0], PickerRow::ProjectHeader(g) if g == "/repo/a"));
+        assert!(matches!(app.filtered_rows[1], PickerRow::Session(0)));
+        assert!(matches!(&app.filtered_rows[2], PickerRow::ProjectHeader(g) if g == "/repo/b"));
+        assert!(matches!(app.filtered_rows[3], PickerRow::Session(1)));
+
+        app.toggle_group_mode();
+        assert_eq!(app.group_mode, GroupMode::Date);
+    }
+
+    #[test]
+    fn build_rows_by_project_groups_sessions_sharing_a_cwd_and_buckets_unknown_ones() {
+        let mut sessions = vec![
+            sample_session_info("s1", "2026/05/08", "2026-05-08T00:00:00Z"),
+            sample_session_info("s2", "2026/05/07", "2026-05-07T00:00:00Z"),
+            sample_session_info("s3", "2026/05/06", "2026-05-06T00:00:00Z"),
+        ];
+        sessions[0].cwd = Some("/repo/a".to_string());
+        sessions[1].cwd = Some("/repo/a".to_string());
+        // s3 has no cwd — falls into the "(unknown project)" bucket.
+        let mut app = test_app(sessions);
+        app.toggle_group_mode();
+        assert_eq!(app.filtered_rows.len(), 5); // 2 project headers + 3 sessions
+        assert!(
+            matches!(&app.filtered_rows[0], PickerRow::ProjectHeader(g) if g == "(unknown project)")
+        );
+        assert!(matches!(app.filtered_rows[1], PickerRow::Session(2)));
+        assert!(matches!(&app.filtered_rows[2], PickerRow::ProjectHeader(g) if g == "/repo/a"));
+        assert!(matches!(app.filtered_rows[3], PickerRow::Session(0)));
+        assert!(matches!(app.filtered_rows[4], PickerRow::Session(1)));
+    }
+
+    #[test]
+    fn activate_picker_row_collapses_and_expands_a_project_group() {
+        let mut sessions = vec![sample_session_info(
+            "s1",
+            "2026/05/08",
+            "2026-05-08T00:00:00Z",
+        )];
+        sessions[0].cwd = Some("/repo/a".to_string());
+        let mut app = test_app(sessions);
+        app.toggle_group_mode();
+        app.picker_state.select(Some(0));
+        app.activate_picker_row();
+        assert_eq!(app.filtered_rows.len(), 1); // header only, session hidden
+        app.activate_picker_row();
+        assert_eq!(app.filtered_rows.len(), 2); // expanded again
     }
 
     #[test]
@@ -743,5 +939,111 @@ mod tests {
             .selected_worker_session()
             .expect("worker session embedded");
         assert_eq!(worker.id, "worker-session");
+    }
+
+    fn write_session_with_spawn_agent_pair(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("rollout-2026-04-27T16-50-45-parent.jsonl");
+        let worker_path = dir.join("rollout-2026-04-27T16-50-46-worker-session.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-04-27T04:50:45Z","type":"session_meta","payload":{"id":"parent","timestamp":"2026-04-27T04:50:45Z"}}"#,
+                r#"{"timestamp":"2026-04-27T04:52:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-04-27T04:52:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"worker\",\"message\":\"Collect evidence\"}","call_id":"call_spawn"}}"#,
+                r#"{"timestamp":"2026-04-27T04:52:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn","output":"{\"agent_id\":\"worker-session\",\"nickname\":\"Parfit\"}"}}"#,
+                r#"{"timestamp":"2026-04-27T04:52:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1777279924.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &worker_path,
+            r#"{"timestamp":"2026-04-27T04:50:46Z","type":"session_meta","payload":{"id":"worker-session","timestamp":"2026-04-27T04:50:46Z","cwd":"/tmp/worker"}}"#,
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn team_rows_is_empty_when_the_session_never_spawned_an_agent() {
+        let tmp = tempdir().unwrap();
+        let path = write_session_with_tool_call(tmp.path());
+        let session = parse_session(&path).unwrap();
+        let open = OpenSession::new(session, path);
+        assert!(open.team_rows().is_empty());
+    }
+
+    #[test]
+    fn team_rows_lists_every_spawn_agent_call_across_turns() {
+        let tmp = tempdir().unwrap();
+        let path = write_session_with_spawn_agent_pair(tmp.path());
+        let session = parse_session(&path).unwrap();
+        let open = OpenSession::new(session, path);
+        assert_eq!(open.team_rows(), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn enter_team_view_focuses_team_and_selects_the_first_row() {
+        let tmp = tempdir().unwrap();
+        let path = write_session_with_spawn_agent_pair(tmp.path());
+        let session = parse_session(&path).unwrap();
+        let mut open = OpenSession::new(session, path);
+        open.enter_team_view();
+        assert_eq!(open.focus, DetailFocus::Team);
+        assert_eq!(open.team_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn move_team_selection_clamps_at_bounds_with_a_single_row() {
+        let tmp = tempdir().unwrap();
+        let path = write_session_with_spawn_agent_pair(tmp.path());
+        let session = parse_session(&path).unwrap();
+        let mut open = OpenSession::new(session, path);
+        open.enter_team_view();
+        open.move_team_selection(5);
+        assert_eq!(open.team_state.selected(), Some(0));
+        open.move_team_selection(-5);
+        assert_eq!(open.team_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn selected_team_worker_session_returns_the_embedded_worker() {
+        let tmp = tempdir().unwrap();
+        let path = write_session_with_spawn_agent_pair(tmp.path());
+        let session = parse_session(&path).unwrap();
+        let mut open = OpenSession::new(session, path);
+        open.enter_team_view();
+        let worker = open
+            .selected_team_worker_session()
+            .expect("worker session embedded");
+        assert_eq!(worker.id, "worker-session");
+    }
+
+    #[test]
+    fn on_key_detail_team_t_returns_to_the_list_and_enter_opens_the_worker() {
+        let tmp = tempdir().unwrap();
+        write_session_with_spawn_agent_pair(tmp.path());
+        let mut app = App::new(tmp.path().to_path_buf());
+        // Sessions sort newest-first by filename timestamp, so the worker
+        // session (16:50:46) lands before its parent (16:50:45) — pick the
+        // row whose id is "parent" rather than assuming an index.
+        let parent_idx = app
+            .sessions
+            .iter()
+            .position(|s| s.id == "parent")
+            .expect("parent session discovered");
+        let row_idx = app
+            .filtered_rows
+            .iter()
+            .position(|row| matches!(row, PickerRow::Session(i) if *i == parent_idx))
+            .expect("parent session has a picker row");
+        app.picker_state.select(Some(row_idx));
+        app.activate_picker_row();
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert_eq!(app.stack.last().unwrap().focus, DetailFocus::Team);
+
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(app.stack.last().unwrap().session.id, "worker-session");
     }
 }

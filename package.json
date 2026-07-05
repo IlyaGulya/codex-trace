@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dev:web": "tauri dev -- -- --web",
+    "dev:tui": "cargo run --manifest-path src-tauri/Cargo.toml --bin codex-trace -- --tui",
     "lint": "oxlint && cargo clippy --manifest-path src-tauri/Cargo.toml",
     "fmt": "oxfmt && cargo fmt --manifest-path src-tauri/Cargo.toml",
     "fmt:check": "oxfmt --check && cargo fmt --manifest-path src-tauri/Cargo.toml --check",

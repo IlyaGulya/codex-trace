@@ -11,7 +11,7 @@ use crate::parser::session::CodexSession;
 use crate::parser::toolcall::{ToolCall, ToolKind};
 use crate::parser::turn::TurnStatus;
 
-use super::app::{App, DetailFocus, ItemPanel, OpenSession, PickerRow, Row, Screen};
+use super::app::{App, DetailFocus, GroupMode, ItemPanel, OpenSession, PickerRow, Row, Screen};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
@@ -34,8 +34,12 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
+    let group_label = match app.group_mode {
+        GroupMode::Date => "by date",
+        GroupMode::Project => "by project",
+    };
     let title = format!(
-        " Codex Trace — {} ({} sessions) ",
+        " Codex Trace — {} ({} sessions, {group_label}) ",
         app.sessions_dir.display(),
         app.sessions.len()
     );
@@ -59,7 +63,7 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
     let footer_text = if app.search_mode {
         format!("search: {}_", app.search_query)
     } else {
-        "j/k move   Enter open/toggle   /  search   r  refresh   ?  help   q  quit".to_string()
+        "j/k move   Enter open/toggle   /  search   p  group by date/project   r  refresh   ?  help   q  quit".to_string()
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::Gray));
     f.render_widget(footer, chunks[2]);
@@ -74,7 +78,7 @@ fn picker_items(app: &App) -> Vec<ListItem<'static>> {
 
 fn picker_row_item(app: &App, row: &PickerRow) -> ListItem<'static> {
     match row {
-        PickerRow::DateHeader(group) => {
+        PickerRow::DateHeader(group) | PickerRow::ProjectHeader(group) => {
             let collapsed = app.collapsed_groups.contains(group);
             let arrow = if collapsed { "▶" } else { "▼" };
             ListItem::new(Line::from(Span::styled(
@@ -140,6 +144,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
     match open.focus {
         DetailFocus::List => draw_detail_list(f, open, depth),
         DetailFocus::Item => draw_detail_item(f, open),
+        DetailFocus::Team => draw_detail_team(f, open),
     }
 }
 
@@ -184,10 +189,109 @@ fn draw_detail_list(f: &mut Frame, open: &mut OpenSession, depth: usize) {
     f.render_stateful_widget(list, chunks[1], &mut open.list_state);
 
     let footer = Paragraph::new(
-        "j/k move   Tab expand   e/c expand/collapse all   Enter detail   r refresh   Esc back   ? help",
+        "j/k move   Tab expand   e/c expand/collapse all   Enter detail   t team   r refresh   Esc back   ? help",
     )
     .style(Style::default().fg(Color::Gray));
     f.render_widget(footer, chunks[2]);
+}
+
+/// Roster of every `spawn_agent` call in the session, flattened across turns
+/// — the terminal equivalent of the web/TUI reference's `TeamBoard`.
+fn draw_detail_team(f: &mut Frame, open: &mut OpenSession) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(info_bar_line(&open.session)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} — Team ", open.session.id)),
+    );
+    f.render_widget(header, chunks[0]);
+
+    let rows = open.team_rows();
+    let items: Vec<ListItem<'static>> = if rows.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No spawned agents in this session",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        rows.iter()
+            .map(|(t, tc)| team_row_item(&open.session, *t, *tc))
+            .collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Agents "))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, chunks[1], &mut open.team_state);
+
+    let footer = Paragraph::new("j/k move   Enter open worker session   Esc/t back   ? help")
+        .style(Style::default().fg(Color::Gray));
+    f.render_widget(footer, chunks[2]);
+}
+
+fn team_row_item(session: &CodexSession, t: usize, tc: usize) -> ListItem<'static> {
+    let turn = &session.turns[t];
+    let tool = &turn.tool_calls[tc];
+    let spawn = turn
+        .collab_spawns
+        .iter()
+        .find(|s| s.call_id == tool.call_id);
+
+    let nickname = spawn
+        .map(|s| s.agent_nickname.clone())
+        .or_else(|| tool.subagent_name.clone())
+        .unwrap_or_else(|| "(unnamed)".to_string());
+    let role = spawn.map(|s| s.agent_role.clone()).unwrap_or_default();
+    let model = spawn
+        .and_then(|s| s.model.clone())
+        .unwrap_or_else(|| "-".to_string());
+    let status_style = Style::default().fg(tool_status_color(&tool.status));
+
+    let mut spans = vec![
+        Span::styled(
+            format!("Turn {} ", t + 1),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(nickname, Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if !role.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{role}]"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(model, Style::default().fg(Color::Cyan)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(tool.status.clone(), status_style));
+    if tool.worker_session.is_some() {
+        spans.push(Span::styled(
+            "  ↳ Enter to open",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let mut lines = vec![Line::from(spans)];
+    if let Some(spawn) = spawn {
+        if !spawn.prompt_preview.is_empty() {
+            lines.push(Line::from(Span::raw(format!(
+                "    {}",
+                truncate(&single_line(&spawn.prompt_preview), 110)
+            ))));
+        }
+    }
+    ListItem::new(lines)
 }
 
 fn detail_items(open: &OpenSession) -> Vec<ListItem<'static>> {
@@ -706,8 +810,9 @@ fn draw_help(f: &mut Frame, screen: Screen) {
             "Session Picker",
             "",
             "j / k / ↑ / ↓   move selection",
-            "Enter / Space   open session, or expand/collapse a date group",
+            "Enter / Space   open session, or expand/collapse a group",
             "/               search sessions   (Esc clears, Enter keeps filter)",
+            "p               toggle grouping: by date / by project (cwd)",
             "r               rescan the sessions directory",
             "?               toggle this help",
             "q / Ctrl+C      quit",
@@ -720,6 +825,7 @@ fn draw_help(f: &mut Frame, screen: Screen) {
             "e / c                expand / collapse all tool calls",
             "Enter                open full detail, or drill into a spawned agent",
             "h / l                switch Request / Response panel in detail view",
+            "t                    team board — roster of spawned agents",
             "r                    reload the session from disk",
             "Esc / q              back to the list, or back to the picker",
             "?                    toggle this help",

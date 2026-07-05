@@ -80,6 +80,7 @@ npm install
 
 npm run tauri dev        # desktop app with hot reload
 npm run dev:web          # web mode (opens browser)
+npm run dev:tui          # terminal UI (builds and runs the Rust binary directly)
 ```
 
 ### Run in Docker
@@ -121,14 +122,16 @@ Browses the same `~/.codex/sessions/` data as the desktop and web UI, entirely i
 | Screen         | Keys           | Action                                           |
 | -------------- | -------------- | ------------------------------------------------ |
 | Session Picker | `j` / `k`      | Move selection                                   |
-| Session Picker | `Enter`        | Open a session, or expand/collapse a date group  |
+| Session Picker | `Enter`        | Open a session, or expand/collapse a group       |
 | Session Picker | `/`            | Search sessions (`Esc` clears, `Enter` keeps it) |
+| Session Picker | `p`            | Toggle grouping: by date / by project (cwd)      |
 | Session Picker | `r`            | Rescan the sessions directory                    |
 | Session Detail | `j` / `k`      | Move selection (list) or scroll (detail)         |
 | Session Detail | `Tab`          | Expand/collapse a tool call inline               |
 | Session Detail | `e` / `c`      | Expand / collapse all tool calls                 |
 | Session Detail | `Enter`        | Open full detail, or drill into a spawned agent  |
 | Session Detail | `h` / `l`      | Switch Request / Response panel in detail view   |
+| Session Detail | `t`            | Team board — roster of every spawned agent       |
 | Session Detail | `r`            | Reload the session from disk                     |
 | Session Detail | `Esc` / `q`    | Back to the list, or back to the picker          |
 | All screens    | `?`            | Toggle keybinding help                           |

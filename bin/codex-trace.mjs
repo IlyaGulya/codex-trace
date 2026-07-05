@@ -10,7 +10,7 @@ const binDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(binDir, "..");
 
 const args = process.argv.slice(2);
-const mode = args.find((a) => ["--app", "--web"].includes(a)) ?? "--app";
+const mode = args.find((a) => ["--app", "--web", "--tui"].includes(a)) ?? "--app";
 const noOpen = args.includes("--no-open");
 
 function run(cmd, cmdArgs, opts = {}) {
@@ -66,6 +66,23 @@ function openBrowser(url) {
 switch (mode) {
   case "--app":
     run("npx", ["tauri", "dev"]);
+    break;
+
+  case "--tui":
+    // The TUI is a native terminal app (crossterm raw mode) that reads
+    // session files directly — no Vite/Tauri dev server or backend needed,
+    // so this builds and runs the Rust binary straight through cargo rather
+    // than `npx tauri dev`.
+    run("cargo", [
+      "run",
+      "--quiet",
+      "--manifest-path",
+      "src-tauri/Cargo.toml",
+      "--bin",
+      "codex-trace",
+      "--",
+      "--tui",
+    ]);
     break;
 
   case "--web": {
