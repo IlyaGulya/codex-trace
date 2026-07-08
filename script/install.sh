@@ -45,6 +45,7 @@ if [ "$OS" = "Darwin" ]; then
   echo "Installed! Launch the desktop app from Launchpad/Applications, or:"
   echo "  open -a \"Codex Trace\"   # desktop app"
   echo "  codex-trace --web        # web mode (opens browser)"
+  echo "  codex-trace --tui        # terminal UI (SSH-friendly, no browser/GUI needed)"
 else
   echo "==> Building frontend..."
   npm run build
@@ -59,4 +60,5 @@ else
   echo "Installed! Run:"
   echo "  codex-trace          # desktop app (default)"
   echo "  codex-trace --web    # web mode (opens browser)"
+  echo "  codex-trace --tui    # terminal UI (SSH-friendly, no browser/GUI needed)"
 fi
