@@ -742,7 +742,7 @@ fn handle_event_msg(
         // codex-trace does not model MCP auth state — these events carry no turn-building
         // semantics and are explicitly skipped so ordinary sessions with auth flows parse
         // without corrupting turn data.
-        "mcp_auth_request" | "mcp_auth_result" => {}
+        "mcp_auth_request" | "mcp_auth_result" | "mcp_auth_challenge" | "mcp_auth_complete" => {}
 
         _ => {}
     }
@@ -4061,5 +4061,53 @@ mod tests {
         let turn = &turns[0];
         assert_eq!(turn.tool_calls.len(), 0);
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.144.0 (PR #28772): also covers the mcp_auth_challenge/mcp_auth_complete
+    // naming variant. Both naming conventions must be recognised.
+
+    #[test]
+    fn v0144_mcp_auth_events_during_turn_do_not_corrupt_turn_state() {
+        let lines = [
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-flow","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"list_repos","arguments":{}}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:03Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-1","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":[{"type":"text","text":"[\"my-repo\",\"other-repo\"]"}]}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:09Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055209.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "list_repos");
+        assert_eq!(turn.tool_calls[0].mcp_server.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn v0144_mcp_auth_challenge_without_tool_call_does_not_crash() {
+        let lines = [
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-proactive-auth","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"slack","auth_url":"https://slack.com/oauth/v2/authorize?client_id=xyz"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:06Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"slack","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Authenticated with Slack."}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055208.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 0);
     }
 }
