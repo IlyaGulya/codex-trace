@@ -334,6 +334,15 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
                     }
+                    "token_budget_abort" | "inference_stream_cancelled" => {
+                        // v0.142.0+: budget exhausted or inference cancelled — turn is done.
+                        // v0.143.0 reliably preserves these on disk during shutdown.
+                        is_ongoing = false;
+                        end_time = v
+                            .get("timestamp")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
                     "token_count" => {
                         if let Some(info) = v
                             .get("payload")
@@ -1384,5 +1393,81 @@ mod tests {
         assert_eq!(session.cli_version.as_deref(), Some("0.140.0"));
         assert_eq!(session.cwd.as_deref(), Some("/project"));
         assert!(!session.is_ongoing, "completed session must not be ongoing");
+    }
+
+    #[test]
+    fn v0143_token_budget_abort_marks_session_not_ongoing() {
+        // Codex v0.142.0 introduced `token_budget_abort`; v0.143.0 (PRs #29918, #30144)
+        // reliably flushes it to disk during shutdown. discover_sessions must recognise
+        // this event as a turn-terminating signal so the session is NOT shown as ongoing.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/12");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-07-12T10-00-00-v0143-budget.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-12T10:00:00Z","type":"session_meta","payload":{"id":"v0143-budget-disc","timestamp":"2026-07-12T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:03Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","limit":8000,"used":8001}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0143-budget-disc")
+            .expect("session terminated by token_budget_abort must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.143.0"));
+        assert!(
+            !session.is_ongoing,
+            "token_budget_abort must mark session as not ongoing"
+        );
+        assert_eq!(
+            session.end_time.as_deref(),
+            Some("2026-07-12T10:00:03Z"),
+            "end_time must be set from token_budget_abort timestamp"
+        );
+    }
+
+    #[test]
+    fn v0143_inference_stream_cancelled_marks_session_not_ongoing() {
+        // Codex v0.143.0 (PRs #29918, #30144) reliably preserves `inference_stream_cancelled`
+        // events on disk during shutdown. discover_sessions must recognise this event as a
+        // turn-terminating signal so the session is NOT shown as ongoing.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/12");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-07-12T10-01-00-v0143-cancel.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-12T10:01:00Z","type":"session_meta","payload":{"id":"v0143-cancel-disc","timestamp":"2026-07-12T10:01:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:03Z","type":"event_msg","payload":{"type":"inference_stream_cancelled","turn_id":"turn-1","reason":"user_interrupt"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0143-cancel-disc")
+            .expect("session terminated by inference_stream_cancelled must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.143.0"));
+        assert!(
+            !session.is_ongoing,
+            "inference_stream_cancelled must mark session as not ongoing"
+        );
+        assert_eq!(
+            session.end_time.as_deref(),
+            Some("2026-07-12T10:01:03Z"),
+            "end_time must be set from inference_stream_cancelled timestamp"
+        );
     }
 }
