@@ -1494,4 +1494,61 @@ mod tests {
         let msg_entry = RawEntry::parse(lines[2]).unwrap();
         assert_eq!(msg_entry.payload["metadata"]["turn_id"], "turn-1");
     }
+
+    // Codex v0.144.0 (PR #31494): paste-triggered corruption of resumed conversation
+    // history fixed. Sessions captured before v0.144.0 may contain corrupted/garbled
+    // entries where pasted terminal control sequences broke JSONL line integrity.
+    // The parser must gracefully handle both corruption forms without crashing.
+
+    #[test]
+    fn v0144_paste_corrupted_invalid_json_line_is_silently_skipped() {
+        // Raw ESC byte (0x1b) embedded in a JSON line breaks JSON structure,
+        // making the line invalid JSON. serde_json::from_str(...).ok()? returns
+        // None and the line is silently dropped — pre-v0.144.0 sessions with
+        // this corruption must not cause panics or parse failures.
+        let corrupted_line = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"content\":\"run \x1b[1mmake test\x1b[0m\"}}";
+        assert!(RawEntry::parse(corrupted_line).is_none());
+    }
+
+    #[test]
+    fn v0144_response_item_with_unicode_escaped_control_sequences_does_not_panic() {
+        // A response_item where the content field contains Unicode-escaped ANSI
+        // sequences (\u001b[1m) is technically valid JSON. The parser must
+        // accept it without panicking -- the garbled display content is passed
+        // through as-is. This models pre-v0.144.0 resumed history entries where
+        // pasted control sequences were JSON-encoded rather than written as raw bytes.
+        let line = "{\"timestamp\":\"2026-07-01T10:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"run \\u001b[1mmake test\\u001b[0m now\"}}";
+        let e = RawEntry::parse(line);
+        assert!(e.is_some());
+        let e = e.unwrap();
+        assert_eq!(e.entry_type, "response_item");
+    }
+
+    #[test]
+    fn v0144_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all four standard JSONL entry types from a v0.144.0
+        // session must parse correctly. The paste-corruption fix (PR #31494) is
+        // a TUI-level change — the JSONL session format is unchanged.
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367604.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.144.0");
+        assert_eq!(meta.payload["id"], "v0144-session");
+    }
 }

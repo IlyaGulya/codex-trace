@@ -3990,4 +3990,30 @@ mod tests {
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
+
+    // Codex v0.144.0 (PR #31494): paste-triggered corruption of resumed conversation
+    // history. Pre-v0.144.0 sessions may include corrupted response_items in their
+    // resumed history. Turn building must complete without panicking even when history
+    // entries contain control sequence characters in string content.
+
+    #[test]
+    fn v0144_paste_corrupted_resumed_history_response_item_does_not_crash_turn_building() {
+        // A resumed session from before v0.144.0 may contain response_item entries
+        // where the content field has embedded Unicode-escaped ANSI sequences.
+        // Turn building must complete without panicking and process subsequent turns.
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-resume","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0"}}"#,
+            r#"{"timestamp":"2026-07-01T09:50:00Z","type":"response_item","payload":{"type":"message","role":"user","content":"run [1mmake test[0m now"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Running tests now."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+    }
 }
