@@ -4110,4 +4110,49 @@ mod tests {
         assert_eq!(turns[0].status, super::TurnStatus::Complete);
         assert_eq!(turns[0].tool_calls.len(), 0);
     }
+
+    #[test]
+    fn v0144_mcp_auth_events_interleaved_with_agent_message_do_not_corrupt_turn() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:02:00Z","type":"session_meta","payload":{"id":"v0144-mcp-auth-msg","timestamp":"2026-07-01T10:02:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-3","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL."}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Waiting for GitHub authentication...","phase":"main"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:04Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-3","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364125.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Auth events must not appear as agent messages — only the real agent_message survives
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(
+            turns[0].agent_messages[0].text,
+            "Waiting for GitHub authentication..."
+        );
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn v0144_multiple_mcp_auth_attempts_are_all_skipped_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:03:00Z","type":"session_meta","payload":{"id":"v0144-mcp-auth-retry","timestamp":"2026-07-01T10:03:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"jira","call_id":"auth-4","auth_url":"https://auth.jira.com/oauth","instructions":"Auth with Jira."}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:03Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"jira","call_id":"auth-4","status":"failed","error":"timeout"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:04Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"jira","call_id":"auth-5","auth_url":"https://auth.jira.com/oauth","instructions":"Auth with Jira."}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"jira","call_id":"auth-5","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364186.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Multiple auth request/result pairs must all be silently skipped
+        assert!(turns[0].agent_messages.is_empty());
+        assert!(turns[0].tool_calls.is_empty());
+    }
 }
