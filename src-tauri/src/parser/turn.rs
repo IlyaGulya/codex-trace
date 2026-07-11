@@ -73,6 +73,34 @@ pub struct CompactionMeta {
     pub lineage_id: Option<String>,
 }
 
+/// A single credit option for resetting usage limits (Codex v0.144.0, PR #30488).
+/// Codex v0.144.0 extended rate-limit reset data with per-credit type and expiration
+/// information, and allows users to select among multiple available credits.
+/// All fields are optional to remain compatible with earlier Codex versions where
+/// credits were untyped or absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetCredit {
+    /// Credit kind, e.g. `"subscription"` or `"purchased"`. Null for pre-v0.144.0 sessions.
+    #[serde(rename = "type")]
+    pub credit_type: Option<String>,
+    /// ISO-8601 expiration timestamp, or null if the credit does not expire.
+    pub expiration: Option<String>,
+}
+
+/// Rate-limit information from a `token_count` event payload (Codex v0.144.0, PR #30488).
+/// The `rate_limits` field is a sibling of `info` on `token_count` payloads.
+/// Null in pre-v0.144.0 sessions and whenever the API does not return limit data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitInfo {
+    /// ISO-8601 timestamp when the usage limit resets.
+    pub reset_at: Option<String>,
+    /// All credits available for redeeming the reset. Populated by Codex v0.144.0+.
+    #[serde(default)]
+    pub reset_credits: Vec<ResetCredit>,
+    /// The credit selected for redemption when multiple are available (Codex v0.144.0+).
+    pub selected_reset_credit: Option<ResetCredit>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollabSpawn {
     pub call_id: String,
@@ -136,6 +164,10 @@ pub struct CodexTurn {
     /// Items carry an optional version field (Codex v0.132.0+, PR #23148).
     /// Empty for sessions from older Codex versions.
     pub memories: Vec<MemorySummary>,
+    /// Rate-limit data from the most recent `token_count` event (Codex v0.144.0+, PR #30488).
+    /// Includes optional credit type, expiration, and selectable credit list.
+    /// Null for pre-v0.144.0 sessions or when the API returns no rate-limit data.
+    pub rate_limit_info: Option<RateLimitInfo>,
 }
 
 impl CodexTurn {
@@ -165,6 +197,7 @@ impl CodexTurn {
             forked_from_thread_id: None,
             compaction_meta: None,
             memories: Vec::new(),
+            rate_limit_info: None,
         }
     }
 }
@@ -566,6 +599,48 @@ fn handle_event_msg(
                                 model_context_window: u64_field(info, "model_context_window"),
                             });
                         }
+                    }
+                    // Codex v0.144.0 (PR #30488): rate_limits is a sibling of `info` on the
+                    // token_count payload. It carries optional type/expiration per reset credit
+                    // and a selectable list of credits. Null in older sessions.
+                    if let Some(rl) = payload.get("rate_limits").filter(|v| !v.is_null()) {
+                        turn.rate_limit_info = Some(RateLimitInfo {
+                            reset_at: rl
+                                .get("reset_at")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                            reset_credits: rl
+                                .get("reset_credits")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .map(|c| ResetCredit {
+                                            credit_type: c
+                                                .get("type")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_owned),
+                                            expiration: c
+                                                .get("expiration")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_owned),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            selected_reset_credit: rl
+                                .get("selected_reset_credit")
+                                .filter(|v| !v.is_null())
+                                .map(|c| ResetCredit {
+                                    credit_type: c
+                                        .get("type")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                    expiration: c
+                                        .get("expiration")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                }),
+                        });
                     }
                 }
             }
@@ -1495,6 +1570,108 @@ mod tests {
         assert_eq!(tokens.total_tokens, 40000);
         assert_eq!(tokens.context_window_tokens, Some(26000));
         assert_eq!(tokens.model_context_window, 100000);
+    }
+
+    // --- Codex v0.144.0 rate_limits tests (PR #30488) ---
+
+    #[test]
+    fn rate_limits_null_leaves_rate_limit_info_none() {
+        // Pre-v0.144.0 sessions emit rate_limits: null; must not populate rate_limit_info.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"s1","timestamp":"2026-07-01T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":1100},"model_context_window":128000},"rate_limits":null}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].rate_limit_info.is_none(),
+            "rate_limits:null must not populate rate_limit_info"
+        );
+    }
+
+    #[test]
+    fn rate_limits_absent_leaves_rate_limit_info_none() {
+        // Sessions that predate rate_limits entirely must not populate rate_limit_info.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"s2","timestamp":"2026-07-01T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550},"last_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550},"model_context_window":128000}}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].rate_limit_info.is_none(),
+            "absent rate_limits must not populate rate_limit_info"
+        );
+    }
+
+    #[test]
+    fn v0144_rate_limits_with_type_and_expiration_parsed() {
+        // Codex v0.144.0 (PR #30488): rate_limits gains credit type and expiration fields.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-12T10:00:00Z","type":"session_meta","payload":{"id":"s3","timestamp":"2026-07-12T10:00:00Z"}}"#,
+            r#"{"timestamp":"2026-07-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-12T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":2200},"last_token_usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":2200},"model_context_window":200000},"rate_limits":{"reset_at":"2026-07-13T00:00:00Z","reset_credits":[{"type":"subscription","expiration":null},{"type":"purchased","expiration":"2026-08-01T00:00:00Z"}],"selected_reset_credit":{"type":"purchased","expiration":"2026-08-01T00:00:00Z"}}}}"#,
+            r#"{"timestamp":"2026-07-12T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752314403.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let rl = turns[0]
+            .rate_limit_info
+            .as_ref()
+            .expect("rate_limit_info must be present for v0.144.0+ data");
+        assert_eq!(rl.reset_at.as_deref(), Some("2026-07-13T00:00:00Z"));
+        assert_eq!(rl.reset_credits.len(), 2);
+        assert_eq!(
+            rl.reset_credits[0].credit_type.as_deref(),
+            Some("subscription")
+        );
+        assert!(rl.reset_credits[0].expiration.is_none());
+        assert_eq!(
+            rl.reset_credits[1].credit_type.as_deref(),
+            Some("purchased")
+        );
+        assert_eq!(
+            rl.reset_credits[1].expiration.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+        let sel = rl
+            .selected_reset_credit
+            .as_ref()
+            .expect("selected_reset_credit must be present");
+        assert_eq!(sel.credit_type.as_deref(), Some("purchased"));
+        assert_eq!(sel.expiration.as_deref(), Some("2026-08-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn v0144_rate_limits_without_credits_array_parsed() {
+        // Tolerate rate_limits that carry reset_at but no reset_credits/selected_reset_credit.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-12T11:00:00Z","type":"session_meta","payload":{"id":"s4","timestamp":"2026-07-12T11:00:00Z"}}"#,
+            r#"{"timestamp":"2026-07-12T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-12T11:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110},"model_context_window":128000},"rate_limits":{"reset_at":"2026-07-13T00:00:00Z"}}}"#,
+            r#"{"timestamp":"2026-07-12T11:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752318003.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        let rl = turns[0]
+            .rate_limit_info
+            .as_ref()
+            .expect("rate_limit_info must be present");
+        assert_eq!(rl.reset_at.as_deref(), Some("2026-07-13T00:00:00Z"));
+        assert!(rl.reset_credits.is_empty());
+        assert!(rl.selected_reset_credit.is_none());
     }
 
     #[test]
