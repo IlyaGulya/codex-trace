@@ -1667,4 +1667,85 @@ mod tests {
         );
         assert!(!session.is_ongoing);
     }
+
+    // Codex v0.143.0 (PRs #29918, #30144): trailing realtime transcript text and terminal
+    // rollout events are now preserved during shutdown rather than dropped. Sessions written
+    // by v0.143.0+ include trailing unknown events between task_complete and session_end, and
+    // session_end is reliably written by an atexit handler even after crashes.
+
+    #[test]
+    fn v0143_trailing_transcript_and_reliable_session_end_parse_correctly() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-07-12T10-00-00-v0143trail.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-12T10:00:00Z","type":"session_meta","payload":{"id":"v0143-trail-session","timestamp":"2026-07-12T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v143-trail","arguments":"{\"cmd\":\"echo done\"}"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v143-trail","aggregated_output":"done\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":5000000}}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"All done.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752314405.0}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:06Z","type":"event_msg","payload":{"type":"realtime_transcript_text","text":"trailing output preserved by v0.143.0","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:07Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0143-trail-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
+        assert_eq!(
+            session.turns[0].tool_calls[0].output.as_deref(),
+            Some("done\n")
+        );
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("All done."),
+            "final_answer must be populated from agent_message before task_complete"
+        );
+        assert!(
+            !session.is_ongoing,
+            "session_end marker must close the session regardless of file freshness"
+        );
+    }
+
+    #[test]
+    fn v0143_session_end_without_task_complete_marks_turn_aborted() {
+        // v0.143.0 writes session_end via atexit handler even after a crash. If the process
+        // dies between task_started and task_complete, session_end appears without a preceding
+        // task_complete. The abrupt-cutoff workaround must fire and set status=Aborted.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-07-12T10-01-00-v0143crash.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-12T10:01:00Z","type":"session_meta","payload":{"id":"v0143-crash-session","timestamp":"2026-07-12T10:01:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v143-crash","arguments":"{\"cmd\":\"long-running-job\"}"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:03Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0143-crash-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].status,
+            TurnStatus::Aborted,
+            "session_end without task_complete must trigger abrupt-cutoff → Aborted"
+        );
+        assert!(
+            !session.is_ongoing,
+            "session_end marker must close the session regardless of turn state"
+        );
+    }
 }

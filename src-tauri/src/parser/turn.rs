@@ -736,6 +736,13 @@ fn handle_event_msg(
         // No turn-building semantics — silently skip.
         "token_budget_reminder" => {}
 
+        // Codex v0.143.0 (PRs #29918, #30144): trailing realtime transcript text and
+        // terminal rollout events are now preserved on shutdown rather than dropped.
+        // Any previously rare or unseen event types that appear at the tail of a session
+        // carry no turn-building semantics and are safely handled by the catch-all below.
+        // The is_ongoing / abrupt-cutoff heuristics in session.rs remain correct: sessions
+        // with session_end present are definitively closed regardless of file freshness,
+        // and sessions whose last turn received task_complete are never marked is_ongoing.
         _ => {}
     }
 }
