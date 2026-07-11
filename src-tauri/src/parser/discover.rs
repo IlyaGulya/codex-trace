@@ -42,6 +42,10 @@ pub struct CodexSessionInfo {
     /// true when the session has been archived via `codex archive` (Codex v0.136.0+).
     /// A trailing `session_archived` event sets this; a subsequent `session_unarchived` clears it.
     pub is_archived: bool,
+    /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+    /// Known values: "suggest" (old default), "auto-edit", "full-auto", "writes" (new in v0.144.0).
+    /// Null for sessions predating v0.144.0 or when the field is absent.
+    pub approval_mode: Option<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -156,6 +160,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         worker_role,
         ai_title,
         meta_archived,
+        approval_mode,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -198,6 +203,8 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .get("archived")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Codex v0.144.0 (PR #30482): ask_for_approval field in session_meta.
+            let approval_mode = opt_str(payload, "ask_for_approval");
             (
                 id,
                 start_time,
@@ -212,6 +219,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 worker_role,
                 ai_title,
                 meta_archived,
+                approval_mode,
             )
         }
         "session_meta_root" => {
@@ -224,7 +232,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false,
+                false, None,
             )
         }
         _ => return None,
@@ -459,6 +467,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         spawned_worker_ids,
         date_group,
         ai_title,
+        approval_mode,
     })
 }
 
@@ -1384,5 +1393,105 @@ mod tests {
         assert_eq!(session.cli_version.as_deref(), Some("0.140.0"));
         assert_eq!(session.cwd.as_deref(), Some("/project"));
         assert!(!session.is_ongoing, "completed session must not be ongoing");
+    }
+
+    #[test]
+    fn discover_sessions_v0144_writes_approval_mode_is_extracted() {
+        // Regression guard: Codex v0.144.0 (PR #30482) added a new "writes" approval mode.
+        // scan_session_file must populate approval_mode from ask_for_approval in session_meta.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-07-01T10-00-00-v0144writes.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-disc-writes","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","ask_for_approval":"writes"}}"#,
+                r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0144-disc-writes")
+            .expect("v0.144.0 writes session must be discovered");
+        assert_eq!(
+            session.approval_mode.as_deref(),
+            Some("writes"),
+            "ask_for_approval='writes' must be surfaced as approval_mode"
+        );
+        assert_eq!(session.cli_version.as_deref(), Some("0.144.0"));
+    }
+
+    #[test]
+    fn discover_sessions_v0144_known_approval_modes_are_all_extracted() {
+        // Verify all known ask_for_approval values are surfaced in CodexSessionInfo.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/02");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        for (mode, label) in &[
+            ("suggest", "suggest"),
+            ("auto-edit", "auto-edit"),
+            ("full-auto", "full-auto"),
+            ("writes", "writes"),
+        ] {
+            let path = day_dir.join(format!(
+                "rollout-2026-07-02T10-00-00-approval-{label}.jsonl"
+            ));
+            let meta = format!(
+                r#"{{"timestamp":"2026-07-02T10:00:00Z","type":"session_meta","payload":{{"id":"disc-approval-{label}","timestamp":"2026-07-02T10:00:00Z","ask_for_approval":"{mode}"}}}}"#,
+            );
+            let done = r#"{"timestamp":"2026-07-02T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
+            let end = r#"{"timestamp":"2026-07-02T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1751453902.0}}"#;
+            std::fs::write(&path, [meta.as_str(), done, end].join("\n")).unwrap();
+        }
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        for (mode, label) in &[
+            ("suggest", "suggest"),
+            ("auto-edit", "auto-edit"),
+            ("full-auto", "full-auto"),
+            ("writes", "writes"),
+        ] {
+            let session = sessions
+                .iter()
+                .find(|s| s.id == format!("disc-approval-{label}"))
+                .unwrap_or_else(|| panic!("session for approval mode '{mode}' must be discovered"));
+            assert_eq!(
+                session.approval_mode.as_deref(),
+                Some(*mode),
+                "approval_mode must be '{mode}' for ask_for_approval='{mode}'"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_sessions_pre_v0144_sessions_have_null_approval_mode() {
+        // Pre-v0.144.0 sessions have no ask_for_approval — approval_mode must be None.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/01/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-01-01T00-00-00-old.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old-disc-session","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1735689602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "old-disc-session")
+            .expect("old session must be discovered");
+        assert_eq!(
+            session.approval_mode, None,
+            "sessions without ask_for_approval must have approval_mode == None"
+        );
     }
 }

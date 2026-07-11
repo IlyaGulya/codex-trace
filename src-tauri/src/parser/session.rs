@@ -42,6 +42,10 @@ pub struct CodexSession {
     /// function_call_output for spawn_agent to be empty. When this is true, multi-agent
     /// subagent lineage is absent and users should set hide_spawn_agent_metadata = false.
     pub has_missing_spawn_metadata: bool,
+    /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+    /// Known values: "suggest" (old default), "auto-edit", "full-auto", "writes" (new in v0.144.0).
+    /// Null for sessions predating v0.144.0 or when the field is absent.
+    pub approval_mode: Option<String>,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -87,6 +91,7 @@ fn parse_session_inner(
         ai_title: None,
         is_headless: false,
         has_missing_spawn_metadata: false,
+        approval_mode: None,
     };
 
     // Parse session_meta from first matching entry
@@ -303,6 +308,9 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| opt_str(payload, "instructions"));
+    // Codex v0.144.0 (PR #30482): ask_for_approval field in session_meta.
+    // Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
+    session.approval_mode = opt_str(payload, "ask_for_approval");
 }
 
 fn parse_session_meta_root(session: &mut CodexSession, raw: &Value) {
@@ -1666,5 +1674,88 @@ mod tests {
             "message with internal_chat_message_metadata_passthrough must populate final_answer"
         );
         assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn v0144_writes_approval_mode_is_extracted_from_session_meta() {
+        // Regression guard: Codex v0.144.0 (PR #30482) added a new "writes" approval mode.
+        // parse_session must populate approval_mode from ask_for_approval in session_meta.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-07-01T10-00-00-v0144writes.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-writes-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","ask_for_approval":"writes"}}"#,
+                r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0144-writes-session");
+        assert_eq!(
+            session.approval_mode.as_deref(),
+            Some("writes"),
+            "ask_for_approval='writes' must be surfaced as approval_mode"
+        );
+        assert_eq!(session.cli_version.as_deref(), Some("0.144.0"));
+    }
+
+    #[test]
+    fn v0144_known_approval_modes_are_all_extracted() {
+        // Verify all known ask_for_approval values round-trip correctly.
+        let tmp = tempdir().unwrap();
+        for (mode, label) in &[
+            ("suggest", "suggest"),
+            ("auto-edit", "auto-edit"),
+            ("full-auto", "full-auto"),
+            ("writes", "writes"),
+        ] {
+            let path = tmp.path().join(format!(
+                "rollout-2026-07-01T10-00-00-approval-{label}.jsonl"
+            ));
+            let meta = format!(
+                r#"{{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{{"id":"sess-{label}","timestamp":"2026-07-01T10:00:00Z","ask_for_approval":"{mode}"}}}}"#,
+            );
+            let done = r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
+            let end = r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1751367602.0}}"#;
+            std::fs::write(&path, [meta.as_str(), done, end].join("\n")).unwrap();
+
+            let session = parse_session(&path).unwrap();
+            assert_eq!(
+                session.approval_mode.as_deref(),
+                Some(*mode),
+                "approval_mode must be '{mode}' for ask_for_approval='{mode}'"
+            );
+        }
+    }
+
+    #[test]
+    fn sessions_without_ask_for_approval_have_null_approval_mode() {
+        // Pre-v0.144.0 sessions have no ask_for_approval — approval_mode must be None.
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-01-01T00-00-00-no-approval.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old-session","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","cli_version":"0.130.0"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1735689602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(
+            session.approval_mode, None,
+            "sessions without ask_for_approval must have approval_mode == None"
+        );
     }
 }
