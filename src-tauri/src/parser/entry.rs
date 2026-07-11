@@ -1494,4 +1494,62 @@ mod tests {
         let msg_entry = RawEntry::parse(lines[2]).unwrap();
         assert_eq!(msg_entry.payload["metadata"]["turn_id"], "turn-1");
     }
+
+    // Codex v0.144.0 (PR #30482): new `writes` app-approval mode added.
+    // The `ask_for_approval` field in session_meta can now carry `"writes"`, which sits between
+    // the existing `"auto"` (never prompt) and the always-prompt policy — it allows declared
+    // read-only actions to proceed automatically while still prompting for write actions.
+    // The loosely-typed RawEntry model passes all session_meta fields through unchanged, so
+    // `ask_for_approval: "writes"` must parse without error and be accessible in the payload.
+    // Unknown future approval-mode values must also pass through (no strict enum validation).
+
+    #[test]
+    fn v0144_session_meta_with_ask_for_approval_writes_does_not_panic() {
+        let line = r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-writes-session","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai","ask_for_approval":"writes"}}"#;
+        let e =
+            RawEntry::parse(line).expect("session_meta with ask_for_approval=writes must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["id"], "v0144-writes-session");
+        assert_eq!(e.payload["cli_version"], "0.144.0");
+        // ask_for_approval is passed through as an opaque string — no enum validation.
+        assert_eq!(e.payload["ask_for_approval"], "writes");
+    }
+
+    #[test]
+    fn v0144_session_meta_unknown_ask_for_approval_value_is_tolerated() {
+        // Future approval-mode values must not break parsing — the field is always passthrough.
+        let line = r#"{"timestamp":"2026-07-10T10:01:00Z","type":"session_meta","payload":{"id":"v0144-future-mode","timestamp":"2026-07-10T10:01:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai","ask_for_approval":"reads-only-future-mode"}}"#;
+        let e = RawEntry::parse(line)
+            .expect("session_meta with unknown ask_for_approval value must parse");
+        assert_eq!(e.entry_type, "session_meta");
+        assert_eq!(e.payload["ask_for_approval"], "reads-only-future-mode");
+    }
+
+    #[test]
+    fn v0144_all_standard_entry_types_parse_correctly() {
+        // Regression guard: all standard JSONL entry types from a v0.144.0 session must parse.
+        // session_meta carries ask_for_approval; other entry types are unchanged.
+        let lines = [
+            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai","ask_for_approval":"writes"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752142804.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.144.0");
+        assert_eq!(meta.payload["id"], "v0144-session");
+        assert_eq!(meta.payload["ask_for_approval"], "writes");
+    }
 }

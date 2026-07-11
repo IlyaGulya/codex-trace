@@ -3990,4 +3990,29 @@ mod tests {
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
+
+    // Codex v0.144.0 (PR #30482): new `writes` app-approval mode added.
+    // When a session is started with `--ask-for-approval writes`, the session_meta payload
+    // carries `ask_for_approval: "writes"`. The turn-builder must parse such sessions
+    // without error; existing turn fields (model, reasoning_effort, memories) are unaffected.
+
+    #[test]
+    fn v0144_ask_for_approval_writes_in_session_does_not_break_turn_parsing() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-writes","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai","ask_for_approval":"writes"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project","effort":"high"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done."}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752142804.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+        assert_eq!(turn.reasoning_effort.as_deref(), Some("high"));
+        // ask_for_approval on session_meta does not surface on CodexTurn (it is session-level config).
+        assert_eq!(turn.final_answer.as_deref(), Some("Done."));
+    }
 }
