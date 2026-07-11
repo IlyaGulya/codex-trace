@@ -1630,6 +1630,48 @@ mod tests {
         assert!(!session.is_ongoing);
     }
 
+    // Codex v0.144.0 (PR #31494): paste-triggered TUI corruption fixed.
+    // Sessions captured before v0.144.0 may contain JSONL lines where pasted terminal
+    // control sequences were embedded unescaped in JSON strings, producing invalid JSON.
+    // parse_session must skip those lines via filter_map(RawEntry::parse) and successfully
+    // return the turns built from the remaining valid entries.
+
+    #[test]
+    fn v0144_session_with_corrupted_line_skips_bad_entry_and_returns_valid_turns() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-07-01T10-00-00-v0144corrupt.jsonl");
+        // Embed a literal ESC byte (U+001B) inside a JSON string to simulate the
+        // pre-v0.144.0 paste corruption. The surrounding valid lines must still produce
+        // a complete turn.
+        let esc = '\x1b';
+        let corrupted_user_msg = format!(
+            r#"{{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{{"type":"user_message","content":"pasted: {}[31m red text"}}}}"#,
+            esc
+        );
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-corrupt-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            corrupted_user_msg.as_str(),
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751414404.0}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0144-corrupt-session");
+        // Corrupted user_message line is silently skipped; the turn is still captured
+        // from task_started / task_complete boundaries.
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("Done"),
+            "final_answer must be populated from the valid response_item after the corrupted line"
+        );
+        assert!(!session.is_ongoing);
+    }
+
     // Codex v0.142.0 (PR #28968): `metadata` on chat message response_items renamed to
     // `internal_chat_message_metadata_passthrough`. Sessions written by v0.142.0+ must parse
     // correctly; final_answer must still be populated from `content`, not the metadata field.

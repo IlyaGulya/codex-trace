@@ -1551,4 +1551,41 @@ mod tests {
         assert_eq!(meta.payload["cli_version"], "0.144.0");
         assert_eq!(meta.payload["id"], "v0144-session");
     }
+
+    // Codex v0.144.0 (PR #31494): paste-triggered TUI corruption fixed.
+    // Sessions captured before v0.144.0 may contain JSONL lines where pasted terminal
+    // control sequences (e.g. ESC = U+001B) were embedded unescaped inside JSON strings,
+    // producing syntactically invalid JSON. RawEntry::parse must return None for such lines
+    // so callers using filter_map can skip them without panicking.
+
+    #[test]
+    fn v0144_corrupted_line_with_unescaped_control_sequence_returns_none() {
+        // Simulate a line corrupted by a pasted ESC sequence before Codex v0.144.0 fixed
+        // the paste handling. The literal ESC byte (U+001B) inside a JSON string makes
+        // the line invalid JSON — serde_json rejects it, so parse returns None.
+        let esc = '\x1b';
+        let corrupted = format!(
+            r#"{{"timestamp":"2026-07-01T10:00:00Z","type":"event_msg","payload":{{"type":"user_message","content":"pasted: {}[31m red"}}}}"#,
+            esc
+        );
+        assert!(
+            RawEntry::parse(&corrupted).is_none(),
+            "line with unescaped control sequence must return None"
+        );
+    }
+
+    #[test]
+    fn v0144_well_formed_line_adjacent_to_corrupted_line_still_parses() {
+        // Verify that a well-formed entry in the same pre-v0.144.0 session parses
+        // correctly even when a neighboring line is corrupted. The caller (filter_map)
+        // skips None results, so only the corrupted entry is lost.
+        let well_formed = r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751414401.0}}"#;
+        let entry = RawEntry::parse(well_formed)
+            .expect("well-formed line adjacent to corrupted entry must still parse");
+        assert_eq!(entry.entry_type, "event_msg");
+        assert_eq!(
+            entry.payload.get("type").and_then(|t| t.as_str()),
+            Some("task_complete")
+        );
+    }
 }

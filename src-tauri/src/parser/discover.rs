@@ -1385,4 +1385,46 @@ mod tests {
         assert_eq!(session.cwd.as_deref(), Some("/project"));
         assert!(!session.is_ongoing, "completed session must not be ongoing");
     }
+
+    #[test]
+    fn v0144_discover_session_with_corrupted_line_reports_correct_turn_count() {
+        // Codex v0.144.0 (PR #31494): paste-triggered TUI corruption fixed.
+        // Sessions captured before v0.144.0 may contain JSONL lines where pasted terminal
+        // control sequences (e.g. ESC = U+001B) were embedded unescaped in JSON strings,
+        // producing syntactically invalid JSON. scan_session_file must skip those lines via
+        // the `Err(_) => continue` branch in the JSON-parse loop and still return the correct
+        // turn count and session metadata from the surrounding valid entries.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-07-01T10-00-00-v0144corrupt.jsonl");
+        let esc = '\x1b';
+        let corrupted_user_msg = format!(
+            r#"{{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{{"type":"user_message","content":"pasted: {}[31m red text"}}}}"#,
+            esc
+        );
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-disc-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                corrupted_user_msg.as_str(),
+                r#"{"timestamp":"2026-07-01T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+                r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751414404.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0144-disc-session")
+            .expect("session with corrupted line must still be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.143.0"));
+        assert_eq!(
+            session.turn_count, 1,
+            "corrupted line must not affect turn count — valid task_started/task_complete pair counts as 1 turn"
+        );
+        assert!(!session.is_ongoing, "completed session must not be ongoing");
+    }
 }
