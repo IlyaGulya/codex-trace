@@ -11,6 +11,7 @@ const TOKEN_INFO: TokenInfo = {
   total_tokens: 1500,
   context_window_tokens: 1500,
   model_context_window: 8000,
+  rate_limits: null,
 };
 
 function makeSession(overrides: Partial<CodexSession> = {}): CodexSession {

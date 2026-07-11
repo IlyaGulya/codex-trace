@@ -4,6 +4,20 @@ export interface GitInfo {
   repository_url?: string;
 }
 
+/** Codex v0.144.0 (PR #30488): a single selectable usage-limit reset credit entry. */
+export interface RateLimitCredit {
+  /** Credit category (e.g. "monthly", "trial"). Null when absent. */
+  type: string | null;
+  /** ISO-8601 expiration timestamp for this credit. Null when absent. */
+  expiration: string | null;
+}
+
+/** Codex v0.144.0 (PR #30488): rate-limit reset credit data from `token_count` events. */
+export interface RateLimitsInfo {
+  /** Selectable credit options. Empty for pre-v0.144.0 sessions. */
+  credits: RateLimitCredit[];
+}
+
 export interface TokenInfo {
   input_tokens: number;
   cached_input_tokens: number;
@@ -12,6 +26,8 @@ export interface TokenInfo {
   total_tokens: number;
   context_window_tokens: number | null;
   model_context_window: number;
+  /** Codex v0.144.0 (PR #30488): rate-limit reset credit data from the same token_count event. Null for pre-v0.144.0 sessions. */
+  rate_limits: RateLimitsInfo | null;
 }
 
 export interface AgentMessage {

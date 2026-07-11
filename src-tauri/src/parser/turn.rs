@@ -30,6 +30,26 @@ pub struct AgentMsg {
     pub order: usize,
 }
 
+/// Codex v0.144.0 (PR #30488): a single selectable usage-limit reset credit entry.
+/// Carries the credit category and expiration timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitCredit {
+    /// Credit category (e.g. "monthly", "trial"). Null when absent.
+    #[serde(rename = "type")]
+    pub credit_type: Option<String>,
+    /// ISO-8601 expiration timestamp for this credit. Null when absent.
+    pub expiration: Option<String>,
+}
+
+/// Codex v0.144.0 (PR #30488): rate-limit reset credit data from `token_count` events.
+/// Extended to carry type/expiration info and support multiple selectable credits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitsInfo {
+    /// Selectable credit options. Empty for pre-v0.144.0 sessions.
+    #[serde(default)]
+    pub credits: Vec<RateLimitCredit>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub input_tokens: u64,
@@ -39,6 +59,9 @@ pub struct TokenInfo {
     pub total_tokens: u64,
     pub context_window_tokens: Option<u64>,
     pub model_context_window: u64,
+    /// Codex v0.144.0 (PR #30488): rate-limit reset credit data from the same `token_count`
+    /// event. Null when the field is absent or null (pre-v0.144.0 sessions).
+    pub rate_limits: Option<RateLimitsInfo>,
 }
 
 /// A single memory summary item from a `turn_context` memories payload.
@@ -492,6 +515,7 @@ fn handle_event_msg(
                             total_tokens,
                             context_window_tokens: None,
                             model_context_window: 0,
+                            rate_limits: None,
                         });
                     }
                 }
@@ -580,6 +604,33 @@ fn handle_event_msg(
         "token_count" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
+                    // Codex v0.144.0 (PR #30488): rate_limits now carries type/expiration per
+                    // credit and supports multiple selectable credits. Null in older sessions.
+                    let rate_limits =
+                        payload
+                            .get("rate_limits")
+                            .filter(|v| !v.is_null())
+                            .map(|v| {
+                                let credits = v
+                                    .get("credits")
+                                    .and_then(|c| c.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .map(|item| RateLimitCredit {
+                                                credit_type: item
+                                                    .get("type")
+                                                    .and_then(|t| t.as_str())
+                                                    .map(str::to_owned),
+                                                expiration: item
+                                                    .get("expiration")
+                                                    .and_then(|e| e.as_str())
+                                                    .map(str::to_owned),
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                RateLimitsInfo { credits }
+                            });
                     if let Some(info) = payload.get("info").filter(|v| !v.is_null()) {
                         if let Some(total) = info.get("total_token_usage") {
                             let context_window_tokens = info
@@ -597,6 +648,7 @@ fn handle_event_msg(
                                 total_tokens: u64_field(total, "total_tokens"),
                                 context_window_tokens,
                                 model_context_window: u64_field(info, "model_context_window"),
+                                rate_limits,
                             });
                         }
                     }
@@ -4166,5 +4218,81 @@ mod tests {
         assert_eq!(turn.tool_calls[0].name, "exec_command");
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
         assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.144.0 (PR #30488): token_count events now carry rate_limits with type and
+    // expiration on reset credits, and support multiple selectable credits.
+
+    #[test]
+    fn v0144_token_count_null_rate_limits_parsed_without_error() {
+        let lines = [
+            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-rl-null","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":10500},"last_token_usage":{"input_tokens":10000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":10500},"model_context_window":128000},"rate_limits":null}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752141603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let tokens = turns[0].total_tokens.as_ref().expect("token info present");
+        assert_eq!(tokens.total_tokens, 10500);
+        assert!(
+            tokens.rate_limits.is_none(),
+            "null rate_limits must remain None"
+        );
+    }
+
+    #[test]
+    fn v0144_token_count_rate_limits_with_typed_credits_parsed() {
+        let lines = [
+            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-rl-credits","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":5000,"output_tokens":1000,"reasoning_output_tokens":200,"total_tokens":21000},"last_token_usage":{"input_tokens":20000,"cached_input_tokens":5000,"output_tokens":1000,"reasoning_output_tokens":200,"total_tokens":21000},"model_context_window":200000},"rate_limits":{"credits":[{"type":"monthly","expiration":"2026-08-01T00:00:00Z"},{"type":"trial","expiration":"2026-07-20T00:00:00Z"}]}}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752141603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let tokens = turns[0].total_tokens.as_ref().expect("token info present");
+        assert_eq!(tokens.total_tokens, 21000);
+        let rl = tokens.rate_limits.as_ref().expect("rate_limits present");
+        assert_eq!(rl.credits.len(), 2);
+        assert_eq!(rl.credits[0].credit_type.as_deref(), Some("monthly"));
+        assert_eq!(
+            rl.credits[0].expiration.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+        assert_eq!(rl.credits[1].credit_type.as_deref(), Some("trial"));
+        assert_eq!(
+            rl.credits[1].expiration.as_deref(),
+            Some("2026-07-20T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn v0144_token_count_rate_limits_with_unknown_extra_fields_tolerated() {
+        // Verify that unexpected fields within rate_limits do not panic or error.
+        let lines = [
+            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-rl-extra","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":5300},"last_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":5300},"model_context_window":128000},"rate_limits":{"credits":[{"type":"monthly","expiration":"2026-08-01T00:00:00Z","future_field":"ignored","another_new":42}],"top_level_new_field":"also_ignored"}}}"#,
+            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752141603.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let tokens = turns[0].total_tokens.as_ref().expect("token info present");
+        let rl = tokens.rate_limits.as_ref().expect("rate_limits present");
+        assert_eq!(rl.credits.len(), 1);
+        assert_eq!(rl.credits[0].credit_type.as_deref(), Some("monthly"));
     }
 }

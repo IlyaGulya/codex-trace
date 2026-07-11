@@ -11,6 +11,7 @@ const TOKEN_INFO: TokenInfo = {
   total_tokens: 40_000,
   context_window_tokens: 26_000,
   model_context_window: 100_000,
+  rate_limits: null,
 };
 
 const FINAL_MSG: AgentMessage = {
