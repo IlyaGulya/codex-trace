@@ -736,6 +736,14 @@ fn handle_event_msg(
         // No turn-building semantics — silently skip.
         "token_budget_reminder" => {}
 
+        // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication
+        // by default, without requiring an experimental opt-in flag. Sessions with MCP tools
+        // that need auth emit these events during the OAuth / API-key handshake.
+        // codex-trace does not model MCP auth state — these events carry no turn-building
+        // semantics and are explicitly skipped so ordinary sessions with auth flows parse
+        // without corrupting turn data.
+        "mcp_auth_request" | "mcp_auth_result" => {}
+
         _ => {}
     }
 }
@@ -3988,6 +3996,70 @@ mod tests {
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "exec_command");
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication by
+    // default (no longer behind an experimental flag). Sessions that include MCP auth flows
+    // emit mcp_auth_request and mcp_auth_result event_msg entries. These must be skipped
+    // without corrupting turn data.
+
+    #[test]
+    fn v0144_mcp_auth_events_do_not_corrupt_turn_data() {
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-turns","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:06Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"get_repo","arguments":{"owner":"openai","repo":"codex"}}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:07Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":"Repository info..."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360408.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "auth events must not create synthetic turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(
+            turn.tool_calls.len(),
+            1,
+            "MCP tool call must survive auth events intact"
+        );
+        assert_eq!(turn.tool_calls[0].name, "get_repo");
+        assert_eq!(
+            turn.tool_calls[0].output.as_deref(),
+            Some("Repository info...")
+        );
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0144_mcp_auth_request_failed_result_does_not_corrupt_turn_data() {
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-fail","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"slack","call_id":"auth-2","auth_url":"https://slack.com/oauth/v2/authorize","instructions":"Authenticate with Slack."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"slack","call_id":"auth-2","status":"failed","error":"User cancelled authentication"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360404.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "auth events must not create synthetic turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 0);
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 }
