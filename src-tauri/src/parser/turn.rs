@@ -3997,4 +3997,93 @@ mod tests {
         assert_eq!(turn.tool_calls[0].output.as_deref(), Some("ok\n"));
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
+
+    // Codex v0.143.0 (PRs #29918, #30144): trailing transcript text and terminal rollout
+    // events are now preserved in the session file after shutdown rather than being dropped.
+    // The parser must handle these gracefully without creating phantom tool calls or
+    // changing the completed turn's status.
+
+    #[test]
+    fn v0143_trailing_agent_message_after_task_complete_does_not_change_turn_status() {
+        // agent_message events emitted after task_complete (realtime transcript flush)
+        // must be absorbed without altering the turn's Completed status or final_answer.
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0143-trailing-msg","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Final answer here"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000003.0}}"#,
+            // Trailing agent_message preserved by v0.143.0 shutdown fix
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-1","message":"trailing flush"}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        // Status must remain Complete — task_complete already fired
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        // The final_answer captured before task_complete must be preserved
+        assert_eq!(turn.final_answer.as_deref(), Some("Final answer here"));
+        // No spurious tool calls
+        assert_eq!(turn.tool_calls.len(), 0);
+    }
+
+    #[test]
+    fn v0143_terminal_rollout_end_event_without_call_id_does_not_create_phantom_tool_call() {
+        // v0.143.0 emits non-tool-call rollout events ending in `_end` (e.g.
+        // `transcript_flush_end`) that carry no call_id and have no pending call.
+        // They must be silently discarded — not turned into phantom Unknown ToolCalls.
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0143-rollout-end","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Done"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000003.0}}"#,
+            // Terminal rollout event: ends in `_end`, no call_id — must not create a phantom ToolCall
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"transcript_flush_end","turn_id":"turn-1"}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        // No phantom tool calls — the rollout end event must be discarded
+        assert_eq!(turn.tool_calls.len(), 0);
+    }
+
+    #[test]
+    fn v0143_full_tail_sequence_produces_correct_state() {
+        // A fully-populated v0.143.0 session tail: real tool call + task_complete +
+        // trailing transcript text + terminal rollout end event. All rollout events
+        // must be absorbed without corrupting the turn's tool list or status.
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0143-full-tail","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"file.txt\n"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","turn_id":"turn-1","exit_code":0,"duration_secs":0.1}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Here are your files"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751000006.0}}"#,
+            // Trailing events preserved by v0.143.0
+            r#"{"timestamp":"2026-07-01T10:00:07Z","type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-1","message":"flush"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:08Z","type":"event_msg","payload":{"type":"transcript_flush_end","turn_id":"turn-1"}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        // Exactly one real tool call — no phantom from transcript_flush_end
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "exec_command");
+        assert_eq!(turn.tool_calls[0].output.as_deref(), Some("file.txt\n"));
+        assert_eq!(turn.final_answer.as_deref(), Some("Here are your files"));
+    }
 }
