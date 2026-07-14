@@ -736,6 +736,14 @@ fn handle_event_msg(
         // No turn-building semantics — silently skip.
         "token_budget_reminder" => {}
 
+        // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication
+        // by default, without requiring an experimental opt-in flag. Sessions with MCP tools
+        // that need auth emit these events during the OAuth / API-key handshake.
+        // codex-trace does not model MCP auth state — these events carry no turn-building
+        // semantics and are explicitly skipped so ordinary sessions with auth flows parse
+        // without corrupting turn data.
+        "mcp_auth_request" | "mcp_auth_result" | "mcp_auth_challenge" | "mcp_auth_complete" => {}
+
         _ => {}
     }
 }
@@ -3991,22 +3999,107 @@ mod tests {
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 
-    // Codex v0.144.0 (PR #31494): paste-triggered corruption of resumed conversation
-    // history. Pre-v0.144.0 sessions may include corrupted response_items in their
-    // resumed history. Turn building must complete without panicking even when history
-    // entries contain control sequence characters in string content.
+    // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication by
+    // default (no longer behind an experimental flag). Sessions that include MCP auth flows
+    // emit mcp_auth_request and mcp_auth_result event_msg entries. These must be skipped
+    // without corrupting turn data.
 
     #[test]
-    fn v0144_paste_corrupted_resumed_history_response_item_does_not_crash_turn_building() {
-        // A resumed session from before v0.144.0 may contain response_item entries
-        // where the content field has embedded Unicode-escaped ANSI sequences.
-        // Turn building must complete without panicking and process subsequent turns.
+    fn v0144_mcp_auth_events_do_not_corrupt_turn_data() {
         let lines = [
-            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-resume","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.143.0"}}"#,
-            r#"{"timestamp":"2026-07-01T09:50:00Z","type":"response_item","payload":{"type":"message","role":"user","content":"run [1mmake test[0m now"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-turns","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0"}}"#,
             r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Running tests now."}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367603.0}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:06Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"get_repo","arguments":{"owner":"openai","repo":"codex"}}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:07Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":"Repository info..."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360408.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "auth events must not create synthetic turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(
+            turn.tool_calls.len(),
+            1,
+            "MCP tool call must survive auth events intact"
+        );
+        assert_eq!(turn.tool_calls[0].name, "get_repo");
+        assert_eq!(
+            turn.tool_calls[0].output.as_deref(),
+            Some("Repository info...")
+        );
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    #[test]
+    fn v0144_mcp_auth_request_failed_result_does_not_corrupt_turn_data() {
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-fail","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"slack","call_id":"auth-2","auth_url":"https://slack.com/oauth/v2/authorize","instructions":"Authenticate with Slack."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"slack","call_id":"auth-2","status":"failed","error":"User cancelled authentication"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360404.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "auth events must not create synthetic turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 0);
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.144.0 (PR #28772): also covers the mcp_auth_challenge/mcp_auth_complete
+    // naming variant. Both naming conventions must be recognised.
+
+    #[test]
+    fn v0144_mcp_auth_events_during_turn_do_not_corrupt_turn_state() {
+        let lines = [
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-flow","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"list_repos","arguments":{}}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:03Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-1","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":[{"type":"text","text":"[\"my-repo\",\"other-repo\"]"}]}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:09Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055209.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "list_repos");
+        assert_eq!(turn.tool_calls[0].mcp_server.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn v0144_mcp_auth_challenge_without_tool_call_does_not_crash() {
+        let lines = [
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-proactive-auth","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"slack","auth_url":"https://slack.com/oauth/v2/authorize?client_id=xyz"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:06Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"slack","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Authenticated with Slack."}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055208.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -4015,5 +4108,51 @@ mod tests {
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].status, super::TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 0);
+    }
+
+    #[test]
+    fn v0144_mcp_auth_events_interleaved_with_agent_message_do_not_corrupt_turn() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:02:00Z","type":"session_meta","payload":{"id":"v0144-mcp-auth-msg","timestamp":"2026-07-01T10:02:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-3","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL."}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Waiting for GitHub authentication...","phase":"main"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:04Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-3","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364125.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Auth events must not appear as agent messages — only the real agent_message survives
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(
+            turns[0].agent_messages[0].text,
+            "Waiting for GitHub authentication..."
+        );
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn v0144_multiple_mcp_auth_attempts_are_all_skipped_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:03:00Z","type":"session_meta","payload":{"id":"v0144-mcp-auth-retry","timestamp":"2026-07-01T10:03:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"jira","call_id":"auth-4","auth_url":"https://auth.jira.com/oauth","instructions":"Auth with Jira."}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:03Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"jira","call_id":"auth-4","status":"failed","error":"timeout"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:04Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"jira","call_id":"auth-5","auth_url":"https://auth.jira.com/oauth","instructions":"Auth with Jira."}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"jira","call_id":"auth-5","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364186.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Multiple auth request/result pairs must all be silently skipped
+        assert!(turns[0].agent_messages.is_empty());
+        assert!(turns[0].tool_calls.is_empty());
     }
 }

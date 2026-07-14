@@ -33,6 +33,7 @@ function makeSession(overrides: Partial<CodexSession> = {}): CodexSession {
     is_headless: false,
     has_missing_spawn_metadata: false,
     is_archived: false,
+    approval_mode: null,
     ...overrides,
   };
 }

@@ -178,6 +178,7 @@ mod tests {
                     spawned_worker_ids: vec![],
                     date_group: String::new(),
                     ai_title: None,
+                    approval_mode: None,
                 }],
             });
         }
@@ -223,6 +224,7 @@ mod tests {
                     spawned_worker_ids: vec![],
                     date_group: String::new(),
                     ai_title: None,
+                    approval_mode: None,
                 }],
             });
         }

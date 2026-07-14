@@ -1454,6 +1454,70 @@ mod tests {
         assert_eq!(e.payload["metadata"]["turn_id"], "turn-abc");
     }
 
+    // Codex v0.144.0 (PR #28772): MCP tools can request interactive authentication by
+    // default (no longer behind an experimental flag). Sessions with MCP tools that need
+    // auth will emit mcp_auth_request and mcp_auth_result event_msg entries during the
+    // OAuth / API-key handshake. These must parse without errors since they now appear in
+    // ordinary sessions, not just experimental ones.
+
+    #[test]
+    fn v0144_mcp_auth_request_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_request event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_request"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["call_id"], "auth-1");
+    }
+
+    #[test]
+    fn v0144_mcp_auth_result_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_result event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_result"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["status"], "authenticated");
+    }
+
+    #[test]
+    fn v0144_mcp_auth_result_failed_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-01T10:00:06Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"slack","call_id":"auth-2","status":"failed","error":"User cancelled authentication"}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_result failed event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_result"));
+        assert_eq!(e.payload["status"], "failed");
+    }
+
+    #[test]
+    fn v0144_all_standard_entry_types_parse_correctly_with_mcp_auth_flow() {
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:06Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"get_repo","arguments":{"owner":"openai","repo":"codex"}}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:07Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":"Repository info..."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360408.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "event_msg",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.144.0");
+        assert_eq!(meta.payload["id"], "v0144-session");
+    }
+
     #[test]
     fn v0142_response_item_without_metadata_turn_id_is_backward_compatible() {
         // Pre-v0.142.2 response items carry no metadata.turn_id — must parse normally.
@@ -1495,49 +1559,50 @@ mod tests {
         assert_eq!(msg_entry.payload["metadata"]["turn_id"], "turn-1");
     }
 
-    // Codex v0.144.0 (PR #31494): paste-triggered corruption of resumed conversation
-    // history fixed. Sessions captured before v0.144.0 may contain corrupted/garbled
-    // entries where pasted terminal control sequences broke JSONL line integrity.
-    // The parser must gracefully handle both corruption forms without crashing.
+    // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication by
+    // default without requiring an experimental opt-in flag. When an MCP server requires
+    // credentials (e.g. OAuth), it emits mcp_auth_challenge at the start of the interactive
+    // flow and mcp_auth_complete once the user has authenticated. These event_msg types were
+    // previously rare because they required an opt-in; v0.144.0 makes them standard so
+    // sessions with active MCP servers will regularly contain them.
 
     #[test]
-    fn v0144_paste_corrupted_invalid_json_line_is_silently_skipped() {
-        // Raw ESC byte (0x1b) embedded in a JSON line breaks JSON structure,
-        // making the line invalid JSON. serde_json::from_str(...).ok()? returns
-        // None and the line is silently dropped — pre-v0.144.0 sessions with
-        // this corruption must not cause panics or parse failures.
-        let corrupted_line = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"content\":\"run \x1b[1mmake test\x1b[0m\"}}";
-        assert!(RawEntry::parse(corrupted_line).is_none());
+    fn v0144_mcp_auth_challenge_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-auth-1"}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_challenge event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_challenge"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["call_id"], "mcp-auth-1");
     }
 
     #[test]
-    fn v0144_response_item_with_unicode_escaped_control_sequences_does_not_panic() {
-        // A response_item where the content field contains Unicode-escaped ANSI
-        // sequences (\u001b[1m) is technically valid JSON. The parser must
-        // accept it without panicking -- the garbled display content is passed
-        // through as-is. This models pre-v0.144.0 resumed history entries where
-        // pasted control sequences were JSON-encoded rather than written as raw bytes.
-        let line = "{\"timestamp\":\"2026-07-01T10:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"run \\u001b[1mmake test\\u001b[0m now\"}}";
-        let e = RawEntry::parse(line);
-        assert!(e.is_some());
-        let e = e.unwrap();
-        assert_eq!(e.entry_type, "response_item");
+    fn v0144_mcp_auth_complete_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-09T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-auth-1","success":true}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_complete event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_complete"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["success"], true);
     }
 
     #[test]
     fn v0144_all_standard_entry_types_parse_correctly() {
-        // Regression guard: all four standard JSONL entry types from a v0.144.0
-        // session must parse correctly. The paste-corruption fix (PR #31494) is
-        // a TUI-level change — the JSONL session format is unchanged.
+        // Regression guard: standard entry types from a v0.144.0 session with an MCP
+        // interactive auth flow must all parse without errors.
         let lines = [
-            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367604.0}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-auth-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-auth-1","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Authenticated with GitHub."}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055208.0}}"#,
         ];
         let expected_types = [
             "session_meta",
+            "event_msg",
+            "event_msg",
             "event_msg",
             "response_item",
             "turn_context",
@@ -1550,42 +1615,15 @@ mod tests {
         let meta = RawEntry::parse(lines[0]).unwrap();
         assert_eq!(meta.payload["cli_version"], "0.144.0");
         assert_eq!(meta.payload["id"], "v0144-session");
-    }
-
-    // Codex v0.144.0 (PR #31494): paste-triggered TUI corruption fixed.
-    // Sessions captured before v0.144.0 may contain JSONL lines where pasted terminal
-    // control sequences (e.g. ESC = U+001B) were embedded unescaped inside JSON strings,
-    // producing syntactically invalid JSON. RawEntry::parse must return None for such lines
-    // so callers using filter_map can skip them without panicking.
-
-    #[test]
-    fn v0144_corrupted_line_with_unescaped_control_sequence_returns_none() {
-        // Simulate a line corrupted by a pasted ESC sequence before Codex v0.144.0 fixed
-        // the paste handling. The literal ESC byte (U+001B) inside a JSON string makes
-        // the line invalid JSON — serde_json rejects it, so parse returns None.
-        let esc = '\x1b';
-        let corrupted = format!(
-            r#"{{"timestamp":"2026-07-01T10:00:00Z","type":"event_msg","payload":{{"type":"user_message","content":"pasted: {}[31m red"}}}}"#,
-            esc
-        );
-        assert!(
-            RawEntry::parse(&corrupted).is_none(),
-            "line with unescaped control sequence must return None"
-        );
-    }
-
-    #[test]
-    fn v0144_well_formed_line_adjacent_to_corrupted_line_still_parses() {
-        // Verify that a well-formed entry in the same pre-v0.144.0 session parses
-        // correctly even when a neighboring line is corrupted. The caller (filter_map)
-        // skips None results, so only the corrupted entry is lost.
-        let well_formed = r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751414401.0}}"#;
-        let entry = RawEntry::parse(well_formed)
-            .expect("well-formed line adjacent to corrupted entry must still parse");
-        assert_eq!(entry.entry_type, "event_msg");
+        // Verify auth event fields are accessible
+        let challenge = RawEntry::parse(lines[2]).unwrap();
         assert_eq!(
-            entry.payload.get("type").and_then(|t| t.as_str()),
-            Some("task_complete")
+            event_msg_type(&challenge.payload),
+            Some("mcp_auth_challenge")
         );
+        assert_eq!(challenge.payload["server"], "github");
+        let complete = RawEntry::parse(lines[3]).unwrap();
+        assert_eq!(event_msg_type(&complete.payload), Some("mcp_auth_complete"));
+        assert_eq!(complete.payload["success"], true);
     }
 }

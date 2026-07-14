@@ -177,6 +177,10 @@ export interface CodexSession {
   has_missing_spawn_metadata: boolean;
   /** true when the session has been archived via `codex archive` (Codex v0.136.0+). */
   is_archived: boolean;
+  /** Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+   * Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
+   * Null for sessions predating v0.144.0 or when the field is absent. */
+  approval_mode: string | null;
 }
 
 export interface CodexSessionInfo {
@@ -206,6 +210,10 @@ export interface CodexSessionInfo {
   is_headless: boolean;
   /** true when the session has been archived via `codex archive` (Codex v0.136.0+). */
   is_archived: boolean;
+  /** Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+   * Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
+   * Null for sessions predating v0.144.0 or when the field is absent. */
+  approval_mode: string | null;
 }
 
 export interface SettingsResponse {
