@@ -42,10 +42,6 @@ pub struct CodexSession {
     /// function_call_output for spawn_agent to be empty. When this is true, multi-agent
     /// subagent lineage is absent and users should set hide_spawn_agent_metadata = false.
     pub has_missing_spawn_metadata: bool,
-    /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
-    /// Known values: "suggest" (old default), "auto-edit", "full-auto", "writes" (new in v0.144.0).
-    /// Null for sessions predating v0.144.0 or when the field is absent.
-    pub approval_mode: Option<String>,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -91,7 +87,6 @@ fn parse_session_inner(
         ai_title: None,
         is_headless: false,
         has_missing_spawn_metadata: false,
-        approval_mode: None,
     };
 
     // Parse session_meta from first matching entry
@@ -308,9 +303,6 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| opt_str(payload, "instructions"));
-    // Codex v0.144.0 (PR #30482): ask_for_approval field in session_meta.
-    // Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
-    session.approval_mode = opt_str(payload, "ask_for_approval");
 }
 
 fn parse_session_meta_root(session: &mut CodexSession, raw: &Value) {
@@ -1676,86 +1668,84 @@ mod tests {
         assert!(!session.is_ongoing);
     }
 
+    // Codex v0.143.0 (PRs #29918, #30144): trailing realtime transcript text and terminal
+    // rollout events are now preserved during shutdown rather than dropped. Sessions written
+    // by v0.143.0+ include trailing unknown events between task_complete and session_end, and
+    // session_end is reliably written by an atexit handler even after crashes.
+
     #[test]
-    fn v0144_writes_approval_mode_is_extracted_from_session_meta() {
-        // Regression guard: Codex v0.144.0 (PR #30482) added a new "writes" approval mode.
-        // parse_session must populate approval_mode from ask_for_approval in session_meta.
+    fn v0143_trailing_transcript_and_reliable_session_end_parse_correctly() {
         let tmp = tempdir().unwrap();
         let path = tmp
             .path()
-            .join("rollout-2026-07-01T10-00-00-v0144writes.jsonl");
+            .join("rollout-2026-07-12T10-00-00-v0143trail.jsonl");
         std::fs::write(
             &path,
             [
-                r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-writes-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","ask_for_approval":"writes"}}"#,
-                r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367602.0}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:00Z","type":"session_meta","payload":{"id":"v0143-trail-session","timestamp":"2026-07-12T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v143-trail","arguments":"{\"cmd\":\"echo done\"}"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:03Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-v143-trail","aggregated_output":"done\n","exit_code":0,"status":"completed","duration":{"secs":0,"nanos":5000000}}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"All done.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752314405.0}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:06Z","type":"event_msg","payload":{"type":"realtime_transcript_text","text":"trailing output preserved by v0.143.0","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:07Z","type":"session_end","payload":{}}"#,
             ]
             .join("\n"),
         )
         .unwrap();
 
         let session = parse_session(&path).unwrap();
-        assert_eq!(session.id, "v0144-writes-session");
+        assert_eq!(session.id, "v0143-trail-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].tool_calls.len(), 1);
         assert_eq!(
-            session.approval_mode.as_deref(),
-            Some("writes"),
-            "ask_for_approval='writes' must be surfaced as approval_mode"
+            session.turns[0].tool_calls[0].output.as_deref(),
+            Some("done\n")
         );
-        assert_eq!(session.cli_version.as_deref(), Some("0.144.0"));
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("All done."),
+            "final_answer must be populated from agent_message before task_complete"
+        );
+        assert!(
+            !session.is_ongoing,
+            "session_end marker must close the session regardless of file freshness"
+        );
     }
 
     #[test]
-    fn v0144_known_approval_modes_are_all_extracted() {
-        // Verify all known ask_for_approval values round-trip correctly.
-        let tmp = tempdir().unwrap();
-        for (mode, label) in &[
-            ("suggest", "suggest"),
-            ("auto-edit", "auto-edit"),
-            ("full-auto", "full-auto"),
-            ("writes", "writes"),
-        ] {
-            let path = tmp.path().join(format!(
-                "rollout-2026-07-01T10-00-00-approval-{label}.jsonl"
-            ));
-            let meta = format!(
-                r#"{{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{{"id":"sess-{label}","timestamp":"2026-07-01T10:00:00Z","ask_for_approval":"{mode}"}}}}"#,
-            );
-            let done = r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
-            let end = r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1751367602.0}}"#;
-            std::fs::write(&path, [meta.as_str(), done, end].join("\n")).unwrap();
-
-            let session = parse_session(&path).unwrap();
-            assert_eq!(
-                session.approval_mode.as_deref(),
-                Some(*mode),
-                "approval_mode must be '{mode}' for ask_for_approval='{mode}'"
-            );
-        }
-    }
-
-    #[test]
-    fn sessions_without_ask_for_approval_have_null_approval_mode() {
-        // Pre-v0.144.0 sessions have no ask_for_approval — approval_mode must be None.
+    fn v0143_session_end_without_task_complete_marks_turn_aborted() {
+        // v0.143.0 writes session_end via atexit handler even after a crash. If the process
+        // dies between task_started and task_complete, session_end appears without a preceding
+        // task_complete. The abrupt-cutoff workaround must fire and set status=Aborted.
         let tmp = tempdir().unwrap();
         let path = tmp
             .path()
-            .join("rollout-2026-01-01T00-00-00-no-approval.jsonl");
+            .join("rollout-2026-07-12T10-01-00-v0143crash.jsonl");
         std::fs::write(
             &path,
             [
-                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old-session","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","cli_version":"0.130.0"}}"#,
-                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
-                r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1735689602.0}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:00Z","type":"session_meta","payload":{"id":"v0143-crash-session","timestamp":"2026-07-12T10:01:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-v143-crash","arguments":"{\"cmd\":\"long-running-job\"}"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:03Z","type":"session_end","payload":{}}"#,
             ]
             .join("\n"),
         )
         .unwrap();
 
         let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0143-crash-session");
+        assert_eq!(session.turns.len(), 1);
         assert_eq!(
-            session.approval_mode, None,
-            "sessions without ask_for_approval must have approval_mode == None"
+            session.turns[0].status,
+            TurnStatus::Aborted,
+            "session_end without task_complete must trigger abrupt-cutoff → Aborted"
+        );
+        assert!(
+            !session.is_ongoing,
+            "session_end marker must close the session regardless of turn state"
         );
     }
 }

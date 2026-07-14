@@ -42,10 +42,6 @@ pub struct CodexSessionInfo {
     /// true when the session has been archived via `codex archive` (Codex v0.136.0+).
     /// A trailing `session_archived` event sets this; a subsequent `session_unarchived` clears it.
     pub is_archived: bool,
-    /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
-    /// Known values: "suggest" (old default), "auto-edit", "full-auto", "writes" (new in v0.144.0).
-    /// Null for sessions predating v0.144.0 or when the field is absent.
-    pub approval_mode: Option<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -160,7 +156,6 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         worker_role,
         ai_title,
         meta_archived,
-        approval_mode,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -203,8 +198,6 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .get("archived")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            // Codex v0.144.0 (PR #30482): ask_for_approval field in session_meta.
-            let approval_mode = opt_str(payload, "ask_for_approval");
             (
                 id,
                 start_time,
@@ -219,7 +212,6 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 worker_role,
                 ai_title,
                 meta_archived,
-                approval_mode,
             )
         }
         "session_meta_root" => {
@@ -232,7 +224,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false, None,
+                false,
             )
         }
         _ => return None,
@@ -336,6 +328,15 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                         }
                     }
                     "turn_aborted" => {
+                        is_ongoing = false;
+                        end_time = v
+                            .get("timestamp")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    "token_budget_abort" | "inference_stream_cancelled" => {
+                        // v0.142.0+: budget exhausted or inference cancelled — turn is done.
+                        // v0.143.0 reliably preserves these on disk during shutdown.
                         is_ongoing = false;
                         end_time = v
                             .get("timestamp")
@@ -467,7 +468,6 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         spawned_worker_ids,
         date_group,
         ai_title,
-        approval_mode,
     })
 }
 
@@ -1396,102 +1396,78 @@ mod tests {
     }
 
     #[test]
-    fn discover_sessions_v0144_writes_approval_mode_is_extracted() {
-        // Regression guard: Codex v0.144.0 (PR #30482) added a new "writes" approval mode.
-        // scan_session_file must populate approval_mode from ask_for_approval in session_meta.
+    fn v0143_token_budget_abort_marks_session_not_ongoing() {
+        // Codex v0.142.0 introduced `token_budget_abort`; v0.143.0 (PRs #29918, #30144)
+        // reliably flushes it to disk during shutdown. discover_sessions must recognise
+        // this event as a turn-terminating signal so the session is NOT shown as ongoing.
         let tmp = tempdir().unwrap();
-        let day_dir = tmp.path().join("2026/07/01");
+        let day_dir = tmp.path().join("2026/07/12");
         std::fs::create_dir_all(&day_dir).unwrap();
-        let path = day_dir.join("rollout-2026-07-01T10-00-00-v0144writes.jsonl");
+        let path = day_dir.join("rollout-2026-07-12T10-00-00-v0143-budget.jsonl");
         std::fs::write(
             &path,
             [
-                r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-disc-writes","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","ask_for_approval":"writes"}}"#,
-                r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751367602.0}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:00Z","type":"session_meta","payload":{"id":"v0143-budget-disc","timestamp":"2026-07-12T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
+                r#"{"timestamp":"2026-07-12T10:00:03Z","type":"event_msg","payload":{"type":"token_budget_abort","turn_id":"turn-1","limit":8000,"used":8001}}"#,
             ]
             .join("\n"),
         )
         .unwrap();
+
         let sessions = discover_sessions(tmp.path()).unwrap();
         let session = sessions
             .iter()
-            .find(|s| s.id == "v0144-disc-writes")
-            .expect("v0.144.0 writes session must be discovered");
-        assert_eq!(
-            session.approval_mode.as_deref(),
-            Some("writes"),
-            "ask_for_approval='writes' must be surfaced as approval_mode"
+            .find(|s| s.id == "v0143-budget-disc")
+            .expect("session terminated by token_budget_abort must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.143.0"));
+        assert!(
+            !session.is_ongoing,
+            "token_budget_abort must mark session as not ongoing"
         );
-        assert_eq!(session.cli_version.as_deref(), Some("0.144.0"));
+        assert_eq!(
+            session.end_time.as_deref(),
+            Some("2026-07-12T10:00:03Z"),
+            "end_time must be set from token_budget_abort timestamp"
+        );
     }
 
     #[test]
-    fn discover_sessions_v0144_known_approval_modes_are_all_extracted() {
-        // Verify all known ask_for_approval values are surfaced in CodexSessionInfo.
+    fn v0143_inference_stream_cancelled_marks_session_not_ongoing() {
+        // Codex v0.143.0 (PRs #29918, #30144) reliably preserves `inference_stream_cancelled`
+        // events on disk during shutdown. discover_sessions must recognise this event as a
+        // turn-terminating signal so the session is NOT shown as ongoing.
         let tmp = tempdir().unwrap();
-        let day_dir = tmp.path().join("2026/07/02");
+        let day_dir = tmp.path().join("2026/07/12");
         std::fs::create_dir_all(&day_dir).unwrap();
-        for (mode, label) in &[
-            ("suggest", "suggest"),
-            ("auto-edit", "auto-edit"),
-            ("full-auto", "full-auto"),
-            ("writes", "writes"),
-        ] {
-            let path = day_dir.join(format!(
-                "rollout-2026-07-02T10-00-00-approval-{label}.jsonl"
-            ));
-            let meta = format!(
-                r#"{{"timestamp":"2026-07-02T10:00:00Z","type":"session_meta","payload":{{"id":"disc-approval-{label}","timestamp":"2026-07-02T10:00:00Z","ask_for_approval":"{mode}"}}}}"#,
-            );
-            let done = r#"{"timestamp":"2026-07-02T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
-            let end = r#"{"timestamp":"2026-07-02T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1751453902.0}}"#;
-            std::fs::write(&path, [meta.as_str(), done, end].join("\n")).unwrap();
-        }
-        let sessions = discover_sessions(tmp.path()).unwrap();
-        for (mode, label) in &[
-            ("suggest", "suggest"),
-            ("auto-edit", "auto-edit"),
-            ("full-auto", "full-auto"),
-            ("writes", "writes"),
-        ] {
-            let session = sessions
-                .iter()
-                .find(|s| s.id == format!("disc-approval-{label}"))
-                .unwrap_or_else(|| panic!("session for approval mode '{mode}' must be discovered"));
-            assert_eq!(
-                session.approval_mode.as_deref(),
-                Some(*mode),
-                "approval_mode must be '{mode}' for ask_for_approval='{mode}'"
-            );
-        }
-    }
-
-    #[test]
-    fn discover_sessions_pre_v0144_sessions_have_null_approval_mode() {
-        // Pre-v0.144.0 sessions have no ask_for_approval — approval_mode must be None.
-        let tmp = tempdir().unwrap();
-        let day_dir = tmp.path().join("2026/01/01");
-        std::fs::create_dir_all(&day_dir).unwrap();
-        let path = day_dir.join("rollout-2026-01-01T00-00-00-old.jsonl");
+        let path = day_dir.join("rollout-2026-07-12T10-01-00-v0143-cancel.jsonl");
         std::fs::write(
             &path,
             [
-                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old-disc-session","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","cli_version":"0.130.0"}}"#,
-                r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
-                r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1735689602.0}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:00Z","type":"session_meta","payload":{"id":"v0143-cancel-disc","timestamp":"2026-07-12T10:01:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Working..."}}"#,
+                r#"{"timestamp":"2026-07-12T10:01:03Z","type":"event_msg","payload":{"type":"inference_stream_cancelled","turn_id":"turn-1","reason":"user_interrupt"}}"#,
             ]
             .join("\n"),
         )
         .unwrap();
+
         let sessions = discover_sessions(tmp.path()).unwrap();
         let session = sessions
             .iter()
-            .find(|s| s.id == "old-disc-session")
-            .expect("old session must be discovered");
+            .find(|s| s.id == "v0143-cancel-disc")
+            .expect("session terminated by inference_stream_cancelled must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.143.0"));
+        assert!(
+            !session.is_ongoing,
+            "inference_stream_cancelled must mark session as not ongoing"
+        );
         assert_eq!(
-            session.approval_mode, None,
-            "sessions without ask_for_approval must have approval_mode == None"
+            session.end_time.as_deref(),
+            Some("2026-07-12T10:01:03Z"),
+            "end_time must be set from inference_stream_cancelled timestamp"
         );
     }
 }
