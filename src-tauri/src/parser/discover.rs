@@ -42,6 +42,10 @@ pub struct CodexSessionInfo {
     /// true when the session has been archived via `codex archive` (Codex v0.136.0+).
     /// A trailing `session_archived` event sets this; a subsequent `session_unarchived` clears it.
     pub is_archived: bool,
+    /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
+    /// Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
+    /// Null for sessions predating v0.144.0 or when the field is absent.
+    pub approval_mode: Option<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
@@ -156,6 +160,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         worker_role,
         ai_title,
         meta_archived,
+        approval_mode,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -198,6 +203,12 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .get("archived")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Codex v0.144.0 (PR #30482): approval mode captured in session_meta.
+            let approval_mode = payload
+                .get("ask_for_approval")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             (
                 id,
                 start_time,
@@ -212,6 +223,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 worker_role,
                 ai_title,
                 meta_archived,
+                approval_mode,
             )
         }
         "session_meta_root" => {
@@ -224,7 +236,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false,
+                false, None,
             )
         }
         _ => return None,
@@ -468,6 +480,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         spawned_worker_ids,
         date_group,
         ai_title,
+        approval_mode,
     })
 }
 
