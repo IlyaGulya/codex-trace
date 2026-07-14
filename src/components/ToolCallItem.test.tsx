@@ -82,6 +82,7 @@ function makeWorkerSession(toolCalls: CodexToolCall[]): CodexSession {
     is_headless: false,
     has_missing_spawn_metadata: false,
     is_archived: false,
+    approval_mode: null,
   };
 }
 

@@ -30,26 +30,6 @@ pub struct AgentMsg {
     pub order: usize,
 }
 
-/// Codex v0.144.0 (PR #30488): a single selectable usage-limit reset credit entry.
-/// Carries the credit category and expiration timestamp.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitCredit {
-    /// Credit category (e.g. "monthly", "trial"). Null when absent.
-    #[serde(rename = "type")]
-    pub credit_type: Option<String>,
-    /// ISO-8601 expiration timestamp for this credit. Null when absent.
-    pub expiration: Option<String>,
-}
-
-/// Codex v0.144.0 (PR #30488): rate-limit reset credit data from `token_count` events.
-/// Extended to carry type/expiration info and support multiple selectable credits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitsInfo {
-    /// Selectable credit options. Empty for pre-v0.144.0 sessions.
-    #[serde(default)]
-    pub credits: Vec<RateLimitCredit>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub input_tokens: u64,
@@ -59,9 +39,6 @@ pub struct TokenInfo {
     pub total_tokens: u64,
     pub context_window_tokens: Option<u64>,
     pub model_context_window: u64,
-    /// Codex v0.144.0 (PR #30488): rate-limit reset credit data from the same `token_count`
-    /// event. Null when the field is absent or null (pre-v0.144.0 sessions).
-    pub rate_limits: Option<RateLimitsInfo>,
 }
 
 /// A single memory summary item from a `turn_context` memories payload.
@@ -94,34 +71,6 @@ pub struct CompactionMeta {
     /// ancestor, enabling lineage reconstruction across compaction boundaries.
     /// Null for sessions predating v0.142.0.
     pub lineage_id: Option<String>,
-}
-
-/// A single credit option for resetting usage limits (Codex v0.144.0, PR #30488).
-/// Codex v0.144.0 extended rate-limit reset data with per-credit type and expiration
-/// information, and allows users to select among multiple available credits.
-/// All fields are optional to remain compatible with earlier Codex versions where
-/// credits were untyped or absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResetCredit {
-    /// Credit kind, e.g. `"subscription"` or `"purchased"`. Null for pre-v0.144.0 sessions.
-    #[serde(rename = "type")]
-    pub credit_type: Option<String>,
-    /// ISO-8601 expiration timestamp, or null if the credit does not expire.
-    pub expiration: Option<String>,
-}
-
-/// Rate-limit information from a `token_count` event payload (Codex v0.144.0, PR #30488).
-/// The `rate_limits` field is a sibling of `info` on `token_count` payloads.
-/// Null in pre-v0.144.0 sessions and whenever the API does not return limit data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitInfo {
-    /// ISO-8601 timestamp when the usage limit resets.
-    pub reset_at: Option<String>,
-    /// All credits available for redeeming the reset. Populated by Codex v0.144.0+.
-    #[serde(default)]
-    pub reset_credits: Vec<ResetCredit>,
-    /// The credit selected for redemption when multiple are available (Codex v0.144.0+).
-    pub selected_reset_credit: Option<ResetCredit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,10 +136,6 @@ pub struct CodexTurn {
     /// Items carry an optional version field (Codex v0.132.0+, PR #23148).
     /// Empty for sessions from older Codex versions.
     pub memories: Vec<MemorySummary>,
-    /// Rate-limit data from the most recent `token_count` event (Codex v0.144.0+, PR #30488).
-    /// Includes optional credit type, expiration, and selectable credit list.
-    /// Null for pre-v0.144.0 sessions or when the API returns no rate-limit data.
-    pub rate_limit_info: Option<RateLimitInfo>,
 }
 
 impl CodexTurn {
@@ -220,7 +165,6 @@ impl CodexTurn {
             forked_from_thread_id: None,
             compaction_meta: None,
             memories: Vec::new(),
-            rate_limit_info: None,
         }
     }
 }
@@ -515,7 +459,6 @@ fn handle_event_msg(
                             total_tokens,
                             context_window_tokens: None,
                             model_context_window: 0,
-                            rate_limits: None,
                         });
                     }
                 }
@@ -604,33 +547,6 @@ fn handle_event_msg(
         "token_count" => {
             if let Some(ref tid) = current_turn_id {
                 if let Some(turn) = turns.get_mut(tid) {
-                    // Codex v0.144.0 (PR #30488): rate_limits now carries type/expiration per
-                    // credit and supports multiple selectable credits. Null in older sessions.
-                    let rate_limits =
-                        payload
-                            .get("rate_limits")
-                            .filter(|v| !v.is_null())
-                            .map(|v| {
-                                let credits = v
-                                    .get("credits")
-                                    .and_then(|c| c.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .map(|item| RateLimitCredit {
-                                                credit_type: item
-                                                    .get("type")
-                                                    .and_then(|t| t.as_str())
-                                                    .map(str::to_owned),
-                                                expiration: item
-                                                    .get("expiration")
-                                                    .and_then(|e| e.as_str())
-                                                    .map(str::to_owned),
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                RateLimitsInfo { credits }
-                            });
                     if let Some(info) = payload.get("info").filter(|v| !v.is_null()) {
                         if let Some(total) = info.get("total_token_usage") {
                             let context_window_tokens = info
@@ -648,51 +564,8 @@ fn handle_event_msg(
                                 total_tokens: u64_field(total, "total_tokens"),
                                 context_window_tokens,
                                 model_context_window: u64_field(info, "model_context_window"),
-                                rate_limits,
                             });
                         }
-                    }
-                    // Codex v0.144.0 (PR #30488): rate_limits is a sibling of `info` on the
-                    // token_count payload. It carries optional type/expiration per reset credit
-                    // and a selectable list of credits. Null in older sessions.
-                    if let Some(rl) = payload.get("rate_limits").filter(|v| !v.is_null()) {
-                        turn.rate_limit_info = Some(RateLimitInfo {
-                            reset_at: rl
-                                .get("reset_at")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_owned),
-                            reset_credits: rl
-                                .get("reset_credits")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .map(|c| ResetCredit {
-                                            credit_type: c
-                                                .get("type")
-                                                .and_then(|v| v.as_str())
-                                                .map(str::to_owned),
-                                            expiration: c
-                                                .get("expiration")
-                                                .and_then(|v| v.as_str())
-                                                .map(str::to_owned),
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            selected_reset_credit: rl
-                                .get("selected_reset_credit")
-                                .filter(|v| !v.is_null())
-                                .map(|c| ResetCredit {
-                                    credit_type: c
-                                        .get("type")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_owned),
-                                    expiration: c
-                                        .get("expiration")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::to_owned),
-                                }),
-                        });
                     }
                 }
             }
@@ -862,6 +735,14 @@ fn handle_event_msg(
         // token_budget_reminder is emitted when usage crosses a threshold percentage.
         // No turn-building semantics — silently skip.
         "token_budget_reminder" => {}
+
+        // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication
+        // by default, without requiring an experimental opt-in flag. Sessions with MCP tools
+        // that need auth emit these events during the OAuth / API-key handshake.
+        // codex-trace does not model MCP auth state — these events carry no turn-building
+        // semantics and are explicitly skipped so ordinary sessions with auth flows parse
+        // without corrupting turn data.
+        "mcp_auth_request" | "mcp_auth_result" | "mcp_auth_challenge" | "mcp_auth_complete" => {}
 
         _ => {}
     }
@@ -1622,108 +1503,6 @@ mod tests {
         assert_eq!(tokens.total_tokens, 40000);
         assert_eq!(tokens.context_window_tokens, Some(26000));
         assert_eq!(tokens.model_context_window, 100000);
-    }
-
-    // --- Codex v0.144.0 rate_limits tests (PR #30488) ---
-
-    #[test]
-    fn rate_limits_null_leaves_rate_limit_info_none() {
-        // Pre-v0.144.0 sessions emit rate_limits: null; must not populate rate_limit_info.
-        let entries = entries(&[
-            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"s1","timestamp":"2026-07-01T10:00:00Z"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":1100},"model_context_window":128000},"rate_limits":null}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364003.0}}"#,
-        ]);
-
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        assert!(
-            turns[0].rate_limit_info.is_none(),
-            "rate_limits:null must not populate rate_limit_info"
-        );
-    }
-
-    #[test]
-    fn rate_limits_absent_leaves_rate_limit_info_none() {
-        // Sessions that predate rate_limits entirely must not populate rate_limit_info.
-        let entries = entries(&[
-            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"s2","timestamp":"2026-07-01T10:00:00Z"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550},"last_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550},"model_context_window":128000}}}"#,
-            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364003.0}}"#,
-        ]);
-
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        assert!(
-            turns[0].rate_limit_info.is_none(),
-            "absent rate_limits must not populate rate_limit_info"
-        );
-    }
-
-    #[test]
-    fn v0144_rate_limits_with_type_and_expiration_parsed() {
-        // Codex v0.144.0 (PR #30488): rate_limits gains credit type and expiration fields.
-        let entries = entries(&[
-            r#"{"timestamp":"2026-07-12T10:00:00Z","type":"session_meta","payload":{"id":"s3","timestamp":"2026-07-12T10:00:00Z"}}"#,
-            r#"{"timestamp":"2026-07-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-12T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":2200},"last_token_usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":2200},"model_context_window":200000},"rate_limits":{"reset_at":"2026-07-13T00:00:00Z","reset_credits":[{"type":"subscription","expiration":null},{"type":"purchased","expiration":"2026-08-01T00:00:00Z"}],"selected_reset_credit":{"type":"purchased","expiration":"2026-08-01T00:00:00Z"}}}}"#,
-            r#"{"timestamp":"2026-07-12T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752314403.0}}"#,
-        ]);
-
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        let rl = turns[0]
-            .rate_limit_info
-            .as_ref()
-            .expect("rate_limit_info must be present for v0.144.0+ data");
-        assert_eq!(rl.reset_at.as_deref(), Some("2026-07-13T00:00:00Z"));
-        assert_eq!(rl.reset_credits.len(), 2);
-        assert_eq!(
-            rl.reset_credits[0].credit_type.as_deref(),
-            Some("subscription")
-        );
-        assert!(rl.reset_credits[0].expiration.is_none());
-        assert_eq!(
-            rl.reset_credits[1].credit_type.as_deref(),
-            Some("purchased")
-        );
-        assert_eq!(
-            rl.reset_credits[1].expiration.as_deref(),
-            Some("2026-08-01T00:00:00Z")
-        );
-        let sel = rl
-            .selected_reset_credit
-            .as_ref()
-            .expect("selected_reset_credit must be present");
-        assert_eq!(sel.credit_type.as_deref(), Some("purchased"));
-        assert_eq!(sel.expiration.as_deref(), Some("2026-08-01T00:00:00Z"));
-    }
-
-    #[test]
-    fn v0144_rate_limits_without_credits_array_parsed() {
-        // Tolerate rate_limits that carry reset_at but no reset_credits/selected_reset_credit.
-        let entries = entries(&[
-            r#"{"timestamp":"2026-07-12T11:00:00Z","type":"session_meta","payload":{"id":"s4","timestamp":"2026-07-12T11:00:00Z"}}"#,
-            r#"{"timestamp":"2026-07-12T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-12T11:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110},"model_context_window":128000},"rate_limits":{"reset_at":"2026-07-13T00:00:00Z"}}}"#,
-            r#"{"timestamp":"2026-07-12T11:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752318003.0}}"#,
-        ]);
-
-        let turns = build_turns(&entries);
-
-        assert_eq!(turns.len(), 1);
-        let rl = turns[0]
-            .rate_limit_info
-            .as_ref()
-            .expect("rate_limit_info must be present");
-        assert_eq!(rl.reset_at.as_deref(), Some("2026-07-13T00:00:00Z"));
-        assert!(rl.reset_credits.is_empty());
-        assert!(rl.selected_reset_credit.is_none());
     }
 
     #[test]
@@ -4220,38 +3999,83 @@ mod tests {
         assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 
-    // Codex v0.144.0 (PR #30488): token_count events now carry rate_limits with type and
-    // expiration on reset credits, and support multiple selectable credits.
+    // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication by
+    // default (no longer behind an experimental flag). Sessions that include MCP auth flows
+    // emit mcp_auth_request and mcp_auth_result event_msg entries. These must be skipped
+    // without corrupting turn data.
 
     #[test]
-    fn v0144_token_count_null_rate_limits_parsed_without_error() {
+    fn v0144_mcp_auth_events_do_not_corrupt_turn_data() {
         let lines = [
-            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-rl-null","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.143.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":10500},"last_token_usage":{"input_tokens":10000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":10500},"model_context_window":128000},"rate_limits":null}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752141603.0}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-turns","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:06Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"get_repo","arguments":{"owner":"openai","repo":"codex"}}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:07Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":"Repository info..."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360408.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
             .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
             .collect();
         let turns = build_turns(&parsed);
-        assert_eq!(turns.len(), 1);
-        let tokens = turns[0].total_tokens.as_ref().expect("token info present");
-        assert_eq!(tokens.total_tokens, 10500);
-        assert!(
-            tokens.rate_limits.is_none(),
-            "null rate_limits must remain None"
+        assert_eq!(
+            turns.len(),
+            1,
+            "auth events must not create synthetic turns"
         );
+        let turn = &turns[0];
+        assert_eq!(
+            turn.tool_calls.len(),
+            1,
+            "MCP tool call must survive auth events intact"
+        );
+        assert_eq!(turn.tool_calls[0].name, "get_repo");
+        assert_eq!(
+            turn.tool_calls[0].output.as_deref(),
+            Some("Repository info...")
+        );
+        assert_eq!(turn.status, super::TurnStatus::Complete);
     }
 
     #[test]
-    fn v0144_token_count_rate_limits_with_typed_credits_parsed() {
+    fn v0144_mcp_auth_request_failed_result_does_not_corrupt_turn_data() {
         let lines = [
-            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-rl-credits","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":5000,"output_tokens":1000,"reasoning_output_tokens":200,"total_tokens":21000},"last_token_usage":{"input_tokens":20000,"cached_input_tokens":5000,"output_tokens":1000,"reasoning_output_tokens":200,"total_tokens":21000},"model_context_window":200000},"rate_limits":{"credits":[{"type":"monthly","expiration":"2026-08-01T00:00:00Z"},{"type":"trial","expiration":"2026-07-20T00:00:00Z"}]}}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752141603.0}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-fail","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"slack","call_id":"auth-2","auth_url":"https://slack.com/oauth/v2/authorize","instructions":"Authenticate with Slack."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:03Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"slack","call_id":"auth-2","status":"failed","error":"User cancelled authentication"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360404.0}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(
+            turns.len(),
+            1,
+            "auth events must not create synthetic turns"
+        );
+        let turn = &turns[0];
+        assert_eq!(turn.tool_calls.len(), 0);
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+    }
+
+    // Codex v0.144.0 (PR #28772): also covers the mcp_auth_challenge/mcp_auth_complete
+    // naming variant. Both naming conventions must be recognised.
+
+    #[test]
+    fn v0144_mcp_auth_events_during_turn_do_not_corrupt_turn_state() {
+        let lines = [
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-auth-flow","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"list_repos","arguments":{}}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:03Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-1","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":[{"type":"text","text":"[\"my-repo\",\"other-repo\"]"}]}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:09Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055209.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -4259,30 +4083,23 @@ mod tests {
             .collect();
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
-        let tokens = turns[0].total_tokens.as_ref().expect("token info present");
-        assert_eq!(tokens.total_tokens, 21000);
-        let rl = tokens.rate_limits.as_ref().expect("rate_limits present");
-        assert_eq!(rl.credits.len(), 2);
-        assert_eq!(rl.credits[0].credit_type.as_deref(), Some("monthly"));
-        assert_eq!(
-            rl.credits[0].expiration.as_deref(),
-            Some("2026-08-01T00:00:00Z")
-        );
-        assert_eq!(rl.credits[1].credit_type.as_deref(), Some("trial"));
-        assert_eq!(
-            rl.credits[1].expiration.as_deref(),
-            Some("2026-07-20T00:00:00Z")
-        );
+        let turn = &turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, super::TurnStatus::Complete);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "list_repos");
+        assert_eq!(turn.tool_calls[0].mcp_server.as_deref(), Some("github"));
     }
 
     #[test]
-    fn v0144_token_count_rate_limits_with_unknown_extra_fields_tolerated() {
-        // Verify that unexpected fields within rate_limits do not panic or error.
+    fn v0144_mcp_auth_challenge_without_tool_call_does_not_crash() {
         let lines = [
-            r#"{"timestamp":"2026-07-10T10:00:00Z","type":"session_meta","payload":{"id":"v0144-rl-extra","timestamp":"2026-07-10T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":5300},"last_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":5300},"model_context_window":128000},"rate_limits":{"credits":[{"type":"monthly","expiration":"2026-08-01T00:00:00Z","future_field":"ignored","another_new":42}],"top_level_new_field":"also_ignored"}}}"#,
-            r#"{"timestamp":"2026-07-10T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752141603.0}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-proactive-auth","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"slack","auth_url":"https://slack.com/oauth/v2/authorize?client_id=xyz"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:06Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"slack","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Authenticated with Slack."}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055208.0}}"#,
         ];
         let parsed: Vec<_> = lines
             .iter()
@@ -4290,9 +4107,52 @@ mod tests {
             .collect();
         let turns = build_turns(&parsed);
         assert_eq!(turns.len(), 1);
-        let tokens = turns[0].total_tokens.as_ref().expect("token info present");
-        let rl = tokens.rate_limits.as_ref().expect("rate_limits present");
-        assert_eq!(rl.credits.len(), 1);
-        assert_eq!(rl.credits[0].credit_type.as_deref(), Some("monthly"));
+        assert_eq!(turns[0].status, super::TurnStatus::Complete);
+        assert_eq!(turns[0].tool_calls.len(), 0);
+    }
+
+    #[test]
+    fn v0144_mcp_auth_events_interleaved_with_agent_message_do_not_corrupt_turn() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:02:00Z","type":"session_meta","payload":{"id":"v0144-mcp-auth-msg","timestamp":"2026-07-01T10:02:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-3","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL."}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Waiting for GitHub authentication...","phase":"main"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:04Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-3","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364125.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Auth events must not appear as agent messages — only the real agent_message survives
+        assert_eq!(turns[0].agent_messages.len(), 1);
+        assert_eq!(
+            turns[0].agent_messages[0].text,
+            "Waiting for GitHub authentication..."
+        );
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn v0144_multiple_mcp_auth_attempts_are_all_skipped_gracefully() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-01T10:03:00Z","type":"session_meta","payload":{"id":"v0144-mcp-auth-retry","timestamp":"2026-07-01T10:03:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"jira","call_id":"auth-4","auth_url":"https://auth.jira.com/oauth","instructions":"Auth with Jira."}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:03Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"jira","call_id":"auth-4","status":"failed","error":"timeout"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:04Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"jira","call_id":"auth-5","auth_url":"https://auth.jira.com/oauth","instructions":"Auth with Jira."}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"jira","call_id":"auth-5","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:03:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751364186.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        // Multiple auth request/result pairs must all be silently skipped
+        assert!(turns[0].agent_messages.is_empty());
+        assert!(turns[0].tool_calls.is_empty());
     }
 }

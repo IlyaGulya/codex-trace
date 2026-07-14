@@ -969,17 +969,22 @@ impl ToolCallBuilder {
     /// Catch-all for any unrecognised *_end event — preserves name from pending.
     pub fn finalize_unknown_end(&mut self, event_type: &str, payload: &Value) {
         let call_id = str_field(payload, "call_id");
-        let pending = self
-            .pending
-            .remove(&call_id)
-            .unwrap_or_else(|| PendingCall {
+        // Codex v0.143.0 emits non-tool-call terminal rollout events (e.g.
+        // `transcript_flush_end`) that end in `_end` but carry no `call_id`
+        // and have no matching pending call. Emitting a phantom ToolCall for
+        // them corrupts the turn's tool list, so skip them.
+        let pending = match self.pending.remove(&call_id) {
+            Some(p) => p,
+            None if call_id.is_empty() => return,
+            None => PendingCall {
                 name: kind_name(event_type),
                 arguments: Value::Null,
                 input_text: None,
                 namespace: None,
                 mcp_server: None,
                 plugin_id: None,
-            });
+            },
+        };
         let output = ["output", "aggregated_output", "stdout"]
             .iter()
             .find_map(|key| {

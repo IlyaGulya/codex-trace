@@ -21,6 +21,7 @@ function makeSession(overrides: Partial<CodexSessionInfo> = {}): CodexSessionInf
     is_inline_worker: false,
     is_headless: false,
     is_archived: false,
+    approval_mode: null,
     worker_nickname: null,
     worker_role: null,
     spawned_worker_ids: [],
