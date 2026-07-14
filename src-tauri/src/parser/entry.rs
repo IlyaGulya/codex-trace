@@ -1454,6 +1454,70 @@ mod tests {
         assert_eq!(e.payload["metadata"]["turn_id"], "turn-abc");
     }
 
+    // Codex v0.144.0 (PR #28772): MCP tools can request interactive authentication by
+    // default (no longer behind an experimental flag). Sessions with MCP tools that need
+    // auth will emit mcp_auth_request and mcp_auth_result event_msg entries during the
+    // OAuth / API-key handshake. These must parse without errors since they now appear in
+    // ordinary sessions, not just experimental ones.
+
+    #[test]
+    fn v0144_mcp_auth_request_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_request event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_request"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["call_id"], "auth-1");
+    }
+
+    #[test]
+    fn v0144_mcp_auth_result_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_result event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_result"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["status"], "authenticated");
+    }
+
+    #[test]
+    fn v0144_mcp_auth_result_failed_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-01T10:00:06Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"slack","call_id":"auth-2","status":"failed","error":"User cancelled authentication"}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_result failed event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_result"));
+        assert_eq!(e.payload["status"], "failed");
+    }
+
+    #[test]
+    fn v0144_all_standard_entry_types_parse_correctly_with_mcp_auth_flow() {
+        let lines = [
+            r#"{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-01T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_request","server":"github","call_id":"auth-1","auth_url":"https://github.com/login/oauth/authorize?client_id=abc","instructions":"Visit the URL to grant access."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_result","server":"github","call_id":"auth-1","status":"authenticated"}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:06Z","type":"response_item","payload":{"type":"mcp_tool_call","call_id":"mcp-1","server":"github","tool":"get_repo","arguments":{"owner":"openai","repo":"codex"}}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:07Z","type":"response_item","payload":{"type":"mcp_tool_call_output","call_id":"mcp-1","output":"Repository info..."}}"#,
+            r#"{"timestamp":"2026-07-01T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1751360408.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "event_msg",
+            "event_msg",
+            "response_item",
+            "response_item",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.144.0");
+        assert_eq!(meta.payload["id"], "v0144-session");
+    }
+
     #[test]
     fn v0142_response_item_without_metadata_turn_id_is_backward_compatible() {
         // Pre-v0.142.2 response items carry no metadata.turn_id — must parse normally.
@@ -1493,5 +1557,73 @@ mod tests {
         // metadata.turn_id must be accessible on response_item payload
         let msg_entry = RawEntry::parse(lines[2]).unwrap();
         assert_eq!(msg_entry.payload["metadata"]["turn_id"], "turn-1");
+    }
+
+    // Codex v0.144.0 (PR #28772): MCP tools can now request interactive authentication by
+    // default without requiring an experimental opt-in flag. When an MCP server requires
+    // credentials (e.g. OAuth), it emits mcp_auth_challenge at the start of the interactive
+    // flow and mcp_auth_complete once the user has authenticated. These event_msg types were
+    // previously rare because they required an opt-in; v0.144.0 makes them standard so
+    // sessions with active MCP servers will regularly contain them.
+
+    #[test]
+    fn v0144_mcp_auth_challenge_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-auth-1"}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_challenge event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_challenge"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["call_id"], "mcp-auth-1");
+    }
+
+    #[test]
+    fn v0144_mcp_auth_complete_event_msg_parses_correctly() {
+        let line = r#"{"timestamp":"2026-07-09T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-auth-1","success":true}}"#;
+        let e = RawEntry::parse(line).expect("mcp_auth_complete event_msg must parse");
+        assert_eq!(e.entry_type, "event_msg");
+        assert_eq!(event_msg_type(&e.payload), Some("mcp_auth_complete"));
+        assert_eq!(e.payload["server"], "github");
+        assert_eq!(e.payload["success"], true);
+    }
+
+    #[test]
+    fn v0144_all_standard_entry_types_parse_correctly() {
+        // Regression guard: standard entry types from a v0.144.0 session with an MCP
+        // interactive auth flow must all parse without errors.
+        let lines = [
+            r#"{"timestamp":"2026-07-09T10:00:00Z","type":"session_meta","payload":{"id":"v0144-session","timestamp":"2026-07-09T10:00:00Z","cwd":"/project","cli_version":"0.144.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:02Z","type":"event_msg","payload":{"type":"mcp_auth_challenge","server":"github","auth_url":"https://github.com/login/oauth/authorize?client_id=abc123","call_id":"mcp-auth-1"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:05Z","type":"event_msg","payload":{"type":"mcp_auth_complete","server":"github","call_id":"mcp-auth-1","success":true}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Authenticated with GitHub."}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:07Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-07-09T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1752055208.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "event_msg",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.144.0");
+        assert_eq!(meta.payload["id"], "v0144-session");
+        // Verify auth event fields are accessible
+        let challenge = RawEntry::parse(lines[2]).unwrap();
+        assert_eq!(
+            event_msg_type(&challenge.payload),
+            Some("mcp_auth_challenge")
+        );
+        assert_eq!(challenge.payload["server"], "github");
+        let complete = RawEntry::parse(lines[3]).unwrap();
+        assert_eq!(event_msg_type(&complete.payload), Some("mcp_auth_complete"));
+        assert_eq!(complete.payload["success"], true);
     }
 }
