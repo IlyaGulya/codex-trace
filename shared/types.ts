@@ -177,6 +177,10 @@ export interface CodexTurn {
    * Null for pre-v0.144.0 sessions or when the API returns no rate-limit data.
    * Absent for cached data serialized before this field was added. */
   rate_limit_info?: RateLimitInfo | null;
+  /** Audio transcript segments from realtime voice turns (Codex v0.143.0+ trailing events;
+   * Codex v0.145.0+ live mid-turn V3 streaming audio). Empty for non-voice sessions.
+   * Absent for cached data serialized before this field was added. */
+  audio_transcript?: string[];
 }
 
 /**
