@@ -28,6 +28,7 @@ function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
     status: "completed",
     subagent_id: null,
     subagent_name: null,
+    output_truncated: null,
     ...overrides,
   };
 }
@@ -495,6 +496,46 @@ describe("ToolCallItem", () => {
       const summary = container.querySelector(".tool-call__summary");
       expect(summary).toBeInTheDocument();
       expect(summary!.textContent).toBe("a sunset over mountains");
+    });
+  });
+
+  // Codex v0.145.0: bounded exec output — truncation notice in expanded view.
+  describe("output truncation notice (v0.145.0+)", () => {
+    it("shows truncation notice when output_truncated is true", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ output: "partial output...", output_truncated: true })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(/Output was truncated by the Codex runtime/)).toBeInTheDocument();
+    });
+
+    it("does not show truncation notice when output_truncated is null", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ output: "full output", output_truncated: null })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(
+        screen.queryByText(/Output was truncated by the Codex runtime/),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not show truncation notice when output_truncated is false", () => {
+      render(
+        <ToolCallItem
+          tool={makeTool({ output: "full output", output_truncated: false })}
+          expanded={true}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(
+        screen.queryByText(/Output was truncated by the Codex runtime/),
+      ).not.toBeInTheDocument();
     });
   });
 });

@@ -45,6 +45,7 @@ const EXEC_TOOL: CodexToolCall = {
   status: "completed",
   subagent_id: null,
   subagent_name: null,
+  output_truncated: null,
 };
 
 function makeTurn(overrides: Partial<CodexTurn> = {}): CodexTurn {

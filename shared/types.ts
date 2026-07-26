@@ -141,6 +141,8 @@ export interface CodexToolCall {
   image_file_path: string | null;
   worker_session: CodexSession | null;
   status: string;
+  /** Codex v0.145.0: true when exec_command_end signals that aggregated_output was clipped by the runtime's output limit. Null for pre-v0.145.0 sessions and non-exec tool calls. */
+  output_truncated: boolean | null;
 }
 
 export interface CodexTurn {
