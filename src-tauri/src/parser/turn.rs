@@ -4155,4 +4155,92 @@ mod tests {
         assert!(turns[0].agent_messages.is_empty());
         assert!(turns[0].tool_calls.is_empty());
     }
+
+    // Codex v0.145.0: contextual branch fix — attachments and mention bindings are now
+    // preserved when a message is edited and retried, rather than being dropped on the
+    // retried branch. The user_message event for the new branch now carries the same
+    // attachment/mention data as the original. codex-trace's generic field extraction
+    // already tolerates these extra fields; these tests confirm no regression: preserved
+    // attachment/mention data on a retried turn does not crash the parser, and the
+    // turn-branching logic correctly attributes each user_message to its own turn.
+
+    #[test]
+    fn v0145_retried_branch_with_preserved_attachment_is_parsed_correctly() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"v0145-ctx-branch-attach","timestamp":"2026-07-26T10:00:00Z","cwd":"/project","cli_version":"0.145.0","model_provider":"openai"}}"#,
+            // Original turn: user message includes an image attachment.
+            r#"{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Analyze this screenshot","attachments":[{"type":"image","path":"/home/user/.codex/images/screen.png"}],"mention_bindings":[]}}"#,
+            r#"{"timestamp":"2026-07-26T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785060003.0}}"#,
+            // Retried branch: user edited the message; v0.145.0 preserves the image
+            // attachment from the original turn in this branch's user_message.
+            r#"{"timestamp":"2026-07-26T10:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2","forked_from_thread_id":"turn-1-thread"}}"#,
+            r#"{"timestamp":"2026-07-26T10:00:05Z","type":"event_msg","payload":{"type":"user_message","message":"Analyze this updated screenshot","attachments":[{"type":"image","path":"/home/user/.codex/images/screen.png"}],"mention_bindings":[]}}"#,
+            r#"{"timestamp":"2026-07-26T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"I can see the screenshot."}}"#,
+            r#"{"timestamp":"2026-07-26T10:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1785060007.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        // Both turns must be parsed — the retried branch does not replace the original.
+        assert_eq!(turns.len(), 2);
+
+        // Original turn retains its own user message.
+        assert_eq!(turns[0].turn_id, "turn-1");
+        assert_eq!(turns[0].status, TurnStatus::Complete);
+        assert_eq!(
+            turns[0].user_message.as_deref(),
+            Some("Analyze this screenshot"),
+            "original turn user_message must not be overwritten by retried branch"
+        );
+        assert!(
+            turns[0].forked_from_thread_id.is_none(),
+            "original turn must have no forked_from_thread_id"
+        );
+
+        // Retried branch captures its own edited message and fork origin.
+        assert_eq!(turns[1].turn_id, "turn-2");
+        assert_eq!(turns[1].status, TurnStatus::Complete);
+        assert_eq!(
+            turns[1].user_message.as_deref(),
+            Some("Analyze this updated screenshot"),
+            "retried branch must carry its own edited user_message text"
+        );
+        assert_eq!(
+            turns[1].forked_from_thread_id.as_deref(),
+            Some("turn-1-thread"),
+            "retried branch must record its fork origin"
+        );
+    }
+
+    #[test]
+    fn v0145_retried_branch_with_preserved_mention_binding_is_parsed_correctly() {
+        // Edge case: the retried branch preserves a mention_binding (e.g. @shell) that was
+        // originally lost before the v0.145.0 contextual branch fix.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-07-26T11:00:00Z","type":"session_meta","payload":{"id":"v0145-ctx-branch-mention","timestamp":"2026-07-26T11:00:00Z","cwd":"/project","cli_version":"0.145.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-07-26T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-07-26T11:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug using @shell","mention_bindings":[]}}"#,
+            r#"{"timestamp":"2026-07-26T11:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785063603.0}}"#,
+            // Retried branch: mention_binding now preserved by v0.145.0.
+            r#"{"timestamp":"2026-07-26T11:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2","forked_from_thread_id":"turn-1-thread"}}"#,
+            r#"{"timestamp":"2026-07-26T11:00:05Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug using @shell","mention_bindings":[{"mention":"@shell","binding":"shell"}]}}"#,
+            r#"{"timestamp":"2026-07-26T11:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":1785063606.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 2);
+        // Retried branch correctly receives its own user_message (not a stale None from
+        // turn-1 — the mention_bindings field in the payload must not confuse the parser).
+        assert_eq!(
+            turns[1].user_message.as_deref(),
+            Some("Fix the bug using @shell"),
+            "retried branch user_message must be correctly attributed despite mention_bindings"
+        );
+        assert_eq!(
+            turns[1].forked_from_thread_id.as_deref(),
+            Some("turn-1-thread")
+        );
+    }
 }
