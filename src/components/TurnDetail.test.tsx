@@ -72,6 +72,7 @@ function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
     status: "completed",
     subagent_id: null,
     subagent_name: null,
+    output_truncated: null,
     ...overrides,
   };
 }

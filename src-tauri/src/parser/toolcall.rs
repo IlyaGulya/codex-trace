@@ -61,6 +61,11 @@ pub struct ToolCall {
     /// Codex v0.134.0 (PR #22882): subagent human-readable name from hook input identity fields.
     /// Null for parent-agent tool calls and sessions from pre-v0.134.0.
     pub subagent_name: Option<String>,
+    /// Codex v0.145.0: exec_command_end may include a truncation indicator when the runtime
+    /// bounded command output to fix an unbounded-exec bug. True means `aggregated_output`
+    /// is partial; None means no truncation field was present (pre-v0.145.0 or unaffected run).
+    #[serde(default)]
+    pub output_truncated: Option<bool>,
 }
 
 /// A pending (not yet finalized) tool call — waiting for its end event.
@@ -187,6 +192,7 @@ impl ToolCallBuilder {
                 },
                 subagent_id: None,
                 subagent_name: None,
+                output_truncated: None,
             });
         }
     }
@@ -300,6 +306,7 @@ impl ToolCallBuilder {
                     status: "completed".to_string(),
                     subagent_id: None,
                     subagent_name: None,
+                    output_truncated: None,
                 });
                 return;
             }
@@ -329,6 +336,7 @@ impl ToolCallBuilder {
                     status: spawn_agent_status(output),
                     subagent_id: None,
                     subagent_name: None,
+                    output_truncated: None,
                 });
                 return;
             }
@@ -368,6 +376,7 @@ impl ToolCallBuilder {
                     status: "completed".to_string(),
                     subagent_id: None,
                     subagent_name: None,
+                    output_truncated: None,
                 });
                 return;
             }
@@ -400,6 +409,7 @@ impl ToolCallBuilder {
                     status: "completed".to_string(),
                     subagent_id: None,
                     subagent_name: None,
+                    output_truncated: None,
                 });
                 return;
             }
@@ -477,6 +487,7 @@ impl ToolCallBuilder {
                 status: "completed".to_string(),
                 subagent_id: None,
                 subagent_name: None,
+                output_truncated: None,
             });
         }
     }
@@ -548,6 +559,10 @@ impl ToolCallBuilder {
                 .map(|s| s.to_string())
         });
         let status = str_field(payload, "status");
+        // Codex v0.145.0: may include a truncation indicator when the runtime bounded
+        // command output to fix an unbounded-exec bug (bytes_truncated, truncated, or
+        // output_truncated). Parse it so the UI can warn users that output is partial.
+        let output_truncated = parse_output_truncated(payload);
 
         let (subagent_id, subagent_name) = extract_subagent_identity(payload);
 
@@ -572,6 +587,7 @@ impl ToolCallBuilder {
             existing.status = status;
             existing.subagent_id = subagent_id;
             existing.subagent_name = subagent_name;
+            existing.output_truncated = output_truncated;
             // Prefer existing output from function_call_output (full raw text); fall back
             // to aggregated_output only if no output was captured yet.
             if existing.output.is_none() {
@@ -604,6 +620,7 @@ impl ToolCallBuilder {
             status,
             subagent_id,
             subagent_name,
+            output_truncated,
         });
     }
 
@@ -677,6 +694,7 @@ impl ToolCallBuilder {
             status: "completed".to_string(),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -765,6 +783,7 @@ impl ToolCallBuilder {
             status: str_field(payload, "status"),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -799,6 +818,7 @@ impl ToolCallBuilder {
             status: str_field(payload, "status"),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -833,6 +853,7 @@ impl ToolCallBuilder {
             status: "completed".to_string(),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -867,6 +888,7 @@ impl ToolCallBuilder {
             status: "completed".to_string(),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -910,6 +932,7 @@ impl ToolCallBuilder {
             status: "completed".to_string(),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -963,6 +986,7 @@ impl ToolCallBuilder {
             status,
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -1019,6 +1043,7 @@ impl ToolCallBuilder {
             status: str_field(payload, "status"),
             subagent_id,
             subagent_name,
+            output_truncated: None,
         });
     }
 
@@ -1050,6 +1075,7 @@ impl ToolCallBuilder {
                 status: "unknown".to_string(),
                 subagent_id: None,
                 subagent_name: None,
+                output_truncated: None,
             });
         }
         // Remove Unknown entries that share a call_id with a properly classified end-event entry.
@@ -1107,6 +1133,7 @@ fn exec_tool_call_from_pending(
         status: parsed_output.status,
         subagent_id: None,
         subagent_name: None,
+        output_truncated: None,
     }
 }
 
@@ -1427,6 +1454,31 @@ fn extract_mcp_output(payload: &Value) -> Option<String> {
     } else {
         Some(texts.join("\n"))
     }
+}
+
+/// Detect whether an exec_command_end payload signals truncated output.
+///
+/// Codex v0.145.0 introduced bounded exec output to fix an unbounded-exec bug.
+/// When the runtime clips command output it may set one of three fields:
+/// - `truncated` (bool true) — primary indicator added in v0.145.0
+/// - `output_truncated` (bool true) — alternative spelling used in some builds
+/// - `bytes_truncated` (number > 0) — byte count of dropped output
+///
+/// Returns `Some(true)` when any indicator is present and signals truncation,
+/// `Some(false)` when an indicator is explicitly present but false/zero (not
+/// truncated), and `None` when no indicator field exists (pre-v0.145.0 sessions
+/// or exec calls that completed without hitting the output limit).
+fn parse_output_truncated(payload: &Value) -> Option<bool> {
+    if let Some(v) = payload.get("truncated").and_then(|v| v.as_bool()) {
+        return Some(v);
+    }
+    if let Some(v) = payload.get("output_truncated").and_then(|v| v.as_bool()) {
+        return Some(v);
+    }
+    if let Some(n) = payload.get("bytes_truncated").and_then(|v| v.as_u64()) {
+        return Some(n > 0);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2358,5 +2410,180 @@ mod tests {
         assert_eq!(builder.finalized.len(), 1);
         // Built-in classification must win — exec_command via exec_command_end → ExecCommand
         assert_eq!(builder.finalized[0].kind, ToolKind::ExecCommand);
+    }
+
+    // Codex v0.145.0: bounded exec output — truncation indicator fields.
+    // When the runtime clips command output it sets one of: `truncated` (bool),
+    // `output_truncated` (bool), or `bytes_truncated` (number > 0) in the
+    // exec_command_end payload. The parser must surface this as output_truncated
+    // on the ToolCall so the UI can warn users that output is partial.
+
+    #[test]
+    fn v0145_exec_command_end_with_truncated_bool_sets_output_truncated() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_trunc_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cat large_file.log","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_trunc_1",
+            "aggregated_output": "line1\nline2\n...(clipped)",
+            "exit_code": 0,
+            "status": "completed",
+            "truncated": true,
+            "duration": {"secs": 1, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.output_truncated, Some(true));
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
+    #[test]
+    fn v0145_exec_command_end_with_output_truncated_bool_sets_output_truncated() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_trunc_2".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"ls -la","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_trunc_2",
+            "aggregated_output": "total 999\n...(clipped)",
+            "exit_code": 0,
+            "status": "completed",
+            "output_truncated": true
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].output_truncated, Some(true));
+    }
+
+    #[test]
+    fn v0145_exec_command_end_with_bytes_truncated_nonzero_sets_output_truncated() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_trunc_3".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"find / -name '*.rs'","workdir":"/"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_trunc_3",
+            "aggregated_output": "/src/main.rs\n...(clipped)",
+            "exit_code": 0,
+            "status": "completed",
+            "bytes_truncated": 65536u64
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].output_truncated, Some(true));
+    }
+
+    #[test]
+    fn v0145_exec_command_end_bytes_truncated_zero_yields_some_false() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_trunc_4".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hi","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        // bytes_truncated = 0 means no bytes were dropped — not truncated
+        let payload = json!({
+            "call_id": "call_trunc_4",
+            "aggregated_output": "hi\n",
+            "exit_code": 0,
+            "status": "completed",
+            "bytes_truncated": 0u64
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert_eq!(builder.finalized[0].output_truncated, Some(false));
+    }
+
+    #[test]
+    fn pre_v0145_exec_command_end_without_truncation_field_yields_none() {
+        // Pre-v0.145.0 sessions have no truncation indicator — output_truncated must be None.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_no_trunc".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hello","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_no_trunc",
+            "aggregated_output": "hello\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 10_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        assert!(
+            builder.finalized[0].output_truncated.is_none(),
+            "output_truncated must be None when no truncation field is present"
+        );
+    }
+
+    #[test]
+    fn v0145_truncation_propagated_to_backfill_exec_entry() {
+        // When function_call_output arrives before exec_command_end (v0.132.0+ sessions),
+        // exec_command_end must backfill output_truncated into the existing entry.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_backfill".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"cat huge.log","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        // function_call_output arrives first (v0.132.0+ ordering)
+        builder.add_function_call_output("call_backfill", "partial output...", None);
+
+        // exec_command_end arrives second with truncation indicator
+        let payload = json!({
+            "call_id": "call_backfill",
+            "aggregated_output": "partial output...",
+            "exit_code": 0,
+            "status": "completed",
+            "truncated": true,
+            "duration": {"secs": 2, "nanos": 0u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        // Should still have exactly one entry (backfilled, not duplicated)
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.output_truncated, Some(true));
+        assert_eq!(tool.exit_code, Some(0));
     }
 }
