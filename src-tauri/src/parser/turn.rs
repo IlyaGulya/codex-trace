@@ -136,6 +136,11 @@ pub struct CodexTurn {
     /// Items carry an optional version field (Codex v0.132.0+, PR #23148).
     /// Empty for sessions from older Codex versions.
     pub memories: Vec<MemorySummary>,
+    /// Audio transcript segments from realtime voice turns (Codex v0.143.0+, PRs #29918, #30144;
+    /// live mid-turn segments in Codex v0.145.0+ V3 streaming realtime audio).
+    /// Empty for non-voice sessions.
+    #[serde(default)]
+    pub audio_transcript: Vec<String>,
 }
 
 impl CodexTurn {
@@ -165,6 +170,7 @@ impl CodexTurn {
             forked_from_thread_id: None,
             compaction_meta: None,
             memories: Vec::new(),
+            audio_transcript: Vec::new(),
         }
     }
 }
@@ -743,6 +749,31 @@ fn handle_event_msg(
         // semantics and are explicitly skipped so ordinary sessions with auth flows parse
         // without corrupting turn data.
         "mcp_auth_request" | "mcp_auth_result" | "mcp_auth_challenge" | "mcp_auth_complete" => {}
+
+        // Codex v0.143.0 (PRs #29918, #30144): trailing realtime transcript text preserved
+        // during shutdown. Codex v0.145.0 reintroduces streaming realtime V3 audio and emits
+        // this event type mid-turn (live voice segments, not just shutdown-time trailing text).
+        // Extract the transcript so voice-turn content is surfaced rather than silently dropped.
+        "realtime_transcript_text" => {
+            let text = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !text.is_empty() {
+                let target_id = payload
+                    .get("turn_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .or_else(|| current_turn_id.clone());
+                if let Some(ref tid) = target_id {
+                    if let Some(turn) = turns.get_mut(tid) {
+                        turn.audio_transcript.push(text);
+                    }
+                }
+            }
+        }
 
         _ => {}
     }

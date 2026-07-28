@@ -1790,4 +1790,48 @@ mod tests {
             "session_end marker must close the session regardless of turn state"
         );
     }
+
+    // Codex v0.145.0: streaming realtime V3 audio conversations reintroduced (issue #201).
+    // Unlike v0.143.0's trailing-only events (after task_complete), v0.145.0 emits
+    // realtime_transcript_text mid-turn during live streaming voice conversations.
+    // The turn model must capture audio_transcript content, not silently drop it.
+
+    #[test]
+    fn v0145_live_realtime_transcript_mid_turn_is_captured() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-07-26T10-00-00-v0145audio.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"v0145-audio-session","timestamp":"2026-07-26T10:00:00Z","cwd":"/project","cli_version":"0.145.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a1"}}"#,
+                r#"{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"realtime_transcript_text","text":"Hello, please run the tests","turn_id":"turn-a1"}}"#,
+                r#"{"timestamp":"2026-07-26T10:00:03Z","type":"event_msg","payload":{"type":"realtime_transcript_text","text":" for the current project","turn_id":"turn-a1"}}"#,
+                r#"{"timestamp":"2026-07-26T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Running the tests now.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-07-26T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-a1","completed_at":1753520405.0}}"#,
+                r#"{"timestamp":"2026-07-26T10:00:06Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0145-audio-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].audio_transcript,
+            vec![
+                "Hello, please run the tests".to_string(),
+                " for the current project".to_string(),
+            ],
+            "mid-turn realtime_transcript_text events must be extracted into audio_transcript"
+        );
+        assert_eq!(
+            session.turns[0].final_answer.as_deref(),
+            Some("Running the tests now."),
+        );
+        assert!(!session.is_ongoing);
+    }
 }
