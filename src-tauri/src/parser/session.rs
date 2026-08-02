@@ -42,6 +42,12 @@ pub struct CodexSession {
     /// function_call_output for spawn_agent to be empty. When this is true, multi-agent
     /// subagent lineage is absent and users should set hide_spawn_agent_metadata = false.
     pub has_missing_spawn_metadata: bool,
+    /// Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
+    /// inherits from, read from session_meta.payload.history_base.thread_id. Distinct from
+    /// the per-turn `forked_from_thread_id` and compaction `lineage_id` fields — this one
+    /// marks the whole rollout file as a continuation of another paginated thread's history.
+    /// Null for legacy-history sessions or paginated threads with no inherited prefix.
+    pub history_base_thread_id: Option<String>,
 }
 
 /// Parse a Codex JSONL session file into a CodexSession.
@@ -87,6 +93,7 @@ fn parse_session_inner(
         ai_title: None,
         is_headless: false,
         has_missing_spawn_metadata: false,
+        history_base_thread_id: None,
     };
 
     // Parse session_meta from first matching entry
@@ -303,6 +310,15 @@ fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Va
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| opt_str(payload, "instructions"));
+
+    // Codex v0.146.0 (PRs #34621, #35220): a paginated rollout continuing another thread's
+    // history carries session_meta.history_base.thread_id pointing at the source rollout.
+    session.history_base_thread_id = payload
+        .get("history_base")
+        .and_then(|b| b.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 }
 
 fn parse_session_meta_root(session: &mut CodexSession, raw: &Value) {
@@ -1833,5 +1849,55 @@ mod tests {
             Some("Running the tests now."),
         );
         assert!(!session.is_ongoing);
+    }
+
+    // Codex v0.146.0 (PRs #34621, #35220, issue #210): a paginated thread that forks or
+    // inherits history from another rollout carries session_meta.history_base.thread_id,
+    // pointing at the source rollout it continues from. This is distinct from the per-turn
+    // forked_from_thread_id and compaction lineage_id fields.
+
+    #[test]
+    fn v0146_parse_session_reads_history_base_thread_id() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-08-01T10-00-00-v0146fork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"v0146-fork-child","timestamp":"2026-08-01T10:00:00Z","cwd":"/project","cli_version":"0.146.0","model_provider":"openai","history_mode":"paginated","history_base":{"thread_id":"v0146-fork-parent","end_ordinal_exclusive":5,"end_byte_offset":512}}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785657602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(
+            session.history_base_thread_id.as_deref(),
+            Some("v0146-fork-parent")
+        );
+    }
+
+    #[test]
+    fn v0146_parse_session_no_history_base_is_none() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-08-01T10-01-00-v0146nofork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-01T10:01:00Z","type":"session_meta","payload":{"id":"v0146-nofork","timestamp":"2026-08-01T10:01:00Z","cwd":"/project","cli_version":"0.146.0","model_provider":"openai","history_mode":"legacy"}}"#,
+                r#"{"timestamp":"2026-08-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-01T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785657662.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert!(session.history_base_thread_id.is_none());
     }
 }

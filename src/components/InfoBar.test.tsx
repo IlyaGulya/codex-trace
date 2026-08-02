@@ -35,6 +35,7 @@ function makeSession(overrides: Partial<CodexSession> = {}): CodexSession {
     has_missing_spawn_metadata: false,
     is_archived: false,
     approval_mode: null,
+    history_base_thread_id: null,
     ...overrides,
   };
 }
