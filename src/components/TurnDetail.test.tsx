@@ -169,4 +169,25 @@ describe("TurnDetail", () => {
     expect(iTool).toBeGreaterThan(iFirst);
     expect(iSecond).toBeGreaterThan(iTool);
   });
+
+  // Codex v0.146.0 (issue #211): skill catalog budget/truncation notices arrive as
+  // `EventMsg::Warning` and are surfaced per-turn via `CodexTurn.warnings`.
+  it("shows warnings, e.g. a skill catalog budget notice", () => {
+    renderTurnDetail(
+      makeTurn({
+        warnings: ["Skill catalog exceeded its context budget; 3 additional skills omitted."],
+      }),
+    );
+
+    expect(screen.getByText("Warnings")).toBeInTheDocument();
+    expect(
+      screen.getByText("Skill catalog exceeded its context budget; 3 additional skills omitted."),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the Warnings section when there are no warnings", () => {
+    renderTurnDetail(makeTurn());
+
+    expect(screen.queryByText("Warnings")).not.toBeInTheDocument();
+  });
 });

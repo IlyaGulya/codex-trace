@@ -141,6 +141,10 @@ pub struct CodexTurn {
     /// Empty for non-voice sessions.
     #[serde(default)]
     pub audio_transcript: Vec<String>,
+    /// Warning messages emitted during the turn (Codex `EventMsg::Warning`), e.g. skill
+    /// catalog budget/truncation notices (Codex v0.146.0+). Empty when no warnings occurred.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl CodexTurn {
@@ -171,6 +175,7 @@ impl CodexTurn {
             compaction_meta: None,
             memories: Vec::new(),
             audio_transcript: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -587,6 +592,25 @@ fn handle_event_msg(
                         .to_string();
                     turn.status = TurnStatus::Error;
                     turn.error = Some(msg);
+                }
+            }
+        }
+
+        // Codex v0.146.0: skill catalog rendering emits `EventMsg::Warning` when the
+        // catalog is truncated or skills are omitted for budget reasons. `warning` is a
+        // generic notice event (also used for e.g. model-reroute warnings), so surface
+        // its message on the current turn rather than dropping it.
+        "warning" => {
+            if let Some(ref tid) = current_turn_id {
+                if let Some(turn) = turns.get_mut(tid) {
+                    let msg = payload
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !msg.is_empty() {
+                        turn.warnings.push(msg);
+                    }
                 }
             }
         }

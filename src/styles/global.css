@@ -2884,7 +2884,8 @@ body {
 .turn-detail__user-msg,
 .turn-detail__agent-msg,
 .turn-detail__final-answer,
-.turn-detail__error {
+.turn-detail__error,
+.turn-detail__warning {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: inherit;
@@ -2894,6 +2895,12 @@ body {
 }
 .turn-detail__error {
   color: var(--status-error);
+}
+.turn-detail__warning {
+  color: var(--context-warn);
+}
+.turn-detail__warning + .turn-detail__warning {
+  margin-top: 0.4rem;
 }
 .turn-detail__final-answer {
   color: var(--text-bright);
