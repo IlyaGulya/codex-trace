@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // zstd frame magic: 0xFD2FB528 stored little-endian => bytes [0x28, 0xB5, 0x2F, 0xFD]
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -41,6 +41,27 @@ fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize>
         }
     }
     Ok(total)
+}
+
+/// Resolve the actual on-disk path for a rollout session file.
+///
+/// Codex's background compression worker can replace a cold plain `rollout-*.jsonl`
+/// file with a `rollout-*.jsonl.zst` sibling and remove the original (see
+/// `codex-rs/rollout/src/compression.rs` upstream). A watcher holding the original
+/// plain path would otherwise find it gone and silently stop updating. Returns
+/// `None` if neither representation exists.
+pub fn resolve_rollout_path(path: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        return Some(path.to_path_buf());
+    }
+    let name = path.file_name()?.to_str()?;
+    if !name.ends_with(".jsonl.zst") {
+        let compressed = path.with_file_name(format!("{name}.zst"));
+        if compressed.exists() {
+            return Some(compressed);
+        }
+    }
+    None
 }
 
 /// Read a session file that may be plain text or zstd-compressed.
@@ -170,5 +191,31 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("does-not-exist.jsonl");
         assert!(open_session_reader(&path).is_err());
+    }
+
+    #[test]
+    fn resolve_rollout_path_returns_plain_path_when_it_exists() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-plain.jsonl");
+        std::fs::write(&path, "content").unwrap();
+        assert_eq!(resolve_rollout_path(&path), Some(path));
+    }
+
+    #[test]
+    fn resolve_rollout_path_falls_back_to_compressed_sibling() {
+        // Issue #209: a watched session that goes cold can be replaced by Codex's
+        // compression worker with a `.jsonl.zst` sibling, removing the plain file.
+        let tmp = tempdir().unwrap();
+        let plain_path = tmp.path().join("rollout-cold.jsonl");
+        let compressed_path = tmp.path().join("rollout-cold.jsonl.zst");
+        std::fs::write(&compressed_path, compress_zstd(b"content")).unwrap();
+        assert_eq!(resolve_rollout_path(&plain_path), Some(compressed_path));
+    }
+
+    #[test]
+    fn resolve_rollout_path_returns_none_when_neither_representation_exists() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-gone.jsonl");
+        assert_eq!(resolve_rollout_path(&path), None);
     }
 }

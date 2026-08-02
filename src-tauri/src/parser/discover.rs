@@ -96,13 +96,36 @@ fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<
         let path = entry.path();
         if path.is_dir() {
             collect_jsonl_files(&path, infos)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with("rollout-") {
-                if let Some(info) = scan_session_file(&path) {
-                    infos.push(info);
-                }
+            continue;
+        }
+
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("rollout-") {
+            continue;
+        }
+
+        // Codex's background rollout compression worker (codex-rs/rollout/src/compression.rs,
+        // present since v0.137.0 and still active as of v0.146.0's #34566) replaces a cold
+        // `rollout-*.jsonl` file with a `rollout-*.jsonl.zst` sibling and removes the plain
+        // file. Without recognizing the compressed suffix, discovery silently drops any
+        // session Codex has compressed — it just vanishes from the list with no indication.
+        if let Some(plain_name) = name
+            .strip_suffix(".jsonl.zst")
+            .map(|s| format!("{s}.jsonl"))
+        {
+            // A plain sibling briefly coexists with its compressed copy while Codex
+            // materializes it back for append; skip the compressed copy in that case so
+            // the session isn't counted twice.
+            let plain_sibling = path.with_file_name(plain_name);
+            if plain_sibling.exists() {
+                continue;
             }
+        } else if !name.ends_with(".jsonl") {
+            continue;
+        }
+
+        if let Some(info) = scan_session_file(&path) {
+            infos.push(info);
         }
     }
 
@@ -1289,6 +1312,72 @@ mod tests {
         assert!(
             sessions.iter().any(|s| s.id == "v0137-compressed"),
             "compressed session must be found"
+        );
+    }
+
+    // Issue #209 / Codex v0.146.0 (PR #34566 touches rollout compression cleanup):
+    // Codex's background compression worker (codex-rs/rollout/src/compression.rs) replaces a
+    // cold `rollout-*.jsonl` file with a `rollout-*.jsonl.zst` sibling and removes the plain
+    // file — it does not rewrite zstd bytes into the original `.jsonl` name. discover_sessions
+    // must recognize the `.jsonl.zst` suffix so a compressed session isn't silently dropped.
+
+    #[test]
+    fn discover_sessions_v0146_compressed_only_session_uses_real_zst_suffix() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/28");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // Real Codex compression appends `.zst` to the plain filename rather than
+        // compressing in place under the original `.jsonl` name.
+        let compressed_path = day_dir.join("rollout-2026-07-28T10-00-00-coldsession.jsonl.zst");
+        let content = [
+            r#"{"timestamp":"2026-07-28T10:00:00Z","type":"session_meta","payload":{"id":"v0146-cold","timestamp":"2026-07-28T10:00:00Z","cli_version":"0.146.0"}}"#,
+            r#"{"timestamp":"2026-07-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"timestamp":"2026-07-28T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1753696802.0}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&compressed_path, compress_zstd(content.as_bytes())).unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert!(
+            sessions.iter().any(|s| s.id == "v0146-cold"),
+            "session compressed to a `.jsonl.zst` sibling must still be discovered, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0146_compressed_sibling_of_existing_plain_not_double_counted() {
+        // Codex briefly materializes a compressed rollout back to plain `.jsonl` for append
+        // before removing the `.zst` copy. If both are momentarily present, the session must
+        // be counted once, not twice.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/28");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let base_name = "rollout-2026-07-28T11-00-00-transition.jsonl";
+        let content = [
+            r#"{"timestamp":"2026-07-28T11:00:00Z","type":"session_meta","payload":{"id":"v0146-transition","timestamp":"2026-07-28T11:00:00Z","cli_version":"0.146.0"}}"#,
+            r#"{"timestamp":"2026-07-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"timestamp":"2026-07-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1753700402.0}}"#,
+        ]
+        .join("\n");
+
+        std::fs::write(day_dir.join(base_name), &content).unwrap();
+        std::fs::write(
+            day_dir.join(format!("{base_name}.zst")),
+            compress_zstd(content.as_bytes()),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let matches: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.id == "v0146-transition")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "plain + compressed copies of the same rollout must be counted once, not twice"
         );
     }
 
