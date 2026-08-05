@@ -231,6 +231,12 @@ export interface CodexSession {
    * Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
    * Null for sessions predating v0.144.0 or when the field is absent. */
   approval_mode: string | null;
+  /** Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
+   * inherits from (session_meta.payload.history_base.thread_id). Distinct from the
+   * per-turn `forked_from_thread_id` and compaction `lineage_id` fields — this one marks
+   * the whole rollout file as a continuation of another paginated thread's history.
+   * Null for legacy-history sessions or paginated threads with no inherited prefix. */
+  history_base_thread_id: string | null;
 }
 
 export interface CodexSessionInfo {
@@ -264,6 +270,12 @@ export interface CodexSessionInfo {
    * Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
    * Null for sessions predating v0.144.0 or when the field is absent. */
   approval_mode: string | null;
+  /** Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
+   * inherits from (session_meta.payload.history_base.thread_id). Distinct from the
+   * per-turn `forked_from_thread_id` and compaction `lineage_id` fields — this one marks
+   * the whole rollout file as a continuation of another paginated thread's history.
+   * Null for legacy-history sessions or paginated threads with no inherited prefix. */
+  history_base_thread_id: string | null;
 }
 
 export interface SettingsResponse {

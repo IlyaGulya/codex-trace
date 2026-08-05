@@ -179,6 +179,7 @@ mod tests {
                     date_group: String::new(),
                     ai_title: None,
                     approval_mode: None,
+                    history_base_thread_id: None,
                 }],
             });
         }
@@ -225,6 +226,7 @@ mod tests {
                     date_group: String::new(),
                     ai_title: None,
                     approval_mode: None,
+                    history_base_thread_id: None,
                 }],
             });
         }

@@ -46,10 +46,21 @@ pub struct CodexSessionInfo {
     /// Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
     /// Null for sessions predating v0.144.0 or when the field is absent.
     pub approval_mode: Option<String>,
+    /// Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
+    /// inherits from, read from session_meta.payload.history_base.thread_id. Distinct from
+    /// the per-turn `forked_from_thread_id` and compaction `lineage_id` fields — this one
+    /// marks a whole rollout file as a continuation of another paginated thread's history.
+    /// Null for legacy-history sessions or paginated threads with no inherited prefix.
+    pub history_base_thread_id: Option<String>,
 }
 
 /// Scan a sessions directory recursively for all rollout-*.jsonl files.
 /// Returns CodexSessionInfo sorted by filename descending (newest first).
+///
+/// Note on Codex v0.146.0 ephemeral/temporary forks (issue #210): the app-server keeps
+/// ephemeral forked threads "pathless" and never materializes them to a rollout file, so
+/// they cannot appear here and need no explicit filtering — this scanner only ever sees
+/// files that were actually written to `sessions_dir`.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -96,13 +107,36 @@ fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<
         let path = entry.path();
         if path.is_dir() {
             collect_jsonl_files(&path, infos)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with("rollout-") {
-                if let Some(info) = scan_session_file(&path) {
-                    infos.push(info);
-                }
+            continue;
+        }
+
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("rollout-") {
+            continue;
+        }
+
+        // Codex's background rollout compression worker (codex-rs/rollout/src/compression.rs,
+        // present since v0.137.0 and still active as of v0.146.0's #34566) replaces a cold
+        // `rollout-*.jsonl` file with a `rollout-*.jsonl.zst` sibling and removes the plain
+        // file. Without recognizing the compressed suffix, discovery silently drops any
+        // session Codex has compressed — it just vanishes from the list with no indication.
+        if let Some(plain_name) = name
+            .strip_suffix(".jsonl.zst")
+            .map(|s| format!("{s}.jsonl"))
+        {
+            // A plain sibling briefly coexists with its compressed copy while Codex
+            // materializes it back for append; skip the compressed copy in that case so
+            // the session isn't counted twice.
+            let plain_sibling = path.with_file_name(plain_name);
+            if plain_sibling.exists() {
+                continue;
             }
+        } else if !name.ends_with(".jsonl") {
+            continue;
+        }
+
+        if let Some(info) = scan_session_file(&path) {
+            infos.push(info);
         }
     }
 
@@ -161,6 +195,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         ai_title,
         meta_archived,
         approval_mode,
+        history_base_thread_id,
     ) = match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
@@ -209,6 +244,16 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
+            // Codex v0.146.0 (PRs #34621, #35220): a paginated rollout continuing another
+            // thread's history carries session_meta.history_base.thread_id pointing at the
+            // source rollout. This is the lineage-chain marker for session-tree reconstruction
+            // across paginated forks — separate from the per-turn forked_from_thread_id.
+            let history_base_thread_id = payload
+                .get("history_base")
+                .and_then(|b| b.get("thread_id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             (
                 id,
                 start_time,
@@ -224,6 +269,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 ai_title,
                 meta_archived,
                 approval_mode,
+                history_base_thread_id,
             )
         }
         "session_meta_root" => {
@@ -236,7 +282,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             (
                 id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false, None,
+                false, None, None,
             )
         }
         _ => return None,
@@ -481,6 +527,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         date_group,
         ai_title,
         approval_mode,
+        history_base_thread_id,
     })
 }
 
@@ -1292,6 +1339,72 @@ mod tests {
         );
     }
 
+    // Issue #209 / Codex v0.146.0 (PR #34566 touches rollout compression cleanup):
+    // Codex's background compression worker (codex-rs/rollout/src/compression.rs) replaces a
+    // cold `rollout-*.jsonl` file with a `rollout-*.jsonl.zst` sibling and removes the plain
+    // file — it does not rewrite zstd bytes into the original `.jsonl` name. discover_sessions
+    // must recognize the `.jsonl.zst` suffix so a compressed session isn't silently dropped.
+
+    #[test]
+    fn discover_sessions_v0146_compressed_only_session_uses_real_zst_suffix() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/28");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // Real Codex compression appends `.zst` to the plain filename rather than
+        // compressing in place under the original `.jsonl` name.
+        let compressed_path = day_dir.join("rollout-2026-07-28T10-00-00-coldsession.jsonl.zst");
+        let content = [
+            r#"{"timestamp":"2026-07-28T10:00:00Z","type":"session_meta","payload":{"id":"v0146-cold","timestamp":"2026-07-28T10:00:00Z","cli_version":"0.146.0"}}"#,
+            r#"{"timestamp":"2026-07-28T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"timestamp":"2026-07-28T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1753696802.0}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&compressed_path, compress_zstd(content.as_bytes())).unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        assert!(
+            sessions.iter().any(|s| s.id == "v0146-cold"),
+            "session compressed to a `.jsonl.zst` sibling must still be discovered, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0146_compressed_sibling_of_existing_plain_not_double_counted() {
+        // Codex briefly materializes a compressed rollout back to plain `.jsonl` for append
+        // before removing the `.zst` copy. If both are momentarily present, the session must
+        // be counted once, not twice.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/07/28");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let base_name = "rollout-2026-07-28T11-00-00-transition.jsonl";
+        let content = [
+            r#"{"timestamp":"2026-07-28T11:00:00Z","type":"session_meta","payload":{"id":"v0146-transition","timestamp":"2026-07-28T11:00:00Z","cli_version":"0.146.0"}}"#,
+            r#"{"timestamp":"2026-07-28T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"timestamp":"2026-07-28T11:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1753700402.0}}"#,
+        ]
+        .join("\n");
+
+        std::fs::write(day_dir.join(base_name), &content).unwrap();
+        std::fs::write(
+            day_dir.join(format!("{base_name}.zst")),
+            compress_zstd(content.as_bytes()),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let matches: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.id == "v0146-transition")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "plain + compressed copies of the same rollout must be counted once, not twice"
+        );
+    }
+
     // Codex v0.142.0 (PR #29432, PR #29457): persistent log verbosity reduced.
     //
     // PR #29432: Responses WebSocket events are no longer logged on every message.
@@ -1482,5 +1595,91 @@ mod tests {
             Some("2026-07-12T10:01:03Z"),
             "end_time must be set from inference_stream_cancelled timestamp"
         );
+    }
+
+    // Codex v0.146.0 (PRs #34621, #35220, issue #210): paginated threads that fork or
+    // inherit history from another rollout carry session_meta.history_base.thread_id,
+    // pointing at the source rollout this one continues from. discover_sessions must
+    // surface this so a paginated-history continuation is not treated as a fully
+    // independent session with no prior context.
+
+    #[test]
+    fn discover_sessions_v0146_reads_history_base_thread_id() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-01T10-00-00-v0146-fork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"v0146-fork-child","timestamp":"2026-08-01T10:00:00Z","cwd":"/project","cli_version":"0.146.0","model_provider":"openai","history_mode":"paginated","history_base":{"thread_id":"v0146-fork-parent","end_ordinal_exclusive":5,"end_byte_offset":512}}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785657602.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0146-fork-child")
+            .expect("paginated fork continuation must be discovered");
+        assert_eq!(
+            session.history_base_thread_id.as_deref(),
+            Some("v0146-fork-parent"),
+            "history_base.thread_id must be surfaced as history_base_thread_id"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0146_no_history_base_is_none() {
+        // Legacy-history sessions (and paginated sessions with no inherited prefix) must
+        // not set history_base_thread_id.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-01T10-01-00-v0146-nofork.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-01T10:01:00Z","type":"session_meta","payload":{"id":"v0146-nofork","timestamp":"2026-08-01T10:01:00Z","cwd":"/project","cli_version":"0.146.0","model_provider":"openai","history_mode":"legacy"}}"#,
+                r#"{"timestamp":"2026-08-01T10:01:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-01T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785657662.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0146-nofork")
+            .expect("session must be discovered");
+        assert!(
+            session.history_base_thread_id.is_none(),
+            "session without history_base must have history_base_thread_id == None"
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0146_malformed_history_base_does_not_panic() {
+        // Defensive: a history_base object missing thread_id must be tolerated, not panic.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-01T10-02-00-v0146-malformed.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-08-01T10:02:00Z","type":"session_meta","payload":{"id":"v0146-malformed","timestamp":"2026-08-01T10:02:00Z","history_mode":"paginated","history_base":{"end_ordinal_exclusive":5}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0146-malformed")
+            .expect("session must be discovered even with malformed history_base");
+        assert!(session.history_base_thread_id.is_none());
     }
 }
