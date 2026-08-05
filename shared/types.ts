@@ -183,6 +183,10 @@ export interface CodexTurn {
    * Codex v0.145.0+ live mid-turn V3 streaming audio). Empty for non-voice sessions.
    * Absent for cached data serialized before this field was added. */
   audio_transcript?: string[];
+  /** Warning messages emitted during the turn (`EventMsg::Warning`), e.g. skill catalog
+   * budget/truncation notices (Codex v0.146.0+). Empty when no warnings occurred.
+   * Absent for cached data serialized before this field was added. */
+  warnings?: string[];
 }
 
 /**

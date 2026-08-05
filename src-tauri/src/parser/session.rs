@@ -1900,4 +1900,50 @@ mod tests {
         let session = parse_session(&path).unwrap();
         assert!(session.history_base_thread_id.is_none());
     }
+
+    // Codex v0.146.0 (issue #211): the new skills subsystem renders the skill catalog into
+    // the developer message on each turn and emits a plain `EventMsg::Warning` when the
+    // catalog is truncated or skills are omitted for budget reasons
+    // (`codex-rs/core/src/session/mod.rs`, `build_available_skills` call site). codex-trace
+    // had no handling for the generic `warning` event_msg type at all, so these notices
+    // (and any other `EventMsg::Warning`, e.g. model-reroute warnings) were silently dropped.
+
+    #[test]
+    fn v0146_skill_catalog_warning_is_captured_on_turn() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-08-01T10-00-00-v0146skills.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"v0146-skills-session","timestamp":"2026-08-01T10:00:00Z","cwd":"/project","cli_version":"0.146.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"warning","message":"Skill catalog exceeded its context budget; 3 additional skills omitted."}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1754043604.0}}"#,
+                r#"{"timestamp":"2026-08-01T10:00:05Z","type":"session_end","payload":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let session = parse_session(&path).unwrap();
+        assert_eq!(session.id, "v0146-skills-session");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].warnings,
+            vec![
+                "Skill catalog exceeded its context budget; 3 additional skills omitted."
+                    .to_string()
+            ],
+            "skill catalog budget warnings must be captured, not silently dropped"
+        );
+        assert_eq!(
+            session.turns[0].status,
+            TurnStatus::Complete,
+            "a warning must not itself mark the turn as errored"
+        );
+        assert!(!session.is_ongoing);
+    }
 }

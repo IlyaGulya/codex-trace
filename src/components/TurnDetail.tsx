@@ -110,6 +110,17 @@ export function TurnDetail({
             </div>
           )}
 
+          {turn.warnings && turn.warnings.length > 0 && (
+            <div className="turn-detail__section turn-detail__section--warning">
+              <div className="turn-detail__section-label">Warnings</div>
+              {turn.warnings.map((warning) => (
+                <pre key={warning} className="turn-detail__warning">
+                  {warning}
+                </pre>
+              ))}
+            </div>
+          )}
+
           {reasoning.length > 0 && (
             <div className="turn-detail__section turn-detail__section--reasoning">
               <div
