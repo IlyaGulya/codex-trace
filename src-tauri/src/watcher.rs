@@ -61,12 +61,22 @@ struct SessionUpdatePayload {
     session: crate::parser::session::CodexSession,
 }
 
+/// True for `rollout-*.jsonl` and `rollout-*.jsonl.zst` files — Codex's background
+/// compression worker replaces a cold plain rollout with a `.jsonl.zst` sibling, so both
+/// representations must be treated as session files for change detection.
+fn is_rollout_jsonl_name(name: &str) -> bool {
+    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
+}
+
 fn is_related_session_path(changed_path: &Path, session_file: &Path) -> bool {
     if changed_path == session_file {
         return true;
     }
 
-    changed_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+    changed_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_rollout_jsonl_name)
         && changed_path.parent() == session_file.parent()
 }
 
@@ -119,7 +129,10 @@ pub fn start_session_watcher(
                 _ = stop_rx.recv() => break,
                 Some(()) = signal_rx.recv() => {
                     let p = std::path::Path::new(&path_for_rebuild);
-                    let session = match parse_session(p) {
+                    let Some(resolved) = crate::parser::compression::resolve_rollout_path(p) else {
+                        continue;
+                    };
+                    let session = match parse_session(&resolved) {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
@@ -183,7 +196,7 @@ pub fn start_picker_watcher(
             |event| {
                 event.paths.iter().any(|p| {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    name.ends_with(".jsonl")
+                    is_rollout_jsonl_name(name)
                 })
             },
             signal_tx_clone,
@@ -243,6 +256,16 @@ mod tests {
         let session_file = Path::new("/tmp/sessions/rollout-parent.jsonl");
         let worker_file = Path::new("/tmp/sessions/rollout-worker.jsonl");
         assert!(is_related_session_path(worker_file, session_file));
+    }
+
+    #[test]
+    fn related_session_path_matches_compressed_zst_sibling() {
+        // Issue #209: Codex's background compression worker replaces a cold rollout
+        // with a `.jsonl.zst` sibling. The watcher must still treat that as related
+        // so the picker/session view refreshes instead of going stale.
+        let session_file = Path::new("/tmp/sessions/rollout-parent.jsonl");
+        let compressed_sibling = Path::new("/tmp/sessions/rollout-parent.jsonl.zst");
+        assert!(is_related_session_path(compressed_sibling, session_file));
     }
 
     #[test]
