@@ -960,6 +960,17 @@ fn handle_response_item(
         // tool_search_call mid-turn; matching tools are returned in tool_search_call_output.
         // Merge the discovered tools into the current turn's dynamic tool registry so
         // subsequent function_call entries are classified as McpTool correctly.
+        //
+        // Codex v0.147.0 (issue #222): the bundled MCP SDK bump to 3.0.0 (#36001) and the
+        // opt-in MCP 2026-07-28 protocol (#35724, #35725, #35590, #35742) were audited against
+        // the openai/codex source. Both only change the wire protocol between Codex and MCP
+        // *servers* (SDK type renames, paginated `server/discover` requests, multi-round
+        // tools/call negotiation, non-blocking server startup) — that pagination is resolved
+        // internally before Codex ever builds `dynamic_tools` or tool-search results. Neither
+        // change touches `codex-rs/protocol` (rollout item types), `app-server/src/dynamic_tools.rs`,
+        // or the tool_search_call/tool_search_call_output mechanism handled here, so the
+        // model-facing discovery flow below (and issue #161's fix) is unaffected. No rollout
+        // JSONL shape change; no parser change needed.
         "tool_search_call" => {
             // Search request — tool definitions arrive in the paired tool_search_call_output.
         }
