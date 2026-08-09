@@ -1626,4 +1626,38 @@ mod tests {
         assert_eq!(event_msg_type(&complete.payload), Some("mcp_auth_complete"));
         assert_eq!(complete.payload["success"], true);
     }
+
+    // Codex v0.147.0 (PR #36054): the deprecated `codex exec --full-auto` CLI flag
+    // has been removed entirely; `--sandbox workspace-write` is now the only way to
+    // get that behavior. codex-trace never invokes the Codex CLI and never passes
+    // this flag to any process — it only reads `permission_profile` as recorded
+    // session metadata, which is unrelated to the removed CLI flag and keeps its
+    // existing string values (including the historical "full-auto" value). Verify
+    // all four standard entry types from a v0.147.0 session still parse correctly
+    // and that a "full-auto" permission profile value is read as data, unaffected
+    // by the flag's removal.
+    #[test]
+    fn v0147_full_auto_flag_removal_does_not_affect_session_meta_parsing() {
+        let lines = [
+            r#"{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"id":"v0147-session","timestamp":"2026-08-01T10:00:00Z","cwd":"/project","cli_version":"0.147.0","model_provider":"openai","permission_profile":"full-auto"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Hello"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:03Z","type":"turn_context","payload":{"model":"gpt-5","cwd":"/project"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1785578404.0}}"#,
+        ];
+        let expected_types = [
+            "session_meta",
+            "event_msg",
+            "response_item",
+            "turn_context",
+            "event_msg",
+        ];
+        for (line, expected) in lines.iter().zip(expected_types.iter()) {
+            let entry = RawEntry::parse(line).expect("parse failed");
+            assert_eq!(entry.entry_type, *expected, "wrong type for: {line}");
+        }
+        let meta = RawEntry::parse(lines[0]).unwrap();
+        assert_eq!(meta.payload["cli_version"], "0.147.0");
+        assert_eq!(meta.payload["permission_profile"], "full-auto");
+    }
 }
