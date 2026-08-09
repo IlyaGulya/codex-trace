@@ -1,3 +1,4 @@
+use super::redact::redact_secrets;
 use super::spawn::parse_spawn_agent_output;
 
 use serde::{Deserialize, Serialize};
@@ -539,7 +540,8 @@ impl ToolCallBuilder {
 
         let command: Option<Vec<String>> = payload
             .get("command")
-            .and_then(|c| serde_json::from_value(c.clone()).ok());
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+            .map(redact_command);
         let exit_code = payload
             .get("exit_code")
             .and_then(|v| v.as_i64())
@@ -1150,11 +1152,20 @@ fn spawn_agent_status(output: &str) -> String {
 
 fn command_from_arguments(arguments: &Value) -> Option<Vec<String>> {
     if let Some(cmd) = arguments.get("cmd").and_then(|v| v.as_str()) {
-        return Some(vec![cmd.to_string()]);
+        return Some(redact_command(vec![cmd.to_string()]));
     }
     arguments
         .get("command")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .map(redact_command)
+}
+
+/// Codex v0.147.0 (#36893, #36908) redacts secrets from displayed commands, but only at its
+/// app-server-protocol display layer — the raw command persisted to the rollout JSONL is
+/// unaffected. Apply the same redaction here so codex-trace, which reads that raw JSONL
+/// directly, doesn't surface secrets that Codex's own clients now hide.
+fn redact_command(command: Vec<String>) -> Vec<String> {
+    command.into_iter().map(|s| redact_secrets(&s)).collect()
 }
 
 fn cwd_from_arguments(arguments: &Value) -> Option<String> {
@@ -2585,5 +2596,63 @@ mod tests {
         assert_eq!(tool.kind, ToolKind::ExecCommand);
         assert_eq!(tool.output_truncated, Some(true));
         assert_eq!(tool.exit_code, Some(0));
+    }
+
+    // Codex v0.147.0 (#36893, #36908): Codex's own redaction only applies at its
+    // app-server-protocol display layer, not to the raw command persisted in the rollout
+    // JSONL. codex-trace must redact recognizable secrets itself when extracting `command`.
+    #[test]
+    fn exec_command_end_command_field_has_secrets_redacted() {
+        let fixture_token = format!("{}{}", "abcdefghijklmnop", "01234567");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_secret".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hi","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_secret",
+            "command": ["curl", "-H", format!("Authorization: Bearer {fixture_token}")],
+            "aggregated_output": "",
+            "exit_code": 0,
+            "status": "completed"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        let tool = &builder.finalized[0];
+        let command = tool.command.as_ref().expect("command should be present");
+        assert!(
+            !command.iter().any(|arg| arg.contains(&fixture_token)),
+            "redacted command must not contain the raw secret"
+        );
+        assert!(command[2].contains("Bearer [REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn function_call_output_cmd_argument_has_secrets_redacted() {
+        let fixture_token = format!("{}{}", "sk-", "abcdefghijklmnopqrstuvwx");
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_secret_arg".to_string(),
+            "exec_command".to_string(),
+            &format!(r#"{{"cmd":"export OPENAI_API_KEY={fixture_token}","workdir":"/tmp"}}"#),
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_secret_arg", "done", None);
+
+        let tool = &builder.finalized[0];
+        let command = tool.command.as_ref().expect("command should be present");
+        assert!(
+            !command.iter().any(|arg| arg.contains(&fixture_token)),
+            "redacted command must not contain the raw secret"
+        );
+        assert!(command[0].contains("[REDACTED_SECRET]"));
     }
 }
