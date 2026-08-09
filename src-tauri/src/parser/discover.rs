@@ -44,6 +44,11 @@ pub struct CodexSessionInfo {
     pub is_archived: bool,
     /// Approval mode from session_meta.ask_for_approval (Codex v0.144.0+, PR #30482).
     /// Known values: "suggest", "auto-edit", "full-auto", "writes" (new in v0.144.0).
+    /// Checked against upstream (PR #36373, #37057): v0.147.0's `--approve-for-me`
+    /// flag and v0.146.1's cyber-model auto-review defaults do NOT add a new value
+    /// here — both route through the existing "on-request" policy plus a separate
+    /// auto-review-reviewer setting, not a new ask_for_approval string. Parsing
+    /// below is already a permissive passthrough, so no new value is expected.
     /// Null for sessions predating v0.144.0 or when the field is absent.
     pub approval_mode: Option<String>,
     /// Codex v0.146.0 (PRs #34621, #35220): thread ID this rollout's paginated history
