@@ -18,6 +18,7 @@ function makeTool(overrides: Partial<CodexToolCall> = {}): CodexToolCall {
     mcp_server: null,
     mcp_tool: null,
     plugin_id: null,
+    script_path: null,
     patch_success: null,
     patch_changes: null,
     web_query: null,
@@ -191,6 +192,68 @@ describe("ToolCallItem", () => {
     const prefix = container.querySelector(".tool-call__mcp-prefix");
     expect(prefix).toBeInTheDocument();
     expect(prefix!.textContent).toBe("MCP codex_apps");
+  });
+
+  it("renders plugin_id and script_path for a plugin-attributed exec_command (v0.146.0+)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "exec_command",
+          plugin_id: "plugin-abc",
+          script_path: "scripts/run.py",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const pluginInfo = container.querySelector(".tool-call__plugin-info");
+    expect(pluginInfo).toBeInTheDocument();
+    expect(pluginInfo!.textContent).toBe("plugin: plugin-abc (scripts/run.py)");
+  });
+
+  it("does not render plugin info when plugin_id is null", () => {
+    const { container } = render(
+      <ToolCallItem tool={makeTool({ kind: "exec_command" })} expanded={true} onToggle={vi.fn()} />,
+    );
+    expect(container.querySelector(".tool-call__plugin-info")).not.toBeInTheDocument();
+  });
+
+  it("renders plugin_id for an mcp_tool call", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "mcp_tool",
+          mcp_server: "codex_apps",
+          mcp_tool: "get_pr_info",
+          plugin_id: "plugin-xyz",
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const pluginInfo = container.querySelector(".tool-call__plugin-info");
+    expect(pluginInfo).toBeInTheDocument();
+    expect(pluginInfo!.textContent).toBe("plugin: plugin-xyz");
+  });
+
+  it("renders request_plugin_install as an agent_plugin tool call (issue #223)", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "agent_plugin",
+          name: "request_plugin_install",
+          arguments: { tool_id: "sample@openai-curated", suggest_reason: "Needed for calendar" },
+          command: null,
+          exit_code: null,
+          output: '{"completed":true,"user_confirmed":true}',
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    const body = container.querySelector(".tool-call__body");
+    expect(body).toBeInTheDocument();
+    expect(body!.textContent).toContain("sample@openai-curated");
   });
 
   it("renders web query when kind is web_search", () => {
@@ -466,6 +529,42 @@ describe("ToolCallItem", () => {
       const summary = container.querySelector(".tool-call__summary");
       expect(summary).toBeInTheDocument();
       expect(summary!.textContent).toBe("fix memory leak");
+    });
+
+    it("shows tool_id as summary for agent_plugin request_plugin_install (issue #223)", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({
+            kind: "agent_plugin",
+            name: "request_plugin_install",
+            command: null,
+            exit_code: null,
+            arguments: { tool_id: "sample@openai-curated", suggest_reason: "Needed" },
+          })}
+          expanded={false}
+          onToggle={vi.fn()}
+        />,
+      );
+      const summary = container.querySelector(".tool-call__summary");
+      expect(summary).toBeInTheDocument();
+      expect(summary!.textContent).toBe("sample@openai-curated");
+    });
+
+    it("shows no summary for agent_plugin list_available_plugins_to_install (empty args)", () => {
+      const { container } = render(
+        <ToolCallItem
+          tool={makeTool({
+            kind: "agent_plugin",
+            name: "list_available_plugins_to_install",
+            command: null,
+            exit_code: null,
+            arguments: {},
+          })}
+          expanded={false}
+          onToggle={vi.fn()}
+        />,
+      );
+      expect(container.querySelector(".tool-call__summary")).not.toBeInTheDocument();
     });
 
     it("shows no summary for exec_command with null command", () => {

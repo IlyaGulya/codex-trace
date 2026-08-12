@@ -111,6 +111,10 @@ export type ToolKind =
   /** Codex v0.140.0 (PRs #27438, #27488, #27518): built-in runtime tools for querying the
    * remaining context budget (`token_budget_context`, `context_remaining`, `context_window`). */
   | "context_query"
+  /** Codex's Agent Plugins subsystem (issue #223): built-in tools for searching and
+   * installing plugin/connector catalogs (`list_available_plugins_to_install`,
+   * `request_plugin_install`). */
+  | "agent_plugin"
   | "unknown";
 
 export interface CodexToolCall {
@@ -126,8 +130,14 @@ export interface CodexToolCall {
   duration_secs: number | null;
   mcp_server: string | null;
   mcp_tool: string | null;
-  /** Codex v0.133.0+: identifies which plugin the MCP tool belongs to. Null for pre-v0.133.0 sessions. */
+  /** Codex v0.133.0+: identifies which plugin the MCP tool belongs to. Codex v0.146.0+ also
+   * sets this on ExecCommand calls attributed to a trusted plugin script (issue #223). Null
+   * for pre-v0.133.0 sessions and non-plugin-attributed calls. */
   plugin_id: string | null;
+  /** Codex v0.146.0+: safe plugin-relative script path attributed to an ExecCommand call run
+   * by a plugin script (issue #223). Null for non-plugin-attributed exec calls and
+   * pre-v0.146.0 sessions. */
+  script_path: string | null;
   /** Codex v0.134.0+ (PR #22882): subagent session ID from hook input identity fields. Null for parent-agent calls and pre-v0.134.0 sessions. */
   subagent_id: string | null;
   /** Codex v0.134.0+ (PR #22882): subagent human-readable name from hook input identity fields. Null for parent-agent calls and pre-v0.134.0 sessions. */

@@ -26,6 +26,10 @@ pub enum ToolKind {
     /// invokes to query the remaining context budget. Covers `token_budget_context`,
     /// `context_remaining`, and `context_window`.
     ContextQuery,
+    /// Codex's Agent Plugins subsystem (issue #223): built-in tools for searching and
+    /// installing plugin/connector catalogs. Covers `list_available_plugins_to_install`
+    /// and `request_plugin_install`.
+    AgentPlugin,
     Unknown,
 }
 
@@ -45,7 +49,13 @@ pub struct ToolCall {
     pub mcp_tool: Option<String>,
     /// Codex v0.133.0 (PRs #23353, #23737): plugin_id identifies which plugin
     /// an MCP tool belongs to. Absent for pre-v0.133.0 sessions and non-MCP calls.
+    /// Codex v0.146.0 also sets this on ExecCommand calls attributed to a trusted
+    /// plugin script (issue #223).
     pub plugin_id: Option<String>,
+    /// Codex v0.146.0: safe plugin-relative script path attributed to an ExecCommand
+    /// call run by a plugin script. Absent for non-plugin-attributed exec calls and
+    /// pre-v0.146.0 sessions (issue #223).
+    pub script_path: Option<String>,
     pub patch_success: Option<bool>,
     pub patch_changes: Option<Value>,
     pub web_query: Option<String>,
@@ -179,6 +189,7 @@ impl ToolCallBuilder {
                 mcp_server: None,
                 mcp_tool: None,
                 plugin_id: None,
+                script_path: None,
                 patch_success: exit_code.map(|c| c == 0),
                 patch_changes: None,
                 web_query: None,
@@ -297,6 +308,7 @@ impl ToolCallBuilder {
                     mcp_server: None,
                     mcp_tool: None,
                     plugin_id: None,
+                    script_path: None,
                     patch_success: None,
                     patch_changes: None,
                     web_query: None,
@@ -327,6 +339,7 @@ impl ToolCallBuilder {
                     mcp_server: None,
                     mcp_tool: None,
                     plugin_id: None,
+                    script_path: None,
                     patch_success: None,
                     patch_changes: None,
                     web_query: None,
@@ -367,6 +380,49 @@ impl ToolCallBuilder {
                     mcp_server: None,
                     mcp_tool: None,
                     plugin_id: None,
+                    script_path: None,
+                    patch_success: None,
+                    patch_changes: None,
+                    web_query: None,
+                    web_url: None,
+                    image_prompt: None,
+                    image_file_path: None,
+                    worker_session: None,
+                    status: "completed".to_string(),
+                    subagent_id: None,
+                    subagent_name: None,
+                    output_truncated: None,
+                });
+                return;
+            }
+
+            // Codex's Agent Plugins subsystem (issue #223): built-in tools for searching
+            // and installing plugin/connector catalogs. Classify as AgentPlugin instead of
+            // falling through to Unknown so the trace view can surface which plugin was
+            // searched for or requested per turn.
+            if matches!(
+                pending.name.as_str(),
+                "list_available_plugins_to_install" | "request_plugin_install"
+            ) {
+                self.finalized.push(ToolCall {
+                    call_id: call_id.to_string(),
+                    kind: ToolKind::AgentPlugin,
+                    name: pending.name,
+                    arguments: pending.arguments,
+                    input_text: pending.input_text,
+                    output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                    exit_code: None,
+                    command: None,
+                    cwd: None,
+                    duration_secs: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    plugin_id: None,
+                    script_path: None,
                     patch_success: None,
                     patch_changes: None,
                     web_query: None,
@@ -400,6 +456,7 @@ impl ToolCallBuilder {
                     mcp_server: None,
                     mcp_tool: None,
                     plugin_id: None,
+                    script_path: None,
                     patch_success: None,
                     patch_changes: None,
                     web_query: None,
@@ -478,6 +535,7 @@ impl ToolCallBuilder {
                 mcp_server,
                 mcp_tool,
                 plugin_id,
+                script_path: None,
                 patch_success: None,
                 patch_changes: None,
                 web_query: None,
@@ -568,6 +626,20 @@ impl ToolCallBuilder {
 
         let (subagent_id, subagent_name) = extract_subagent_identity(payload);
 
+        // Codex v0.146.0: exec_command_end may carry plugin_id/script_path when the
+        // command was attributed to a trusted plugin script (issue #223's "hardened
+        // plugin isolation" hardening). Absent for non-plugin-attributed commands.
+        let plugin_id = payload
+            .get("plugin_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let script_path = payload
+            .get("script_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         // When function_call_output already finalized an ExecCommand for this call_id
         // (v0.132.0+ sessions where both entries appear), backfill the structured
         // metadata from exec_command_end rather than creating a duplicate entry.
@@ -590,6 +662,12 @@ impl ToolCallBuilder {
             existing.subagent_id = subagent_id;
             existing.subagent_name = subagent_name;
             existing.output_truncated = output_truncated;
+            if plugin_id.is_some() {
+                existing.plugin_id = plugin_id;
+            }
+            if script_path.is_some() {
+                existing.script_path = script_path;
+            }
             // Prefer existing output from function_call_output (full raw text); fall back
             // to aggregated_output only if no output was captured yet.
             if existing.output.is_none() {
@@ -611,7 +689,8 @@ impl ToolCallBuilder {
             duration_secs,
             mcp_server: None,
             mcp_tool: None,
-            plugin_id: None,
+            plugin_id,
+            script_path,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -686,6 +765,7 @@ impl ToolCallBuilder {
             mcp_server,
             mcp_tool,
             plugin_id,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -775,6 +855,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success,
             patch_changes,
             web_query: None,
@@ -810,6 +891,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -845,6 +927,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -880,6 +963,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -924,6 +1008,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: query,
@@ -978,6 +1063,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -1035,6 +1121,7 @@ impl ToolCallBuilder {
             mcp_server: None,
             mcp_tool: None,
             plugin_id: None,
+            script_path: None,
             patch_success: None,
             patch_changes: None,
             web_query: None,
@@ -1067,6 +1154,7 @@ impl ToolCallBuilder {
                 mcp_server: None,
                 mcp_tool: None,
                 plugin_id: None,
+                script_path: None,
                 patch_success: None,
                 patch_changes: None,
                 web_query: None,
@@ -1124,7 +1212,11 @@ fn exec_tool_call_from_pending(
         duration_secs: parsed_output.duration_secs,
         mcp_server: None,
         mcp_tool: None,
-        plugin_id: None,
+        // v0.133.0+ (PRs #23353, #23737): tool_id.plugin_id is read generically for any
+        // function_call, including exec_command (issue #223). No exec_command_end event
+        // exists on this path, so script_path (only carried on that event) stays None.
+        plugin_id: pending.plugin_id,
+        script_path: None,
         patch_success: None,
         patch_changes: None,
         web_query: None,
@@ -2596,6 +2688,156 @@ mod tests {
         assert_eq!(tool.kind, ToolKind::ExecCommand);
         assert_eq!(tool.output_truncated, Some(true));
         assert_eq!(tool.exit_code, Some(0));
+    }
+
+    // Codex v0.146.0 (issue #223): exec_command_end may carry plugin_id/script_path when
+    // the command was attributed to a trusted plugin script ("hardened plugin isolation").
+
+    #[test]
+    fn exec_command_end_with_plugin_attribution_is_captured() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_plugin_exec".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hi","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_plugin_exec",
+            "aggregated_output": "hi\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 1_000_000u64},
+            "plugin_id": "plugin-abc",
+            "script_path": "scripts/run.py"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.plugin_id.as_deref(), Some("plugin-abc"));
+        assert_eq!(tool.script_path.as_deref(), Some("scripts/run.py"));
+    }
+
+    #[test]
+    fn exec_command_end_without_plugin_attribution_has_none() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_no_plugin_exec".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"echo hi","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        let payload = json!({
+            "call_id": "call_no_plugin_exec",
+            "aggregated_output": "hi\n",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 1_000_000u64}
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert!(tool.plugin_id.is_none());
+        assert!(tool.script_path.is_none());
+    }
+
+    #[test]
+    fn v0146_plugin_attribution_propagated_to_backfill_exec_entry() {
+        // When function_call_output arrives before exec_command_end (v0.132.0+ ordering),
+        // exec_command_end must backfill plugin_id/script_path into the existing entry.
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_backfill_plugin".to_string(),
+            "exec_command".to_string(),
+            r#"{"cmd":"run.py","workdir":"/tmp"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output("call_backfill_plugin", "done", None);
+
+        let payload = json!({
+            "call_id": "call_backfill_plugin",
+            "aggregated_output": "done",
+            "exit_code": 0,
+            "status": "completed",
+            "duration": {"secs": 0, "nanos": 0u64},
+            "plugin_id": "plugin-xyz",
+            "script_path": "scripts/run.py"
+        });
+        builder.finalize_exec("exec_command_end", &payload);
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.plugin_id.as_deref(), Some("plugin-xyz"));
+        assert_eq!(tool.script_path.as_deref(), Some("scripts/run.py"));
+    }
+
+    // Codex's Agent Plugins subsystem (issue #223): list_available_plugins_to_install and
+    // request_plugin_install are built-in function tools for searching/installing plugin
+    // and connector catalogs. They previously fell through to ToolKind::Unknown.
+
+    #[test]
+    fn list_available_plugins_to_install_is_classified_as_agent_plugin() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_list_plugins".to_string(),
+            "list_available_plugins_to_install".to_string(),
+            "{}",
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_list_plugins",
+            r#"{"tools":[{"id":"sample@openai-curated","name":"Sample Plugin","description":null,"tool_type":"plugin","has_skills":false,"mcp_server_names":[],"app_connector_ids":[]}]}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::AgentPlugin);
+        assert_eq!(tool.name, "list_available_plugins_to_install");
+    }
+
+    #[test]
+    fn request_plugin_install_is_classified_as_agent_plugin() {
+        let mut builder = ToolCallBuilder::new();
+        builder.add_function_call(
+            "call_request_install".to_string(),
+            "request_plugin_install".to_string(),
+            r#"{"tool_type":"plugin","action_type":"install","tool_id":"sample@openai-curated","suggest_reason":"Needed for calendar access"}"#,
+            None,
+            None,
+            None,
+        );
+
+        builder.add_function_call_output(
+            "call_request_install",
+            r#"{"completed":true,"user_confirmed":true,"tool_type":"plugin","action_type":"install","tool_id":"sample@openai-curated","tool_name":"Sample Plugin","suggest_reason":"Needed for calendar access"}"#,
+            None,
+        );
+
+        assert_eq!(builder.finalized.len(), 1);
+        let tool = &builder.finalized[0];
+        assert_eq!(tool.kind, ToolKind::AgentPlugin);
+        assert_eq!(tool.name, "request_plugin_install");
+        assert_eq!(
+            tool.arguments.get("tool_id").and_then(|v| v.as_str()),
+            Some("sample@openai-curated")
+        );
     }
 
     // Codex v0.147.0 (#36893, #36908): Codex's own redaction only applies at its
