@@ -3,6 +3,7 @@ pub mod compression;
 pub mod discover;
 pub mod entry;
 pub mod ongoing;
+pub mod redact;
 pub mod session;
 pub mod spawn;
 pub mod toolcall;
