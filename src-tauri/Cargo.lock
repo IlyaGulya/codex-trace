@@ -521,6 +521,7 @@ dependencies = [
  "dirs",
  "indexmap 2.14.0",
  "notify",
+ "regex",
  "serde",
  "serde_json",
  "tauri",
