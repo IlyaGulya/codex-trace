@@ -61,6 +61,26 @@ pub struct CodexSessionInfo {
 /// ephemeral forked threads "pathless" and never materializes them to a rollout file, so
 /// they cannot appear here and need no explicit filtering — this scanner only ever sees
 /// files that were actually written to `sessions_dir`.
+///
+/// Note on Codex v0.147.0 persistent thread sections (issue #220): PRs #35722/#36007/
+/// #36380 added `threadSection/*` app-server methods backed by new SQLite migrations
+/// (`codex-rs/state/migrations/0045_threads_section.sql`, `0046_threads_section_order.sql`).
+/// Reading the upstream source (`codex-rs/thread-store/src/local/read_thread.rs`,
+/// `state_db.rs`) confirms a thread's `section`/`section_position`/`section_entered_at`
+/// are always joined from local SQLite state at read time — `session_meta` itself only
+/// contributes `id`/`forked_from_id`/`parent_thread_id`/`history_mode` to that join, and
+/// `codex-rs/rollout/src/recorder.rs`'s former `is_pinned` parameter was renamed to
+/// `section` but stayed `None` at every rollout-facing call site. No `section*` field is
+/// ever written to the rollout JSONL, so there is nothing here to parse; a user's manual
+/// section organization in the Codex TUI simply isn't reflected in codex-trace's own
+/// `date_group` grouping. Known limitation, not a parsing gap.
+///
+/// Note on Codex v0.147.0 incremental transcript browsing (issue #220): PRs #36948/#36950
+/// paginate transcript *rendering* inside the TUI (`codex-rs/tui/src/app/history_pagination.rs`,
+/// `pager_overlay.rs`) on top of the app-server pagination protocol v0.146.0 already
+/// introduced (see the `history_base_thread_id` field above, issue #210). Neither PR
+/// touches `codex-rs/rollout` or adds any rollout field — confirmed by diffing both PRs'
+/// changed files — so this scanner needs no changes for it.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -1681,5 +1701,86 @@ mod tests {
             .find(|s| s.id == "v0146-malformed")
             .expect("session must be discovered even with malformed history_base");
         assert!(session.history_base_thread_id.is_none());
+    }
+
+    // Codex v0.147.0 (issue #220): persistent thread sections (PRs #35722/#36007/#36380)
+    // are SQLite-only and never reach the rollout JSONL, and incremental transcript
+    // browsing (PRs #36948/#36950) is TUI rendering built on the existing v0.146.0
+    // pagination protocol. These tests lock in that a v0.147.0 session still discovers
+    // and parses correctly, and that the v0.146.0 pagination marker keeps working
+    // unaffected by either change.
+
+    #[test]
+    fn discover_sessions_v0147_session_parses_normally() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/10");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-10T09-00-00-v0147-basic.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-08-10T09:00:00Z","type":"session_meta","payload":{"id":"v0147-basic","timestamp":"2026-08-10T09:00:00Z","cwd":"/project","cli_version":"0.147.0","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-08-10T09:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-08-10T09:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1786435202.0}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0147-basic")
+            .expect("v0.147.0 session must be discovered");
+        assert_eq!(session.cli_version.as_deref(), Some("0.147.0"));
+    }
+
+    #[test]
+    fn discover_sessions_v0147_history_base_thread_id_still_works() {
+        // Regression: the TUI-side incremental transcript browsing added in v0.147.0
+        // (PRs #36948/#36950) must not disturb the v0.146.0 pagination lineage marker.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/10");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-10T09-01-00-v0147-fork.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-08-10T09:01:00Z","type":"session_meta","payload":{"id":"v0147-fork-child","timestamp":"2026-08-10T09:01:00Z","cli_version":"0.147.0","history_mode":"paginated","history_base":{"thread_id":"v0147-fork-parent","end_ordinal_exclusive":8,"end_byte_offset":1024}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0147-fork-child")
+            .expect("v0.147.0 paginated fork continuation must be discovered");
+        assert_eq!(
+            session.history_base_thread_id.as_deref(),
+            Some("v0147-fork-parent")
+        );
+    }
+
+    #[test]
+    fn discover_sessions_v0147_unrecognized_section_field_does_not_panic() {
+        // Defensive: even if a future Codex patch release ever mirrored SQLite section
+        // metadata into the rollout file, an unrecognized `section` object on session_meta
+        // must be tolerated (ignored), not panic — this scanner reads fields by name via
+        // serde_json::Value and has no code path that looks at `section` at all.
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/08/10");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-08-10T09-02-00-v0147-section.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-08-10T09:02:00Z","type":"session_meta","payload":{"id":"v0147-section","timestamp":"2026-08-10T09:02:00Z","cli_version":"0.147.0","section":{"id":"pinned","name":"Pinned"}}}"#,
+        )
+        .unwrap();
+
+        let sessions = discover_sessions(tmp.path()).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.id == "v0147-section")
+            .expect("session must be discovered even with an unrecognized section field");
+        assert_eq!(session.cli_version.as_deref(), Some("0.147.0"));
     }
 }
