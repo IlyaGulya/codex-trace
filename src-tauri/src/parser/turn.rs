@@ -6,6 +6,15 @@ use super::entry::{parse_timestamp_secs, RawEntry};
 use super::spawn::parse_spawn_agent_output;
 use super::toolcall::{ToolCall, ToolCallBuilder};
 
+/// Codex's own sentinel text for a synthetic `agent_message` event it inserts at the end of
+/// the transcript it copies in from an imported Claude/Cursor conversation (pre-v0.140.0
+/// external-agent import feature). Codex v0.147.0 (PR #36356, issue #221) added support for
+/// syncing further edits into that same imported thread rather than creating a duplicate, so
+/// this marker can now sit mid-transcript — right before the newly-synced turns — instead of
+/// only ever trailing a finished import. It carries no real content and must never be
+/// rendered as an assistant message.
+const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
@@ -387,7 +396,7 @@ fn handle_event_msg(
                         .get("message")
                         .map(extract_message_text)
                         .unwrap_or_default();
-                    if !text.is_empty() {
+                    if !text.is_empty() && text != EXTERNAL_SESSION_IMPORTED_MARKER {
                         let phase = payload
                             .get("phase")
                             .and_then(|v| v.as_str())
@@ -960,6 +969,17 @@ fn handle_response_item(
         // tool_search_call mid-turn; matching tools are returned in tool_search_call_output.
         // Merge the discovered tools into the current turn's dynamic tool registry so
         // subsequent function_call entries are classified as McpTool correctly.
+        //
+        // Codex v0.147.0 (issue #222): the bundled MCP SDK bump to 3.0.0 (#36001) and the
+        // opt-in MCP 2026-07-28 protocol (#35724, #35725, #35590, #35742) were audited against
+        // the openai/codex source. Both only change the wire protocol between Codex and MCP
+        // *servers* (SDK type renames, paginated `server/discover` requests, multi-round
+        // tools/call negotiation, non-blocking server startup) — that pagination is resolved
+        // internally before Codex ever builds `dynamic_tools` or tool-search results. Neither
+        // change touches `codex-rs/protocol` (rollout item types), `app-server/src/dynamic_tools.rs`,
+        // or the tool_search_call/tool_search_call_output mechanism handled here, so the
+        // model-facing discovery flow below (and issue #161's fix) is unaffected. No rollout
+        // JSONL shape change; no parser change needed.
         "tool_search_call" => {
             // Search request — tool definitions arrive in the paired tool_search_call_output.
         }
@@ -4296,6 +4316,80 @@ mod tests {
         assert_eq!(
             turns[1].forked_from_thread_id.as_deref(),
             Some("turn-1-thread")
+        );
+    }
+
+    // Codex v0.147.0 (PR #36356, issue #221): syncing further edits into an already-imported
+    // Claude/Cursor conversation appends new turns after the existing `<EXTERNAL SESSION
+    // IMPORTED>` marker rather than creating a duplicate thread. The marker itself predates
+    // v0.147.0 (external-agent import, v0.140.0) but previously only ever trailed a finished
+    // import; it can now sit mid-transcript, so it must never surface as a real message.
+
+    #[test]
+    fn v0147_external_session_imported_marker_is_not_rendered_as_agent_message() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-05T10:00:00Z","type":"session_meta","payload":{"id":"v0147-import-marker","timestamp":"2026-08-05T10:00:00Z","cwd":"/project","cli_version":"0.147.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-08-05T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}"#,
+            r#"{"timestamp":"2026-08-05T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"first imported request"}}"#,
+            r#"{"timestamp":"2026-08-05T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"first imported answer"}}"#,
+            r#"{"timestamp":"2026-08-05T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"<EXTERNAL SESSION IMPORTED>"}}"#,
+            r#"{"timestamp":"2026-08-05T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1","completed_at":1785926405.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0]
+                .agent_messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first imported answer"],
+            "the <EXTERNAL SESSION IMPORTED> marker must not appear as a rendered message"
+        );
+        assert_eq!(turns[0].final_answer, None);
+    }
+
+    #[test]
+    fn v0147_synced_turn_after_import_marker_parses_as_its_own_turn() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-08-05T11:00:00Z","type":"session_meta","payload":{"id":"v0147-synced-thread","timestamp":"2026-08-05T11:00:00Z","cwd":"/project","cli_version":"0.147.0","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"imported request"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"imported answer"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"<EXTERNAL SESSION IMPORTED>"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1","completed_at":1785930005.0}}"#,
+            // Sync appends a genuinely new turn after the marker once the source conversation
+            // gains more messages upstream.
+            r#"{"timestamp":"2026-08-05T11:00:06Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-2"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:07Z","type":"event_msg","payload":{"type":"user_message","message":"follow-up request added after sync"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:08Z","type":"event_msg","payload":{"type":"agent_message","message":"follow-up answer"}}"#,
+            r#"{"timestamp":"2026-08-05T11:00:09Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-2","completed_at":1785930009.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0]
+                .agent_messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["imported answer"]
+        );
+        assert_eq!(
+            turns[1].user_message.as_deref(),
+            Some("follow-up request added after sync")
+        );
+        assert_eq!(
+            turns[1]
+                .agent_messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["follow-up answer"]
         );
     }
 }
