@@ -4,6 +4,103 @@ All notable changes to codex-trace are documented here. Versions follow
 [semantic versioning](https://semver.org/), and this file follows
 [Keep a Changelog](https://keepachangelog.com/) conventions.
 
+## [0.5.0] — 2026-08-23
+
+This release makes codex-trace usable again on large session histories and keeps pace
+with recent Codex CLIs: the session list appears in about a second instead of minutes,
+parsing runs quietly in the background without freezing the UI, and conversations show
+real titles plus a full prompt/answer transcript even when recorded by the newest
+Codex v0.149 format.
+
+### Added
+
+- **Dialog titles resolved from Codex's own database**
+  ([`b846c38`](https://github.com/IlyaGulya/codex-trace/commit/b846c38), @IlyaGulya).
+  Recent Codex CLIs stopped writing thread names into rollout files and store them in
+  `~/.codex/state_*.sqlite` instead, so most sessions showed only their working
+  directory. The picker now reads that database read-only and displays real
+  conversation titles; internal marker blobs and pasted system prompts are skipped.
+- **Exec output truncation is surfaced**
+  ([`362f2c6`](https://github.com/PixelPaw-Labs/codex-trace/commit/362f2c6)). When the
+  Codex CLI clips a command's output (v0.145.0+), the tool call is now marked as
+  truncated instead of silently showing a partial result.
+- **Rate-limit reset credits** ([`00d65f0`](https://github.com/PixelPaw-Labs/codex-trace/commit/00d65f0)).
+  Usage-limit credit data written by Codex v0.144.0+ (`credit type` / expiration) is
+  parsed and carried through to turn details.
+
+### Fixed
+
+- **Session list appears instantly instead of after minutes**
+  ([`669341b`](https://github.com/IlyaGulya/codex-trace/commit/669341b), @IlyaGulya).
+  Startup used to re-read every byte of your session history before rendering anything.
+  Discovery now reads just each file's header line, the list renders immediately, and a
+  background pass fills in turn counts, models, and tokens with a visible progress bar.
+- **Background scanning no longer freezes the UI**
+  ([`83f104b`](https://github.com/IlyaGulya/codex-trace/commit/83f104b), @IlyaGulya).
+  Parsing previously ran on every CPU core at normal priority, starving the webview.
+  It now uses a reduced, low-priority pool and batches per-session updates into one
+  render pass.
+- **Rescans while Codex is running no longer re-read everything**
+  ([`b846c38`](https://github.com/IlyaGulya/codex-trace/commit/b846c38), @IlyaGulya).
+  Appending to an active session used to trigger a full rescan that re-parsed the
+  growing file from scratch. Scans are rate-limited and resume incrementally from a
+  stored bookmark, so only newly appended bytes are parsed; unchanged sessions are
+  served from an on-disk cache across restarts.
+- **Enrichment parses each payload once**
+  ([`8af18f1`](https://github.com/IlyaGulya/codex-trace/commit/8af18f1), @IlyaGulya).
+  The same JSON payload was tokenized up to three times per line; profiling showed this
+  dominated the scan, and folding it into a single pass made the full scan ~3x faster.
+- **Transcript works with Codex v0.149 sessions**
+  ([`b4f55b1`](https://github.com/IlyaGulya/codex-trace/commit/b4f55b1), @IlyaGulya).
+  Recent CLIs record prompts and replies only as response items, not events, so turn
+  lists showed bare User/Codex rows with stats but no text. Prompts, intermediate
+  replies, and final answers are extracted again, with deduplication for older
+  dual-format sessions.
+- **Rollout files compressed by Codex are discovered**
+  ([`2a53dfc`](https://github.com/PixelPaw-Labs/codex-trace/commit/2a53dfc)). Since
+  v0.137 the CLI can replace cold `.jsonl` files with `.jsonl.zst`; those sessions used
+  to vanish from the list entirely.
+- **Paginated thread history lineage**
+  ([`1dba5ea`](https://github.com/PixelPaw-Labs/codex-trace/commit/1dba5ea)). Sessions
+  continued from another paginated thread now expose their `history_base.thread_id`.
+- **Agent Plugins catalog activity is attributed**
+  ([`a37fd64`](https://github.com/PixelPaw-Labs/codex-trace/commit/a37fd64)). Plugin
+  catalog search/install calls and plugin-run commands are classified and shown like
+  other tool calls.
+- **Secrets redacted in v0.147.0 exec commands**
+  ([`1a34f02`](https://github.com/PixelPaw-Labs/codex-trace/commit/1a34f02)).
+- **Skill warnings are visible**
+  ([`3a743df`](https://github.com/PixelPaw-Labs/codex-trace/commit/3a743df)). Budget or
+  truncation warnings emitted during a turn (v0.146.0+) appear on the turn instead of
+  being dropped.
+- **Token-budget aborts end the turn**
+  ([`ac1565f`](https://github.com/PixelPaw-Labs/codex-trace/commit/ac1565f),
+  [`e6f226f`](https://github.com/PixelPaw-Labs/codex-trace/commit/e6f226f)). Budget-exhausted,
+  cancelled-inference, and v0.142.0 budget events no longer leave turns hanging as
+  ongoing.
+- **MCP auth request/result handled**
+  ([`43bd1fd`](https://github.com/PixelPaw-Labs/codex-trace/commit/43bd1fd)) and tool
+  definitions returned inside tool-search results
+  ([`a6e13a8`](https://github.com/PixelPaw-Labs/codex-trace/commit/a6e13a8)) are parsed.
+- **Response-item correlation and envelopes**
+  ([`5c1a4ae`](https://github.com/PixelPaw-Labs/codex-trace/commit/5c1a4ae),
+  [`dd368ba`](https://github.com/PixelPaw-Labs/codex-trace/commit/dd368ba)). Items are
+  correlated via explicit metadata turn ids where present, and typed rich-text envelopes
+  in agent messages render correctly.
+- **UUIDv7 context windows and compaction lineage**
+  ([`bc13ae7`](https://github.com/PixelPaw-Labs/codex-trace/commit/bc13ae7)) from
+  v0.142.0 parse correctly.
+- **Realtime voice archives**
+  ([`96269bf`](https://github.com/PixelPaw-Labs/codex-trace/commit/96269bf),
+  [`8f46f65`](https://github.com/PixelPaw-Labs/codex-trace/commit/8f46f65)). Live V3
+  streaming transcripts are captured mid-turn, and pre-v0.140 voice items are treated
+  as archive-only instead of corrupting turns.
+- **Approval mode surfaced**
+  ([`4b00fad`](https://github.com/PixelPaw-Labs/codex-trace/commit/4b00fad)). The
+  session-level approval mode recorded by Codex v0.144.0+ is exposed on session info.
+
+[0.5.0]: https://github.com/IlyaGulya/codex-trace/releases/tag/v0.5.0
+
 ## [0.4.0] — 2026-06-28
 
 A fresh app icon in codex green, a quieter macOS install, and a much lighter startup.
