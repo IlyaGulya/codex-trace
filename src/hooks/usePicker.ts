@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "../lib/invoke";
 import type { CodexSessionInfo, SettingsResponse } from "../../shared/types";
 import { useTauriEvent } from "./useTauriEvent";
@@ -23,6 +23,29 @@ export function usePicker() {
     sessionsDir: "",
   });
   const [progress, setProgress] = useState<PickerProgress | null>(null);
+
+  // `session-enriched` events arrive per-session (up to one per file, thousands for a
+  // large directory). Applying each as its own setState re-renders the whole picker/sidebar
+  // per event, so we coalesce a burst into a single update on a short timer.
+  const enrichedBufferRef = useRef<CodexSessionInfo[]>([]);
+  const enrichedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushEnriched = useCallback(() => {
+    enrichedTimerRef.current = null;
+    const batch = enrichedBufferRef.current;
+    enrichedBufferRef.current = [];
+    if (batch.length === 0) return;
+    setState((prev) => {
+      let sessions = prev.sessions;
+      for (const session of batch) {
+        const idx = sessions.findIndex((s) => s.path === session.path);
+        if (idx === -1) continue;
+        if (sessions === prev.sessions) sessions = [...prev.sessions];
+        sessions[idx] = session;
+      }
+      return sessions === prev.sessions ? prev : { ...prev, sessions };
+    });
+  }, []);
 
   const discoverSessions = useCallback(async (sessionsDir: string) => {
     if (!sessionsDir) return;
@@ -66,16 +89,13 @@ export function usePicker() {
     }
   });
 
-  // A single session finished enrichment — replace it in place so the list fills
-  // in live without re-fetching the whole directory.
+  // A single session finished enrichment — buffer it and apply the whole burst in one
+  // render pass so the list fills in live without re-rendering per event.
   useTauriEvent<CodexSessionInfo>("session-enriched", (session) => {
-    setState((prev) => {
-      const idx = prev.sessions.findIndex((s) => s.path === session.path);
-      if (idx === -1) return prev;
-      const sessions = [...prev.sessions];
-      sessions[idx] = session;
-      return { ...prev, sessions };
-    });
+    enrichedBufferRef.current.push(session);
+    if (enrichedTimerRef.current === null) {
+      enrichedTimerRef.current = setTimeout(flushEnriched, 80);
+    }
   });
 
   // picker-refresh carries no session data — the watcher sends only a lightweight
@@ -94,6 +114,7 @@ export function usePicker() {
   useEffect(() => {
     return () => {
       invoke<void>("unwatch_picker").catch(() => {});
+      if (enrichedTimerRef.current !== null) clearTimeout(enrichedTimerRef.current);
     };
   }, []);
 

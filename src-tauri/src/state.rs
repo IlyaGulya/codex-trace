@@ -37,6 +37,20 @@ pub struct AppState {
     pub watched_session_ongoing: Mutex<Option<(String, bool)>>,
     pub event_tx: broadcast::Sender<SseEvent>,
     discovery: Mutex<DiscoveryState>,
+    /// Dedicated, reduced-size thread pool for background enrichment. The default rayon
+    /// global pool spans every logical CPU, so a 7 GB enrichment scan would saturate all
+    /// cores and starve the webview UI. This pool leaves headroom for rendering + tokio.
+    enrich_pool: Arc<rayon::ThreadPool>,
+}
+
+/// How many threads the background enrichment job may use. We deliberately leave at least
+/// half the logical CPUs idle so the webview (a separate process scheduled by the OS) and
+/// the tokio runtime stay responsive while session files are parsed in the background.
+fn enrich_thread_count() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cpus / 2).max(1)
 }
 
 /// Broadcast an event to both the SSE stream (web clients) and the Tauri event bus
@@ -53,6 +67,11 @@ fn broadcast(state: &AppState, app: &Option<AppHandle>, event: &str, data: &str)
 impl AppState {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(64);
+        let enrich_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(enrich_thread_count())
+            .thread_name(|i| format!("codex-enrich-{i}"))
+            .build()
+            .expect("failed to build enrichment thread pool");
         Self {
             session_watcher: Mutex::new(None),
             picker_watcher: Mutex::new(None),
@@ -60,6 +79,7 @@ impl AppState {
             watched_session_ongoing: Mutex::new(None),
             event_tx,
             discovery: Mutex::new(DiscoveryState::default()),
+            enrich_pool: Arc::new(enrich_pool),
         }
     }
 
@@ -156,6 +176,7 @@ impl AppState {
 
     fn spawn_enrichment(self: &Arc<Self>, _dir: String, app: Option<AppHandle>, generation: u64) {
         let state = self.clone();
+        let pool = self.enrich_pool.clone();
         let sessions = {
             let guard = match self.discovery.lock() {
                 Ok(g) => g,
@@ -169,36 +190,41 @@ impl AppState {
         std::thread::spawn(move || {
             let scanned = Arc::new(AtomicUsize::new(0));
 
-            sessions.par_iter().for_each(|info| {
-                let mut enriched = info.clone();
-                let path = PathBuf::from(&info.path);
-                discover::enrich_session_info(&mut enriched, &path);
+            // `install` scopes the parallel loop to the reduced-size pool so enrichment
+            // never saturates all logical CPUs.
+            pool.install(|| {
+                sessions.par_iter().for_each(|info| {
+                    let mut enriched = info.clone();
+                    let path = PathBuf::from(&info.path);
+                    discover::enrich_session_info(&mut enriched, &path);
 
-                let done = scanned.fetch_add(1, Ordering::Relaxed) + 1;
+                    let done = scanned.fetch_add(1, Ordering::Relaxed) + 1;
 
-                {
-                    let mut guard = match state.discovery.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    if guard.generation != generation {
-                        return;
-                    }
-                    if let Some(entry) = guard.sessions.iter_mut().find(|s| s.path == enriched.path)
                     {
-                        *entry = enriched.clone();
+                        let mut guard = match state.discovery.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        if guard.generation != generation {
+                            return;
+                        }
+                        if let Some(entry) =
+                            guard.sessions.iter_mut().find(|s| s.path == enriched.path)
+                        {
+                            *entry = enriched.clone();
+                        }
                     }
-                }
 
-                if let Ok(data) = serde_json::to_string(&enriched) {
-                    broadcast(&state, &app, "session-enriched", &data);
-                }
+                    if let Ok(data) = serde_json::to_string(&enriched) {
+                        broadcast(&state, &app, "session-enriched", &data);
+                    }
 
-                // Throttle progress broadcasts to keep the event stream light.
-                if done == total || done % 25 == 0 {
-                    let progress = serde_json::json!({ "scanned": done, "total": total });
-                    broadcast(&state, &app, "picker-progress", &progress.to_string());
-                }
+                    // Throttle progress broadcasts to keep the event stream light.
+                    if done == total || done % 25 == 0 {
+                        let progress = serde_json::json!({ "scanned": done, "total": total });
+                        broadcast(&state, &app, "picker-progress", &progress.to_string());
+                    }
+                });
             });
 
             // Finalize: mark inline workers across the now-fully-enriched list, then tell
