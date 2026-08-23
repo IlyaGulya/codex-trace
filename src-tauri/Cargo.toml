@@ -34,6 +34,7 @@ indexmap = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
 regex = "1"
+rayon = "1"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

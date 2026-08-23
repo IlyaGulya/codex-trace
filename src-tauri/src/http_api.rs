@@ -195,8 +195,8 @@ async fn api_discover_sessions(
     State(state): State<Arc<HttpState>>,
     Json(body): Json<DiscoverBody>,
 ) -> Response {
-    let app_state = app_state(&state);
-    let mut sessions = match app_state.discover_sessions_cached(&body.dir) {
+    let app_state = &state.app_state;
+    let mut sessions = match app_state.discover_sessions(&body.dir, &state.app) {
         Ok(s) => s,
         Err(e) => return err_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e),
     };
@@ -209,8 +209,15 @@ struct PathBody {
     path: String,
 }
 
-async fn api_load_session(Json(body): Json<PathBody>) -> Response {
-    let session = match crate::commands::session::load_session_from_path(&body.path) {
+async fn api_load_session(
+    State(state): State<Arc<HttpState>>,
+    Json(body): Json<PathBody>,
+) -> Response {
+    let session = match crate::commands::session::load_session_with_progress(
+        &body.path,
+        &state.app_state,
+        &state.app,
+    ) {
         Ok(s) => s,
         Err(e) => return err_response(session_load_error_status(&e), e),
     };

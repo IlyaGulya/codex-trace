@@ -1,8 +1,12 @@
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use rayon::prelude::*;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
-use crate::parser::discover::CodexSessionInfo;
+use crate::parser::discover::{self, CodexSessionInfo};
 use crate::settings::Settings;
 use crate::watcher::WatcherHandle;
 
@@ -13,13 +17,18 @@ pub struct SseEvent {
     pub data: String,
 }
 
-struct SessionsCache {
+/// In-memory discovery state for the session picker.
+///
+/// Holds the progressively-enriched session list plus the bookkeeping needed to
+/// deduplicate/restart the background enrichment job when the sessions directory
+/// changes or a file event invalidates the cached list.
+#[derive(Default)]
+struct DiscoveryState {
     dir: String,
-    cached_at: Instant,
+    generation: u64,
     sessions: Vec<CodexSessionInfo>,
+    dirty: bool,
 }
-
-const SESSIONS_CACHE_TTL: Duration = Duration::from_secs(2);
 
 pub struct AppState {
     pub session_watcher: Mutex<Option<WatcherHandle>>,
@@ -27,7 +36,18 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     pub watched_session_ongoing: Mutex<Option<(String, bool)>>,
     pub event_tx: broadcast::Sender<SseEvent>,
-    sessions_cache: Mutex<Option<SessionsCache>>,
+    discovery: Mutex<DiscoveryState>,
+}
+
+/// Broadcast an event to both the SSE stream (web clients) and the Tauri event bus
+/// (desktop webview). `data` is the JSON payload; both channels deliver the same shape.
+fn broadcast(state: &AppState, app: &Option<AppHandle>, event: &str, data: &str) {
+    state.broadcast(event, data);
+    if let Some(handle) = app {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            let _ = handle.emit(event, value);
+        }
+    }
 }
 
 impl AppState {
@@ -39,7 +59,7 @@ impl AppState {
             settings: Mutex::new(crate::settings::load_settings()),
             watched_session_ongoing: Mutex::new(None),
             event_tx,
-            sessions_cache: Mutex::new(None),
+            discovery: Mutex::new(DiscoveryState::default()),
         }
     }
 
@@ -95,23 +115,105 @@ impl AppState {
         }
     }
 
-    /// Discover sessions for `dir`, returning a cached result if fresh enough.
-    /// Multiple concurrent callers within the TTL window share one disk scan.
-    pub fn discover_sessions_cached(&self, dir: &str) -> Result<Vec<CodexSessionInfo>, String> {
-        let mut cache = self.sessions_cache.lock().map_err(|e| e.to_string())?;
-        if let Some(ref c) = *cache {
-            if c.dir == dir && c.cached_at.elapsed() < SESSIONS_CACHE_TTL {
-                return Ok(c.sessions.clone());
+    /// Fast session discovery plus a background enrichment job.
+    ///
+    /// Returns the header-only session list immediately (no full-file scans), and spawns
+    /// a background thread that enriches each session and streams `picker-progress` and
+    /// `session-enriched` events. Subsequent calls for the same `dir` return the current
+    /// in-memory snapshot without rescanning, unless the watcher marked it dirty.
+    pub fn discover_sessions(
+        self: &Arc<Self>,
+        dir: &str,
+        app: &Option<AppHandle>,
+    ) -> Result<Vec<CodexSessionInfo>, String> {
+        let (sessions, generation) = {
+            let mut guard = self.discovery.lock().map_err(|e| e.to_string())?;
+            if guard.dir == dir && !guard.dirty {
+                return Ok(guard.sessions.clone());
             }
-        }
-        let path = std::path::Path::new(dir);
-        let sessions = crate::parser::discover::discover_sessions(path)?;
-        *cache = Some(SessionsCache {
-            dir: dir.to_string(),
-            cached_at: Instant::now(),
-            sessions: sessions.clone(),
-        });
+
+            let path = std::path::Path::new(dir);
+            let sessions = discover::discover_sessions_fast(path)?;
+            let generation = guard.generation + 1;
+            guard.dir = dir.to_string();
+            guard.generation = generation;
+            guard.sessions = sessions.clone();
+            guard.dirty = false;
+            (sessions, generation)
+        };
+
+        self.spawn_enrichment(dir.to_string(), app.clone(), generation);
         Ok(sessions)
+    }
+
+    /// Mark the cached discovery list stale so the next [`Self::discover_sessions`] call
+    /// rescans. Called by the picker watcher when session files change on disk.
+    pub fn mark_discovery_dirty(&self) {
+        if let Ok(mut guard) = self.discovery.lock() {
+            guard.dirty = true;
+        }
+    }
+
+    fn spawn_enrichment(self: &Arc<Self>, _dir: String, app: Option<AppHandle>, generation: u64) {
+        let state = self.clone();
+        let sessions = {
+            let guard = match self.discovery.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            guard.sessions.clone()
+        };
+
+        let total = sessions.len();
+
+        std::thread::spawn(move || {
+            let scanned = Arc::new(AtomicUsize::new(0));
+
+            sessions.par_iter().for_each(|info| {
+                let mut enriched = info.clone();
+                let path = PathBuf::from(&info.path);
+                discover::enrich_session_info(&mut enriched, &path);
+
+                let done = scanned.fetch_add(1, Ordering::Relaxed) + 1;
+
+                {
+                    let mut guard = match state.discovery.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    if guard.generation != generation {
+                        return;
+                    }
+                    if let Some(entry) = guard.sessions.iter_mut().find(|s| s.path == enriched.path)
+                    {
+                        *entry = enriched.clone();
+                    }
+                }
+
+                if let Ok(data) = serde_json::to_string(&enriched) {
+                    broadcast(&state, &app, "session-enriched", &data);
+                }
+
+                // Throttle progress broadcasts to keep the event stream light.
+                if done == total || done % 25 == 0 {
+                    let progress = serde_json::json!({ "scanned": done, "total": total });
+                    broadcast(&state, &app, "picker-progress", &progress.to_string());
+                }
+            });
+
+            // Finalize: mark inline workers across the now-fully-enriched list, then tell
+            // clients to re-fetch for a consistent view.
+            {
+                let mut guard = match state.discovery.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                if guard.generation == generation {
+                    discover::mark_inline_workers(&mut guard.sessions);
+                }
+            }
+            broadcast(&state, &app, "picker-refresh", "{}");
+        });
     }
 
     pub fn broadcast(&self, event: &str, data: &str) {
@@ -120,124 +222,62 @@ impl AppState {
             data: data.to_string(),
         });
     }
+
+    /// Broadcast to both SSE (web) and the Tauri event bus (desktop webview).
+    pub fn broadcast_all(&self, app: &Option<AppHandle>, event: &str, data: &str) {
+        broadcast(self, app, event, data);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_state() -> AppState {
-        AppState::new()
+    fn make_state() -> Arc<AppState> {
+        Arc::new(AppState::new())
     }
 
     #[test]
-    fn discover_sessions_cached_returns_empty_for_nonexistent_dir() {
-        // discover_sessions returns Ok(empty) for nonexistent dirs (not an error).
+    fn discover_sessions_returns_empty_for_nonexistent_dir() {
         let state = make_state();
-        let result = state.discover_sessions_cached("/nonexistent/path/that/does/not/exist");
+        let result = state.discover_sessions("/nonexistent/path/that/does/not/exist", &None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn discover_sessions_cached_hits_cache_on_second_call() {
+    fn discover_sessions_returns_snapshot_without_rescanning() {
         let state = make_state();
-        // Use a real empty temp dir so the first call succeeds and populates cache
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
 
-        let first = state.discover_sessions_cached(path).unwrap();
+        let first = state.discover_sessions(path, &None).unwrap();
         assert!(first.is_empty());
 
-        // Prime the cache with a fake entry by directly writing to the cache lock
-        {
-            let mut cache = state.sessions_cache.lock().unwrap();
-            *cache = Some(SessionsCache {
-                dir: path.to_string(),
-                cached_at: Instant::now(),
-                sessions: vec![CodexSessionInfo {
-                    id: "cached-session".to_string(),
-                    path: "/fake/path.jsonl".to_string(),
-                    cwd: None,
-                    git_branch: None,
-                    originator: None,
-                    model: None,
-                    cli_version: None,
-                    thread_name: None,
-                    turn_count: 0,
-                    start_time: String::new(),
-                    end_time: None,
-                    total_tokens: None,
-                    is_ongoing: false,
-                    is_external_worker: false,
-                    is_inline_worker: false,
-                    is_headless: false,
-                    is_archived: false,
-                    worker_nickname: None,
-                    worker_role: None,
-                    spawned_worker_ids: vec![],
-                    date_group: String::new(),
-                    ai_title: None,
-                    approval_mode: None,
-                    history_base_thread_id: None,
-                }],
-            });
-        }
-
-        // Second call must return the cached fake entry, not re-scan the dir
-        let second = state.discover_sessions_cached(path).unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].id, "cached-session");
+        let second = state.discover_sessions(path, &None).unwrap();
+        assert!(second.is_empty());
     }
 
     #[test]
-    fn discover_sessions_cached_invalidates_cache_for_different_dir() {
+    fn mark_discovery_dirty_forces_rescan() {
         let state = make_state();
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
 
-        // Populate cache for dir_a with a fake entry
-        {
-            let mut cache = state.sessions_cache.lock().unwrap();
-            *cache = Some(SessionsCache {
-                dir: dir_a.path().to_str().unwrap().to_string(),
-                cached_at: Instant::now(),
-                sessions: vec![CodexSessionInfo {
-                    id: "dir-a-session".to_string(),
-                    path: "/fake/a.jsonl".to_string(),
-                    cwd: None,
-                    git_branch: None,
-                    originator: None,
-                    model: None,
-                    cli_version: None,
-                    thread_name: None,
-                    turn_count: 0,
-                    start_time: String::new(),
-                    end_time: None,
-                    total_tokens: None,
-                    is_ongoing: false,
-                    is_external_worker: false,
-                    is_inline_worker: false,
-                    is_headless: false,
-                    is_archived: false,
-                    worker_nickname: None,
-                    worker_role: None,
-                    spawned_worker_ids: vec![],
-                    date_group: String::new(),
-                    ai_title: None,
-                    approval_mode: None,
-                    history_base_thread_id: None,
-                }],
-            });
-        }
+        assert!(state.discover_sessions(path, &None).unwrap().is_empty());
 
-        // Requesting dir_b must bypass the cache and return the real (empty) scan
-        let result = state
-            .discover_sessions_cached(dir_b.path().to_str().unwrap())
-            .unwrap();
-        assert!(
-            result.is_empty(),
-            "different dir must not return dir_a cached data"
-        );
+        let day_dir = dir.path().join("2026/05/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let file = day_dir.join("rollout-2026-05-07T00-00-00-abc.jsonl");
+        std::fs::write(
+            &file,
+            r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#,
+        )
+        .unwrap();
+
+        state.mark_discovery_dirty();
+        let result = state.discover_sessions(path, &None).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "abc");
     }
 }

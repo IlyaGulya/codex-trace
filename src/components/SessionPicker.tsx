@@ -8,12 +8,14 @@ import { OngoingDots } from "./OngoingDots";
 import { useScrollToSelected } from "../hooks/useScrollToSelected";
 import { TokensIcon, ForwardIcon } from "./Icons";
 import { VscTerminal } from "react-icons/vsc";
+import type { PickerProgress } from "../hooks/usePicker";
 
 interface SessionPickerProps {
   sessions: CodexSessionInfo[];
   loading: boolean;
   searchQuery: string;
   selectedIndex: number;
+  progress: PickerProgress | null;
   onSelectSession: (info: CodexSessionInfo) => void;
   onSearchChange: (q: string) => void;
 }
@@ -35,6 +37,7 @@ export function SessionPicker({
   loading,
   searchQuery,
   selectedIndex,
+  progress,
   onSelectSession,
   onSearchChange,
 }: SessionPickerProps) {
@@ -71,6 +74,20 @@ export function SessionPicker({
           spellCheck={false}
         />
       </div>
+
+      {progress && progress.scanned < progress.total && (
+        <div className="picker__progress">
+          <div className="picker__progress-text">
+            Scanning sessions… {progress.scanned} / {progress.total}
+          </div>
+          <div className="picker__progress-bar">
+            <div
+              className="picker__progress-fill"
+              style={{ width: `${Math.round((progress.scanned / progress.total) * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       <div ref={listRef} className="picker__list">
         {loading && <div className="picker__loading">Loading…</div>}

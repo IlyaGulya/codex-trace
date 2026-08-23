@@ -2382,6 +2382,22 @@ body {
   padding: 1rem;
   color: var(--text-dim);
 }
+.app__loading-text {
+  margin-bottom: 8px;
+}
+.app__loading-bar {
+  height: 4px;
+  background: var(--bg-hover);
+  border-radius: 2px;
+  overflow: hidden;
+  max-width: 480px;
+}
+.app__loading-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.15s ease;
+}
 
 /* Sidebar tree */
 .sidebar-tree {
@@ -2693,6 +2709,28 @@ body {
   gap: 8px;
   padding: 24px;
   color: var(--text-dim);
+}
+.picker__progress {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.picker__progress-text {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.picker__progress-bar {
+  height: 4px;
+  background: var(--bg-hover);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.picker__progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.15s ease;
 }
 
 /* Turn list */

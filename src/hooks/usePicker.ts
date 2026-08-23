@@ -3,6 +3,11 @@ import { invoke } from "../lib/invoke";
 import type { CodexSessionInfo, SettingsResponse } from "../../shared/types";
 import { useTauriEvent } from "./useTauriEvent";
 
+export interface PickerProgress {
+  scanned: number;
+  total: number;
+}
+
 interface PickerState {
   sessions: CodexSessionInfo[];
   loading: boolean;
@@ -17,10 +22,12 @@ export function usePicker() {
     searchQuery: "",
     sessionsDir: "",
   });
+  const [progress, setProgress] = useState<PickerProgress | null>(null);
 
   const discoverSessions = useCallback(async (sessionsDir: string) => {
     if (!sessionsDir) return;
     setState((prev) => ({ ...prev, loading: true, sessionsDir }));
+    setProgress(null);
     try {
       const sessions = await invoke<CodexSessionInfo[]>("list_sessions", { sessionsDir });
       setState((prev) => ({ ...prev, sessions, loading: false }));
@@ -49,14 +56,36 @@ export function usePicker() {
     });
   }, []);
 
+  // Progress from the background enrichment job. The final event carries
+  // scanned === total, at which point we clear the indicator.
+  useTauriEvent<PickerProgress>("picker-progress", (p) => {
+    if (p.scanned >= p.total) {
+      setProgress(null);
+    } else {
+      setProgress({ scanned: p.scanned, total: p.total });
+    }
+  });
+
+  // A single session finished enrichment — replace it in place so the list fills
+  // in live without re-fetching the whole directory.
+  useTauriEvent<CodexSessionInfo>("session-enriched", (session) => {
+    setState((prev) => {
+      const idx = prev.sessions.findIndex((s) => s.path === session.path);
+      if (idx === -1) return prev;
+      const sessions = [...prev.sessions];
+      sessions[idx] = session;
+      return { ...prev, sessions };
+    });
+  });
+
   // picker-refresh carries no session data — the watcher sends only a lightweight
-  // signal. Re-fetch via the API so the expensive discover_sessions scan runs
-  // only on demand and is coalesced by the server-side cache.
+  // signal (also emitted when enrichment completes, after inline-worker links are
+  // resolved). Re-fetch via the API so the expensive scan runs only on demand.
   useTauriEvent("picker-refresh", () => {
     setState((prev) => {
       if (!prev.sessionsDir) return prev;
       invoke<CodexSessionInfo[]>("list_sessions", { sessionsDir: prev.sessionsDir })
-        .then((sessions) => setState((s) => ({ ...s, sessions })))
+        .then((sessions) => setState((s) => ({ ...s, sessions, loading: false })))
         .catch(() => {});
       return prev;
     });
@@ -83,6 +112,7 @@ export function usePicker() {
     loading: state.loading,
     searchQuery: state.searchQuery,
     sessionsDir: state.sessionsDir,
+    progress,
     setSearchQuery,
     discoverSessions,
     updateSessionOngoing,

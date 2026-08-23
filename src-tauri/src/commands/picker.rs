@@ -9,9 +9,10 @@ use crate::watcher::start_picker_watcher;
 #[tauri::command]
 pub async fn list_sessions(
     sessions_dir: String,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<CodexSessionInfo>, String> {
-    let mut sessions = state.discover_sessions_cached(&sessions_dir)?;
+    let mut sessions = state.discover_sessions(&sessions_dir, &Some(app.clone()))?;
     state.apply_watched_ongoing(&mut sessions);
     Ok(sessions)
 }

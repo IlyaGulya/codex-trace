@@ -211,7 +211,9 @@ pub fn start_picker_watcher(
                 Some(()) = signal_rx.recv() => {
                     // Send a lightweight signal — no session data embedded.
                     // Clients call list_sessions to fetch fresh data; the
-                    // server-side cache coalesces concurrent requests.
+                    // server-side discovery cache is marked dirty so the next
+                    // fetch rescans the changed files.
+                    state.mark_discovery_dirty();
                     state.broadcast("picker-refresh", "{}");
 
                     if let Some(ref app_handle) = app {

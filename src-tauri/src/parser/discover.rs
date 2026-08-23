@@ -5,6 +5,8 @@ use std::io::BufRead;
 use std::path::Path;
 use std::time::SystemTime;
 
+use rayon::prelude::*;
+
 use super::compression::open_session_reader;
 use super::entry::{extract_session_id, RawEntry};
 use super::spawn::parse_spawn_agent_output;
@@ -91,38 +93,47 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
         return Ok(Vec::new());
     }
 
-    let mut infos: Vec<CodexSessionInfo> = Vec::new();
-    collect_jsonl_files(sessions_dir, &mut infos)?;
-
-    // Sort newest first (ISO timestamp in filename is lexicographically sortable)
-    infos.sort_by(|a, b| {
-        let fa = Path::new(&a.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        let fb = Path::new(&b.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        fb.cmp(fa)
-    });
-
-    // Second pass: mark inline workers — sessions whose id appears in any parent's spawned_worker_ids.
-    use std::collections::HashSet;
-    let inline_worker_ids: HashSet<String> = infos
-        .iter()
-        .flat_map(|s| s.spawned_worker_ids.iter().cloned())
+    let files = collect_session_files(sessions_dir)?;
+    let mut infos: Vec<CodexSessionInfo> = files
+        .par_iter()
+        .filter_map(|p| scan_session_file(p))
         .collect();
-    for info in &mut infos {
-        if inline_worker_ids.contains(&info.id) {
-            info.is_inline_worker = true;
-        }
-    }
+
+    sort_sessions(&mut infos);
+    mark_inline_workers(&mut infos);
 
     Ok(infos)
 }
 
-fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<(), String> {
+/// Fast session list: read only each file's `session_meta` header line, without scanning
+/// the full file. Deferred fields (`model`, `thread_name`, `turn_count`, `total_tokens`,
+/// `end_time`, `is_ongoing`, `spawned_worker_ids`) are left at their defaults and filled
+/// in later by the background enrichment job ([`crate::state`]).
+pub fn discover_sessions_fast(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, String> {
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let files = collect_session_files(sessions_dir)?;
+    let mut infos: Vec<CodexSessionInfo> = files
+        .par_iter()
+        .filter_map(|p| scan_session_header(p))
+        .collect();
+
+    sort_sessions(&mut infos);
+    // Inline-worker marking depends on spawned_worker_ids, which only exist after the
+    // full enrichment scan — leave it for the enrichment pass.
+
+    Ok(infos)
+}
+
+fn collect_session_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_jsonl_files(dir, &mut files)?;
+    Ok(files)
+}
+
+fn collect_jsonl_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -131,7 +142,7 @@ fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl_files(&path, infos)?;
+            collect_jsonl_files(&path, files)?;
             continue;
         }
 
@@ -160,12 +171,39 @@ fn collect_jsonl_files(dir: &Path, infos: &mut Vec<CodexSessionInfo>) -> Result<
             continue;
         }
 
-        if let Some(info) = scan_session_file(&path) {
-            infos.push(info);
-        }
+        files.push(path);
     }
 
     Ok(())
+}
+
+/// Sort newest first (ISO timestamp in filename is lexicographically sortable).
+fn sort_sessions(infos: &mut [CodexSessionInfo]) {
+    infos.sort_by(|a, b| {
+        let fa = Path::new(&a.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let fb = Path::new(&b.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        fb.cmp(fa)
+    });
+}
+
+/// Second pass: mark inline workers — sessions whose id appears in any parent's spawned_worker_ids.
+pub fn mark_inline_workers(infos: &mut [CodexSessionInfo]) {
+    use std::collections::HashSet;
+    let inline_worker_ids: HashSet<String> = infos
+        .iter()
+        .flat_map(|s| s.spawned_worker_ids.iter().cloned())
+        .collect();
+    for info in infos {
+        if inline_worker_ids.contains(&info.id) {
+            info.is_inline_worker = true;
+        }
+    }
 }
 
 /// Extract date group (YYYY/MM/DD) from the file path.
@@ -181,12 +219,26 @@ fn date_group_from_path(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Quickly scan a JSONL file for session metadata without full parsing.
-///
-/// Streams the file line-by-line (decompressing zstd transparently) so peak
-/// memory stays bounded to a single line — session files can be hundreds of
-/// megabytes, and slurping every file into memory during discovery spiked RSS.
-fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
+/// Header-only fields parsed from a session file's `session_meta` first line.
+struct HeaderFields {
+    id: String,
+    start_time: String,
+    cwd: Option<String>,
+    originator: Option<String>,
+    cli_version: Option<String>,
+    git_branch: Option<String>,
+    is_external_worker: bool,
+    is_headless: bool,
+    worker_nickname: Option<String>,
+    worker_role: Option<String>,
+    ai_title: Option<String>,
+    meta_archived: bool,
+    approval_mode: Option<String>,
+    history_base_thread_id: Option<String>,
+}
+
+/// Read and parse only the `session_meta` header line of a session file.
+fn parse_header(path: &Path) -> Option<HeaderFields> {
     let reader = open_session_reader(path).ok()?;
     let mut lines = reader
         .lines()
@@ -205,23 +257,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
     let payload = &entry.payload;
     let raw = &entry.raw;
 
-    let (
-        id,
-        start_time,
-        cwd,
-        originator,
-        cli_version,
-        git_branch,
-        _instructions,
-        is_external_worker,
-        is_headless,
-        worker_nickname,
-        worker_role,
-        ai_title,
-        meta_archived,
-        approval_mode,
-        history_base_thread_id,
-    ) = match entry.entry_type.as_str() {
+    match entry.entry_type.as_str() {
         "session_meta" => {
             let id = extract_session_id(payload);
             let start_time = str_field(payload, "timestamp");
@@ -233,8 +269,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|g| g.get("branch"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let instructions: Option<String> = None; // not needed for picker
-                                                     // source.subagent present ⟹ this is a system-spawned external worker
+            // source.subagent present ⟹ this is a system-spawned external worker
             let is_external_worker = payload
                 .get("source")
                 .and_then(|s| s.get("subagent"))
@@ -271,22 +306,21 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .map(|s| s.to_string());
             // Codex v0.146.0 (PRs #34621, #35220): a paginated rollout continuing another
             // thread's history carries session_meta.history_base.thread_id pointing at the
-            // source rollout. This is the lineage-chain marker for session-tree reconstruction
-            // across paginated forks — separate from the per-turn forked_from_thread_id.
+            // source rollout.
             let history_base_thread_id = payload
                 .get("history_base")
                 .and_then(|b| b.get("thread_id"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            (
+
+            Some(HeaderFields {
                 id,
                 start_time,
                 cwd,
                 originator,
                 cli_version,
                 git_branch,
-                instructions,
                 is_external_worker,
                 is_headless,
                 worker_nickname,
@@ -295,7 +329,7 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 meta_archived,
                 approval_mode,
                 history_base_thread_id,
-            )
+            })
         }
         "session_meta_root" => {
             let id = str_field(raw, "id");
@@ -305,19 +339,86 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
                 .and_then(|g| g.get("branch"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            (
-                id, start_time, None, None, None, git_branch, None, false, false, None, None, None,
-                false, None, None,
-            )
+            Some(HeaderFields {
+                id,
+                start_time,
+                cwd: None,
+                originator: None,
+                cli_version: None,
+                git_branch,
+                is_external_worker: false,
+                is_headless: false,
+                worker_nickname: None,
+                worker_role: None,
+                ai_title: None,
+                meta_archived: false,
+                approval_mode: None,
+                history_base_thread_id: None,
+            })
         }
-        _ => return None,
-    };
+        _ => None,
+    }
+}
 
-    if id.is_empty() {
+/// Fast scan: build a [`CodexSessionInfo`] from the header line alone.
+///
+/// Deferred fields are left at defaults and filled in later by
+/// [`enrich_session_info`] during the background enrichment pass.
+pub fn scan_session_header(path: &Path) -> Option<CodexSessionInfo> {
+    let header = parse_header(path)?;
+    if header.id.is_empty() {
         return None;
     }
 
-    // Quick scan remaining lines for turn count, model, thread_name, tokens, end_time
+    Some(CodexSessionInfo {
+        id: header.id,
+        path: path.to_string_lossy().to_string(),
+        cwd: header.cwd,
+        git_branch: header.git_branch,
+        originator: header.originator,
+        model: None,
+        cli_version: header.cli_version,
+        thread_name: None,
+        turn_count: 0,
+        start_time: header.start_time,
+        end_time: None,
+        total_tokens: None,
+        is_ongoing: false,
+        is_external_worker: header.is_external_worker,
+        is_inline_worker: false,
+        is_headless: header.is_headless,
+        is_archived: header.meta_archived,
+        worker_nickname: header.worker_nickname,
+        worker_role: header.worker_role,
+        spawned_worker_ids: Vec::new(),
+        date_group: date_group_from_path(path),
+        ai_title: header.ai_title,
+        approval_mode: header.approval_mode,
+        history_base_thread_id: header.history_base_thread_id,
+    })
+}
+
+/// Full scan: fill in the deferred fields (`model`, `thread_name`, `turn_count`,
+/// `total_tokens`, `end_time`, `is_ongoing`, `spawned_worker_ids`, `is_archived`) on an
+/// already-header-parsed [`CodexSessionInfo`].
+///
+/// Streams the file line-by-line (decompressing zstd transparently) so peak memory stays
+/// bounded to a single line, and parses each line with a lightweight [`RawValue`]-based
+/// struct so only the handful of fields we care about are materialised.
+pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
+    let Ok(reader) = open_session_reader(path) else {
+        return;
+    };
+    let mut lines = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty());
+
+    // Skip the header line (already parsed).
+    if lines.next().is_none() {
+        return;
+    }
+
     let mut turn_count: u32 = 0;
     let mut model: Option<String> = None;
     let mut thread_name: Option<String> = None;
@@ -328,28 +429,24 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         std::collections::HashSet::new();
     let mut is_ongoing = true;
     let mut has_session_end = false;
-    // Codex v0.136.0: track archived state; initialised from session_meta.archived.
-    let mut is_archived = meta_archived;
+    let mut is_archived = info.is_archived;
 
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
+        let head: LineHead = match serde_json::from_str(&line) {
+            Ok(h) => h,
             Err(_) => continue,
         };
+        let Some(t) = head.typ else { continue };
 
-        let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match t {
             "session_end" => {
                 has_session_end = true;
                 is_ongoing = false;
                 if end_time.is_none() {
-                    end_time = v
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                    end_time = head.timestamp.map(|s| s.to_string());
                 }
             }
             // Codex v0.136.0: archive/unarchive commands append these events.
@@ -357,153 +454,142 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
             "session_archived" => is_archived = true,
             "session_unarchived" => is_archived = false,
             "event_msg" => {
-                let pt = v
-                    .get("payload")
-                    .and_then(|p| p.get("type"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                match pt {
-                    "task_started" => {
+                let Some(payload) = head.payload else {
+                    continue;
+                };
+                let Ok(pt) = serde_json::from_str::<PayloadType>(payload.get()) else {
+                    continue;
+                };
+                match pt.typ {
+                    Some("task_started") => {
                         turn_count += 1;
                         if !has_session_end {
                             is_ongoing = true;
                         }
                         end_time = None;
                     }
-                    "user_message" if turn_count == 0 => {
+                    Some("user_message") if turn_count == 0 => {
                         turn_count += 1;
                         if !has_session_end {
                             is_ongoing = true;
                         }
                         end_time = None;
                     }
-                    "task_complete" => {
+                    Some("task_complete") => {
                         is_ongoing = false;
-                        let payload = v.get("payload").unwrap_or(&Value::Null);
-                        end_time = payload
-                            .get("completed_at")
-                            .and_then(|v| v.as_f64())
-                            .map(|ts| {
+                        if let Ok(tc) = serde_json::from_str::<TaskComplete>(payload.get()) {
+                            end_time = tc.completed_at.and_then(|ts| {
                                 use chrono::{DateTime, Utc};
                                 DateTime::<Utc>::from_timestamp(ts as i64, 0)
                                     .map(|dt| dt.to_rfc3339())
-                                    .unwrap_or_default()
-                            })
-                            .or_else(|| {
-                                v.get("timestamp")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
                             });
-                        // Codex v0.128.0: task_complete may carry prompt_tokens/completion_tokens/total_tokens.
-                        // Use as fallback when no token_count event was seen.
-                        if total_tokens.is_none() {
-                            total_tokens = payload
-                                .get("total_tokens")
-                                .and_then(|v| v.as_u64())
-                                .or_else(|| {
-                                    let p =
-                                        payload.get("prompt_tokens").and_then(|v| v.as_u64())?;
-                                    let c = payload
-                                        .get("completion_tokens")
-                                        .and_then(|v| v.as_u64())?;
+                            if end_time.is_none() {
+                                end_time = head.timestamp.map(|s| s.to_string());
+                            }
+                            // Codex v0.128.0: task_complete may carry
+                            // prompt_tokens/completion_tokens/total_tokens. Use as fallback
+                            // when no token_count event was seen.
+                            if total_tokens.is_none() {
+                                total_tokens = tc.total_tokens.or_else(|| {
+                                    let p = tc.prompt_tokens?;
+                                    let c = tc.completion_tokens?;
                                     Some(p + c)
                                 });
+                            }
+                        } else {
+                            end_time = head.timestamp.map(|s| s.to_string());
                         }
                     }
-                    "turn_aborted" => {
+                    Some("turn_aborted") => {
                         is_ongoing = false;
-                        end_time = v
-                            .get("timestamp")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                        end_time = head.timestamp.map(|s| s.to_string());
                     }
-                    "token_budget_abort" | "inference_stream_cancelled" => {
+                    Some("token_budget_abort") | Some("inference_stream_cancelled") => {
                         // v0.142.0+: budget exhausted or inference cancelled — turn is done.
                         // v0.143.0 reliably preserves these on disk during shutdown.
                         is_ongoing = false;
-                        end_time = v
-                            .get("timestamp")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                        end_time = head.timestamp.map(|s| s.to_string());
                     }
-                    "token_count" => {
-                        if let Some(info) = v
-                            .get("payload")
-                            .and_then(|p| p.get("info"))
-                            .filter(|v| !v.is_null())
-                        {
-                            if let Some(ttu) = info.get("total_token_usage") {
-                                total_tokens = ttu.get("total_tokens").and_then(|v| v.as_u64());
+                    Some("token_count") => {
+                        if let Ok(tc) = serde_json::from_str::<TokenCount>(payload.get()) {
+                            if let Some(ttu) = tc.info.and_then(|i| i.total_token_usage) {
+                                total_tokens = ttu.total_tokens;
                             }
                         }
                     }
-                    "thread_name_updated" => {
-                        thread_name = v
-                            .get("payload")
-                            .and_then(|p| p.get("thread_name"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                    Some("thread_name_updated") => {
+                        if let Ok(tn) = serde_json::from_str::<ThreadNameUpdated>(payload.get()) {
+                            if let Some(name) = tn.thread_name {
+                                thread_name = Some(name.to_string());
+                            }
+                        }
                     }
-                    "collab_agent_spawn_end" => {
+                    Some("collab_agent_spawn_end") => {
                         // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
-                        if let Some(new_id) = v
-                            .get("payload")
-                            .and_then(|p| {
-                                p.get("new_thread_id").or_else(|| p.get("new_session_id"))
-                            })
-                            .and_then(|v| v.as_str())
-                        {
-                            push_unique(&mut spawned_worker_ids, new_id.to_string());
+                        if let Ok(spawn) = serde_json::from_str::<CollabSpawnEnd>(payload.get()) {
+                            if let Some(new_id) = spawn.new_thread_id.or(spawn.new_session_id) {
+                                push_unique(&mut spawned_worker_ids, new_id.to_string());
+                            }
                         }
                     }
                     _ => {}
                 }
             }
             "response_item" => {
-                let payload = v.get("payload").unwrap_or(&Value::Null);
-                match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                    "function_call"
-                        if payload.get("name").and_then(|v| v.as_str()) == Some("spawn_agent") =>
-                    {
-                        if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
-                            pending_spawn_call_ids.insert(call_id.to_string());
+                let Some(payload) = head.payload else {
+                    continue;
+                };
+                let Ok(pt) = serde_json::from_str::<PayloadType>(payload.get()) else {
+                    continue;
+                };
+                match pt.typ {
+                    Some("function_call") => {
+                        let Ok(fc) = serde_json::from_str::<FunctionCall>(payload.get()) else {
+                            continue;
+                        };
+                        if fc.name == Some("spawn_agent") {
+                            if let Some(call_id) = fc.call_id {
+                                pending_spawn_call_ids.insert(call_id.to_string());
+                            }
                         }
                     }
-                    "function_call_output" => {
-                        let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) else {
+                    Some("function_call_output") => {
+                        let Ok(call) = serde_json::from_str::<CallIdOnly>(payload.get()) else {
+                            continue;
+                        };
+                        let Some(call_id) = call.call_id else {
                             continue;
                         };
                         if !pending_spawn_call_ids.contains(call_id) {
                             continue;
                         }
-                        if let Some(output) = output_text(payload) {
-                            if let Some(spawn) = parse_spawn_agent_output(&output) {
-                                push_unique(&mut spawned_worker_ids, spawn.agent_id);
-                            }
+                        let Ok(out) = serde_json::from_str::<OutputOnly>(payload.get()) else {
+                            continue;
+                        };
+                        let Some(output) = out.output.as_ref().and_then(output_text) else {
+                            continue;
+                        };
+                        if let Some(spawn) = parse_spawn_agent_output(&output) {
+                            push_unique(&mut spawned_worker_ids, spawn.agent_id);
                         }
                     }
                     _ => {}
                 }
             }
             "turn_context" => {
+                let Some(payload) = head.payload else {
+                    continue;
+                };
                 // Always overwrite — spec says "most recent turn_context.payload.model"
-                let m = v
-                    .get("payload")
-                    .and_then(|p| p.get("model"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if m.is_some() {
-                    model = m;
+                if let Ok(tc) = serde_json::from_str::<TurnContext>(payload.get()) {
+                    if let Some(m) = tc.model {
+                        model = Some(m.to_string());
+                    }
                 }
             }
             _ => {}
         }
     }
-
-    // Also count user_message events for old format (no task_started)
-    // We already handle that above by incrementing on first "user_message"
-    // For accuracy, re-scan and count task_started events specifically
-    // (already done in the loop above — task_started increments turn_count)
 
     // Sessions with no turns have no active task — not ongoing regardless of event stream.
     if turn_count == 0 {
@@ -526,34 +612,21 @@ fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
         }
     }
 
-    let date_group = date_group_from_path(path);
+    info.model = model;
+    info.thread_name = thread_name;
+    info.turn_count = turn_count;
+    info.total_tokens = total_tokens;
+    info.end_time = end_time;
+    info.is_ongoing = is_ongoing;
+    info.is_archived = is_archived;
+    info.spawned_worker_ids = spawned_worker_ids;
+}
 
-    Some(CodexSessionInfo {
-        id,
-        path: path.to_string_lossy().to_string(),
-        cwd,
-        git_branch,
-        originator,
-        model,
-        cli_version,
-        thread_name,
-        turn_count,
-        start_time,
-        end_time,
-        total_tokens,
-        is_ongoing,
-        is_external_worker,
-        is_inline_worker: false, // set by discover_sessions second pass
-        is_headless,
-        is_archived,
-        worker_nickname,
-        worker_role,
-        spawned_worker_ids,
-        date_group,
-        ai_title,
-        approval_mode,
-        history_base_thread_id,
-    })
+/// Full scan of a single file: header + enrichment. Used by [`discover_sessions`].
+fn scan_session_file(path: &Path) -> Option<CodexSessionInfo> {
+    let mut info = scan_session_header(path)?;
+    enrich_session_info(&mut info, path);
+    Some(info)
 }
 
 fn worker_metadata(payload: &Value) -> (Option<String>, Option<String>) {
@@ -584,10 +657,12 @@ fn opt_str(v: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn output_text(payload: &Value) -> Option<String> {
-    match payload.get("output") {
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Array(arr)) => Some(
+/// Extract the human-readable text from a `function_call_output` `output` value,
+/// which is either a plain string or an array of `{"type":"text","text":…}` items.
+fn output_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(arr) => Some(
             arr.iter()
                 .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
@@ -603,11 +678,152 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lightweight line parsing for the enrichment scan.
+//
+// Parsing every line as a full `serde_json::Value` was the dominant cost of
+// discovery: session files are dominated by huge `response_item` payloads
+// (command output, reasoning, message content) that we never need. These structs
+// parse only the top-level `type`/`timestamp` and keep `payload` as a borrowed
+// [`RawValue`] — no tree is built unless a specific sub-type requires it.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct LineHead<'a> {
+    #[serde(rename = "type", default)]
+    typ: Option<&'a str>,
+    #[serde(default)]
+    timestamp: Option<&'a str>,
+    #[serde(default)]
+    payload: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct PayloadType<'a> {
+    #[serde(rename = "type", default)]
+    typ: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct TaskComplete {
+    completed_at: Option<f64>,
+    total_tokens: Option<u64>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenCount {
+    info: Option<TokenCountInfo>,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenCountInfo {
+    total_token_usage: Option<TotalTokenUsage>,
+}
+
+#[derive(serde::Deserialize)]
+struct TotalTokenUsage {
+    total_tokens: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct ThreadNameUpdated<'a> {
+    thread_name: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct CollabSpawnEnd<'a> {
+    new_thread_id: Option<&'a str>,
+    new_session_id: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct FunctionCall<'a> {
+    name: Option<&'a str>,
+    call_id: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct CallIdOnly<'a> {
+    call_id: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct OutputOnly {
+    #[serde(default)]
+    output: Option<Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct TurnContext<'a> {
+    model: Option<&'a str>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn discover_sessions_fast_returns_header_without_full_scan() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-07T00-00-00-fast.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"id":"fast","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp","cli_version":"0.131.0"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:02Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576003.0,"total_tokens":123}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions_fast(tmp.path()).unwrap();
+        let session = sessions.iter().find(|s| s.id == "fast").unwrap();
+
+        // Header-only fields are populated…
+        assert_eq!(session.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(session.cli_version.as_deref(), Some("0.131.0"));
+        // …but deferred fields are left at their defaults until enrichment.
+        assert_eq!(session.turn_count, 0);
+        assert_eq!(session.model, None);
+        assert_eq!(session.total_tokens, None);
+        assert!(!session.is_ongoing);
+    }
+
+    #[test]
+    fn enrich_session_info_fills_deferred_fields() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-07T00-00-00-enrich.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"id":"enrich","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:02Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576003.0,"total_tokens":123}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut info = scan_session_header(&path).unwrap();
+        assert_eq!(info.turn_count, 0);
+
+        enrich_session_info(&mut info, &path);
+
+        assert_eq!(info.turn_count, 1);
+        assert_eq!(info.model.as_deref(), Some("gpt-5"));
+        assert_eq!(info.total_tokens, Some(123));
+        assert!(!info.is_ongoing);
+        assert!(info.end_time.is_some());
+    }
 
     #[test]
     fn discover_sessions_reads_id_from_session_id_field() {

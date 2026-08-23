@@ -14,6 +14,7 @@ import { KeybindBar } from "./components/KeybindBar";
 import { ViewToolbar } from "./components/ViewToolbar";
 import { ResizeHandle } from "./components/ResizeHandle";
 import { SettingsModal } from "./components/SettingsModal";
+import { SessionLoading } from "./components/SessionLoading";
 
 function findToolByCallId(tools: CodexToolCall[], callId: string): CodexToolCall | null {
   for (const tool of tools) {
@@ -207,14 +208,13 @@ export function App() {
               loading={picker.loading}
               searchQuery={picker.searchQuery}
               selectedIndex={pickerSelected}
+              progress={picker.progress}
               onSelectSession={handleSelectSession}
               onSearchChange={picker.setSearchQuery}
             />
           )}
 
-          {view === "list" && session.loading && (
-            <div className="app__loading">Loading session…</div>
-          )}
+          {view === "list" && session.loading && <SessionLoading progress={session.loadProgress} />}
 
           {view === "list" && !session.loading && session.session && (
             <TurnList

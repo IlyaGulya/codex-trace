@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::compression::read_session_file;
+use super::compression::open_session_reader;
 use super::entry::{extract_session_id, RawEntry};
 use super::toolcall::ToolKind;
 use super::turn::{build_turns, CodexTurn, TokenInfo, TurnStatus};
@@ -52,15 +53,26 @@ pub struct CodexSession {
 
 /// Parse a Codex JSONL session file into a CodexSession.
 pub fn parse_session(path: &Path) -> Result<CodexSession, String> {
+    parse_session_with_progress(path, &mut |_, _| {})
+}
+
+/// Parse a session file, reporting read progress through `progress(done_bytes, total_bytes)`
+/// as the top-level file is streamed. `total_bytes` is the on-disk file size (0 when unknown,
+/// e.g. for zstd-compressed files whose decompressed size isn't known up front).
+pub fn parse_session_with_progress(
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<CodexSession, String> {
     let mut visited = HashSet::new();
-    parse_session_inner(path, &mut visited)
+    parse_session_inner(path, &mut visited, progress)
 }
 
 fn parse_session_inner(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<CodexSession, String> {
-    let content = read_session_file(path)?;
+    let entries = read_entries_streaming(path, progress)?;
     let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canonical_path.clone()) {
         return Err(format!(
@@ -68,12 +80,6 @@ fn parse_session_inner(
             path.display()
         ));
     }
-
-    let entries: Vec<RawEntry> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(RawEntry::parse)
-        .collect();
 
     let mut session = CodexSession {
         id: String::new(),
@@ -183,6 +189,47 @@ fn parse_session_inner(
     Ok(session)
 }
 
+/// Stream a session file line-by-line into `RawEntry`s, reporting read progress via
+/// `progress(done_bytes, total_bytes)`. Decompresses zstd transparently and keeps peak
+/// memory bounded to a single line instead of slurping the whole file.
+fn read_entries_streaming(
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<RawEntry>, String> {
+    let total = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut reader = open_session_reader(path)?;
+    let mut entries: Vec<RawEntry> = Vec::new();
+    let mut done: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    let mut buf = String::new();
+
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        done += n as u64;
+
+        // Throttle progress to at most ~10 reports/second so the callback (which may
+        // broadcast over SSE/Tauri) doesn't dominate the parse.
+        if last_report.elapsed().as_millis() >= 100 || done == total {
+            progress(done, total);
+            last_report = std::time::Instant::now();
+        }
+
+        let line = buf.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(entry) = RawEntry::parse(line) {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
 fn embed_worker_sessions(
     parent_path: &Path,
     turns: &mut [CodexTurn],
@@ -213,7 +260,7 @@ fn embed_worker_sessions(
                 continue;
             }
 
-            if let Ok(worker_session) = parse_session_inner(&worker_path, visited) {
+            if let Ok(worker_session) = parse_session_inner(&worker_path, visited, &mut |_, _| {}) {
                 tool.worker_session = Some(Box::new(worker_session));
             }
         }
@@ -247,26 +294,30 @@ fn find_session_file_by_id(anchor_path: &Path, session_id: &str) -> Option<PathB
 }
 
 fn session_file_id(path: &Path) -> Option<String> {
-    let content = read_session_file(path).ok()?;
-    content.lines().take(20).find_map(|line| {
-        let entry = RawEntry::parse(line)?;
-        match entry.entry_type.as_str() {
-            "session_meta" => {
-                let id = extract_session_id(&entry.payload);
-                if id.is_empty() {
-                    None
-                } else {
-                    Some(id)
+    let reader = open_session_reader(path).ok()?;
+    reader
+        .lines()
+        .take(20)
+        .filter_map(Result::ok)
+        .find_map(|line| {
+            let entry = RawEntry::parse(&line)?;
+            match entry.entry_type.as_str() {
+                "session_meta" => {
+                    let id = extract_session_id(&entry.payload);
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some(id)
+                    }
                 }
+                "session_meta_root" => entry
+                    .raw
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(|id| id.to_string()),
+                _ => None,
             }
-            "session_meta_root" => entry
-                .raw
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(|id| id.to_string()),
-            _ => None,
-        }
-    })
+        })
 }
 
 fn parse_session_meta_new(session: &mut CodexSession, payload: &Value, _raw: &Value) {
@@ -367,6 +418,39 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn parse_session_with_progress_reports_bytes_and_matches_parse_session() {
+        let tmp = tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-07T00-00-00-progress.jsonl");
+        let content = [
+            r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"id":"progress-session","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#,
+            r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-05-07T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1746576002.0}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let expected = parse_session(&path).unwrap();
+
+        let mut reported: Vec<(u64, u64)> = Vec::new();
+        let actual = parse_session_with_progress(&path, &mut |done, total| {
+            reported.push((done, total));
+        })
+        .unwrap();
+
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.turns.len(), expected.turns.len());
+        // Progress must have been reported at least once…
+        assert!(!reported.is_empty());
+        // …with a final `done` equal to the full byte length (last report reaches EOF).
+        let total_bytes = content.len() as u64;
+        let last = reported.last().unwrap();
+        assert_eq!(last.1, total_bytes, "total must be the on-disk file size");
+        assert_eq!(last.0, total_bytes, "done must reach EOF");
+    }
 
     #[test]
     fn parse_session_reads_id_from_session_id_field() {
