@@ -457,10 +457,10 @@ pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
                 let Some(payload) = head.payload else {
                     continue;
                 };
-                let Ok(pt) = serde_json::from_str::<PayloadType>(payload.get()) else {
+                let Ok(p) = serde_json::from_str::<EventMsgPayload>(payload.get()) else {
                     continue;
                 };
-                match pt.typ {
+                match p.typ {
                     Some("task_started") => {
                         turn_count += 1;
                         if !has_session_end {
@@ -477,27 +477,22 @@ pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
                     }
                     Some("task_complete") => {
                         is_ongoing = false;
-                        if let Ok(tc) = serde_json::from_str::<TaskComplete>(payload.get()) {
-                            end_time = tc.completed_at.and_then(|ts| {
-                                use chrono::{DateTime, Utc};
-                                DateTime::<Utc>::from_timestamp(ts as i64, 0)
-                                    .map(|dt| dt.to_rfc3339())
-                            });
-                            if end_time.is_none() {
-                                end_time = head.timestamp.map(|s| s.to_string());
-                            }
-                            // Codex v0.128.0: task_complete may carry
-                            // prompt_tokens/completion_tokens/total_tokens. Use as fallback
-                            // when no token_count event was seen.
-                            if total_tokens.is_none() {
-                                total_tokens = tc.total_tokens.or_else(|| {
-                                    let p = tc.prompt_tokens?;
-                                    let c = tc.completion_tokens?;
-                                    Some(p + c)
-                                });
-                            }
-                        } else {
+                        end_time = p.completed_at.and_then(|ts| {
+                            use chrono::{DateTime, Utc};
+                            DateTime::<Utc>::from_timestamp(ts as i64, 0).map(|dt| dt.to_rfc3339())
+                        });
+                        if end_time.is_none() {
                             end_time = head.timestamp.map(|s| s.to_string());
+                        }
+                        // Codex v0.128.0: task_complete may carry
+                        // prompt_tokens/completion_tokens/total_tokens. Use as fallback
+                        // when no token_count event was seen.
+                        if total_tokens.is_none() {
+                            total_tokens = p.total_tokens.or_else(|| {
+                                let pt = p.prompt_tokens?;
+                                let ct = p.completion_tokens?;
+                                Some(pt + ct)
+                            });
                         }
                     }
                     Some("turn_aborted") => {
@@ -511,25 +506,21 @@ pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
                         end_time = head.timestamp.map(|s| s.to_string());
                     }
                     Some("token_count") => {
-                        if let Ok(tc) = serde_json::from_str::<TokenCount>(payload.get()) {
-                            if let Some(ttu) = tc.info.and_then(|i| i.total_token_usage) {
+                        if let Some(info) = p.info {
+                            if let Some(ttu) = info.total_token_usage {
                                 total_tokens = ttu.total_tokens;
                             }
                         }
                     }
                     Some("thread_name_updated") => {
-                        if let Ok(tn) = serde_json::from_str::<ThreadNameUpdated>(payload.get()) {
-                            if let Some(name) = tn.thread_name {
-                                thread_name = Some(name.to_string());
-                            }
+                        if let Some(name) = p.thread_name {
+                            thread_name = Some(name.to_string());
                         }
                     }
                     Some("collab_agent_spawn_end") => {
                         // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
-                        if let Ok(spawn) = serde_json::from_str::<CollabSpawnEnd>(payload.get()) {
-                            if let Some(new_id) = spawn.new_thread_id.or(spawn.new_session_id) {
-                                push_unique(&mut spawned_worker_ids, new_id.to_string());
-                            }
+                        if let Some(new_id) = p.new_thread_id.or(p.new_session_id) {
+                            push_unique(&mut spawned_worker_ids, new_id.to_string());
                         }
                     }
                     _ => {}
@@ -539,25 +530,17 @@ pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
                 let Some(payload) = head.payload else {
                     continue;
                 };
-                let Ok(pt) = serde_json::from_str::<PayloadType>(payload.get()) else {
+                let Ok(p) = serde_json::from_str::<ResponseItemPayload>(payload.get()) else {
                     continue;
                 };
-                match pt.typ {
-                    Some("function_call") => {
-                        let Ok(fc) = serde_json::from_str::<FunctionCall>(payload.get()) else {
-                            continue;
-                        };
-                        if fc.name == Some("spawn_agent") {
-                            if let Some(call_id) = fc.call_id {
-                                pending_spawn_call_ids.insert(call_id.to_string());
-                            }
+                match p.typ {
+                    Some("function_call") if p.name == Some("spawn_agent") => {
+                        if let Some(call_id) = p.call_id {
+                            pending_spawn_call_ids.insert(call_id.to_string());
                         }
                     }
                     Some("function_call_output") => {
-                        let Ok(call) = serde_json::from_str::<CallIdOnly>(payload.get()) else {
-                            continue;
-                        };
-                        let Some(call_id) = call.call_id else {
+                        let Some(call_id) = p.call_id else {
                             continue;
                         };
                         if !pending_spawn_call_ids.contains(call_id) {
@@ -581,7 +564,7 @@ pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
                     continue;
                 };
                 // Always overwrite — spec says "most recent turn_context.payload.model"
-                if let Ok(tc) = serde_json::from_str::<TurnContext>(payload.get()) {
+                if let Ok(tc) = serde_json::from_str::<TurnContextPayload>(payload.get()) {
                     if let Some(m) = tc.model {
                         model = Some(m.to_string());
                     }
@@ -698,23 +681,47 @@ struct LineHead<'a> {
     payload: Option<&'a serde_json::value::RawValue>,
 }
 
+/// `event_msg` payload: `type` plus every scalar field the enrichment pass needs.
+/// Parsed in a single serde pass so a large payload (e.g. `exec_command_end`'s
+/// `aggregated_output`) is scanned once, not once per field of interest.
 #[derive(serde::Deserialize)]
-struct PayloadType<'a> {
+struct EventMsgPayload<'a> {
     #[serde(rename = "type", default)]
     typ: Option<&'a str>,
-}
-
-#[derive(serde::Deserialize)]
-struct TaskComplete {
+    #[serde(default)]
     completed_at: Option<f64>,
+    #[serde(default)]
     total_tokens: Option<u64>,
+    #[serde(default)]
     prompt_tokens: Option<u64>,
+    #[serde(default)]
     completion_tokens: Option<u64>,
+    #[serde(default)]
+    thread_name: Option<&'a str>,
+    #[serde(default)]
+    new_thread_id: Option<&'a str>,
+    #[serde(default)]
+    new_session_id: Option<&'a str>,
+    #[serde(default)]
+    info: Option<TokenCountInfo>,
+}
+
+/// `response_item` payload: `type`, `name`, `call_id`. The `output` field is intentionally
+/// absent — it can be huge, so it is only parsed lazily for spawn_agent function calls.
+#[derive(serde::Deserialize)]
+struct ResponseItemPayload<'a> {
+    #[serde(rename = "type", default)]
+    typ: Option<&'a str>,
+    #[serde(default)]
+    name: Option<&'a str>,
+    #[serde(default)]
+    call_id: Option<&'a str>,
 }
 
 #[derive(serde::Deserialize)]
-struct TokenCount {
-    info: Option<TokenCountInfo>,
+struct TurnContextPayload<'a> {
+    #[serde(default)]
+    model: Option<&'a str>,
 }
 
 #[derive(serde::Deserialize)]
@@ -728,36 +735,9 @@ struct TotalTokenUsage {
 }
 
 #[derive(serde::Deserialize)]
-struct ThreadNameUpdated<'a> {
-    thread_name: Option<&'a str>,
-}
-
-#[derive(serde::Deserialize)]
-struct CollabSpawnEnd<'a> {
-    new_thread_id: Option<&'a str>,
-    new_session_id: Option<&'a str>,
-}
-
-#[derive(serde::Deserialize)]
-struct FunctionCall<'a> {
-    name: Option<&'a str>,
-    call_id: Option<&'a str>,
-}
-
-#[derive(serde::Deserialize)]
-struct CallIdOnly<'a> {
-    call_id: Option<&'a str>,
-}
-
-#[derive(serde::Deserialize)]
 struct OutputOnly {
     #[serde(default)]
     output: Option<Value>,
-}
-
-#[derive(serde::Deserialize)]
-struct TurnContext<'a> {
-    model: Option<&'a str>,
 }
 
 #[cfg(test)]
