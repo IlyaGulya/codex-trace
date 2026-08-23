@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
+use crate::parser::cache::PersistentCache;
 use crate::parser::discover::{self, CodexSessionInfo};
 use crate::settings::Settings;
 use crate::watcher::WatcherHandle;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub watched_session_ongoing: Mutex<Option<(String, bool)>>,
     pub event_tx: broadcast::Sender<SseEvent>,
     discovery: Mutex<DiscoveryState>,
+    /// On-disk cache of enriched session metadata keyed by (path, mtime, size).
+    cache: Mutex<PersistentCache>,
     /// Dedicated, reduced-size thread pool for background enrichment. The default rayon
     /// global pool spans every logical CPU, so a 7 GB enrichment scan would saturate all
     /// cores and starve the webview UI. This pool leaves headroom for rendering + tokio.
@@ -52,6 +55,23 @@ fn enrich_thread_count() -> usize {
         .unwrap_or(4);
     (cpus / 2).max(1)
 }
+
+/// Demote the calling thread to background QoS so the OS scheduler always favours the
+/// webview's interactive work over enrichment parsing. Without this, even a few
+/// CPU-bound rayon threads can starve the UI process and cause visible jank.
+#[cfg(target_os = "macos")]
+fn lower_background_priority() {
+    unsafe {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        // QOS_CLASS_UTILITY (0x11): run eagerly on spare cores but yield to UI I/O + CPU.
+        pthread_set_qos_class_self_np(0x11, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lower_background_priority() {}
 
 /// Broadcast an event to both the SSE stream (web clients) and the Tauri event bus
 /// (desktop webview). `data` is the JSON payload; both channels deliver the same shape.
@@ -70,6 +90,7 @@ impl AppState {
         let enrich_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(enrich_thread_count())
             .thread_name(|i| format!("codex-enrich-{i}"))
+            .start_handler(|_| lower_background_priority())
             .build()
             .expect("failed to build enrichment thread pool");
         Self {
@@ -79,6 +100,7 @@ impl AppState {
             watched_session_ongoing: Mutex::new(None),
             event_tx,
             discovery: Mutex::new(DiscoveryState::default()),
+            cache: Mutex::new(PersistentCache::load()),
             enrich_pool: Arc::new(enrich_pool),
         }
     }
@@ -137,8 +159,9 @@ impl AppState {
 
     /// Fast session discovery plus a background enrichment job.
     ///
-    /// Returns the header-only session list immediately (no full-file scans), and spawns
-    /// a background thread that enriches each session and streams `picker-progress` and
+    /// Returns the session list immediately: unchanged files are served from the on-disk
+    /// cache (full metadata), and only new/modified files are left as headers to be
+    /// enriched by a background thread that streams `picker-progress` and
     /// `session-enriched` events. Subsequent calls for the same `dir` return the current
     /// in-memory snapshot without rescanning, unless the watcher marked it dirty.
     pub fn discover_sessions(
@@ -146,23 +169,54 @@ impl AppState {
         dir: &str,
         app: &Option<AppHandle>,
     ) -> Result<Vec<CodexSessionInfo>, String> {
-        let (sessions, generation) = {
+        let (sessions, to_enrich, generation) = {
             let mut guard = self.discovery.lock().map_err(|e| e.to_string())?;
             if guard.dir == dir && !guard.dirty {
                 return Ok(guard.sessions.clone());
             }
 
             let path = std::path::Path::new(dir);
-            let sessions = discover::discover_sessions_fast(path)?;
+            let headers = discover::discover_sessions_fast(path)?;
+
+            // Serve unchanged files from the persistent cache so a cold start doesn't
+            // re-scan gigabytes of JSONL; collect only the files that need a full scan.
+            let cache = self.cache.lock().map_err(|e| e.to_string())?;
+            let mut sessions = Vec::with_capacity(headers.len());
+            let mut to_enrich = Vec::new();
+            for header in headers {
+                let hit = std::fs::metadata(&header.path).ok().and_then(|m| {
+                    let mtime = m.modified().ok()?;
+                    cache.get(&header.path, mtime, m.len())
+                });
+                match hit {
+                    Some(full) => sessions.push(full),
+                    None => {
+                        sessions.push(header.clone());
+                        to_enrich.push(header);
+                    }
+                }
+            }
+            drop(cache);
+
+            // Cached entries already carry spawned_worker_ids, so resolve inline-worker
+            // links now for a correct initial view (the enrichment pass re-runs this
+            // after it fills in the newly-scanned files).
+            discover::mark_inline_workers(&mut sessions);
+
             let generation = guard.generation + 1;
             guard.dir = dir.to_string();
             guard.generation = generation;
             guard.sessions = sessions.clone();
             guard.dirty = false;
-            (sessions, generation)
+            (sessions, to_enrich, generation)
         };
 
-        self.spawn_enrichment(dir.to_string(), app.clone(), generation);
+        // Everything was served from the cache — nothing to scan, no refresh needed.
+        if to_enrich.is_empty() {
+            return Ok(sessions);
+        }
+
+        self.spawn_enrichment(dir.to_string(), app.clone(), generation, to_enrich);
         Ok(sessions)
     }
 
@@ -174,18 +228,16 @@ impl AppState {
         }
     }
 
-    fn spawn_enrichment(self: &Arc<Self>, _dir: String, app: Option<AppHandle>, generation: u64) {
+    fn spawn_enrichment(
+        self: &Arc<Self>,
+        _dir: String,
+        app: Option<AppHandle>,
+        generation: u64,
+        to_enrich: Vec<CodexSessionInfo>,
+    ) {
         let state = self.clone();
         let pool = self.enrich_pool.clone();
-        let sessions = {
-            let guard = match self.discovery.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            guard.sessions.clone()
-        };
-
-        let total = sessions.len();
+        let total = to_enrich.len();
 
         std::thread::spawn(move || {
             let scanned = Arc::new(AtomicUsize::new(0));
@@ -193,7 +245,7 @@ impl AppState {
             // `install` scopes the parallel loop to the reduced-size pool so enrichment
             // never saturates all logical CPUs.
             pool.install(|| {
-                sessions.par_iter().for_each(|info| {
+                to_enrich.par_iter().for_each(|info| {
                     let mut enriched = info.clone();
                     let path = PathBuf::from(&info.path);
                     discover::enrich_session_info(&mut enriched, &path);
@@ -215,6 +267,15 @@ impl AppState {
                         }
                     }
 
+                    // Persist this file's result so the next cold start skips it.
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Ok(mtime) = meta.modified() {
+                            if let Ok(mut cache) = state.cache.lock() {
+                                cache.put(&enriched.path, mtime, meta.len(), enriched.clone());
+                            }
+                        }
+                    }
+
                     if let Ok(data) = serde_json::to_string(&enriched) {
                         broadcast(&state, &app, "session-enriched", &data);
                     }
@@ -227,8 +288,7 @@ impl AppState {
                 });
             });
 
-            // Finalize: mark inline workers across the now-fully-enriched list, then tell
-            // clients to re-fetch for a consistent view.
+            // Finalize: mark inline workers across the (cached + freshly-enriched) list.
             {
                 let mut guard = match state.discovery.lock() {
                     Ok(g) => g,
@@ -238,6 +298,12 @@ impl AppState {
                     discover::mark_inline_workers(&mut guard.sessions);
                 }
             }
+
+            // Persist the cache so the next cold start skips unchanged files.
+            if let Ok(cache) = state.cache.lock() {
+                cache.save();
+            }
+
             broadcast(&state, &app, "picker-refresh", "{}");
         });
     }
