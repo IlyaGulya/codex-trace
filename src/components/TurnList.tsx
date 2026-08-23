@@ -79,6 +79,7 @@ export function TurnList({ turns, selectedIndex, onSelectTurn }: TurnListProps) 
         const userMsg = turn.user_message ?? "";
         const userExpanded = expandedUsers.has(i);
         const agentPreview =
+          turn.final_answer ??
           turn.agent_messages.find((m) => m.phase === "final_answer")?.text ??
           turn.agent_messages.find((m) => !m.is_reasoning)?.text ??
           null;

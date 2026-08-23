@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::entry::{parse_timestamp_secs, RawEntry};
 use super::spawn::parse_spawn_agent_output;
@@ -195,6 +195,18 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
     let mut turns: indexmap::IndexMap<String, CodexTurn> = indexmap::IndexMap::new();
     let mut current_turn_id: Option<String> = None;
     let mut tool_builders: HashMap<String, ToolCallBuilder> = HashMap::new();
+    // Codex v0.149+ transcripts record assistant replies only as response_item
+    // "message" entries (role=assistant) — the agent_message event_msg is gone. Collect
+    // them per-turn (with their stream position) and merge below, deduplicating against
+    // event-derived messages so pre-v0.149 sessions (which carry BOTH forms) don't get
+    // duplicates.
+    let mut assistant_items: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    // Turns whose final_answer currently comes from a response_item (not an event);
+    // the merge step below replaces it with the LAST reply of the turn.
+    let mut final_from_item: HashSet<String> = HashSet::new();
+    // task_complete.last_agent_message is an explicit final verdict from the CLI and
+    // outranks the "last response_item reply" heuristic in the merge step.
+    let mut final_from_complete: HashSet<String> = HashSet::new();
 
     // Detect format: new (has task_started) vs old (user_message-bounded)
     let has_task_started = entries.iter().any(|e| {
@@ -222,6 +234,7 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
                     has_task_started,
                     &mut synthetic_turn_counter,
                     index,
+                    &mut final_from_complete,
                 );
             }
             "response_item"
@@ -229,7 +242,15 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
             | "function_call_output"
             | "message"
             | "reasoning" => {
-                handle_response_item(entry, &mut turns, &current_turn_id, &mut tool_builders);
+                handle_response_item(
+                    entry,
+                    &mut turns,
+                    &current_turn_id,
+                    &mut tool_builders,
+                    &mut assistant_items,
+                    &mut final_from_item,
+                    index,
+                );
             }
             "turn_context" => {
                 handle_turn_context(entry, &mut turns, &current_turn_id);
@@ -259,6 +280,51 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
         }
     }
 
+    // Merge assistant response_items into the transcript. Event-derived messages win
+    // (exact-text dedup) because they carry richer phase info; item-only replies become
+    // commentary messages, and if nothing else marked a final answer, the last reply is it.
+    for (tid, items) in assistant_items {
+        let Some(turn) = turns.get_mut(&tid) else {
+            continue;
+        };
+        let known: HashSet<String> = turn.agent_messages.iter().map(|m| m.text.clone()).collect();
+        for (index, text) in &items {
+            if known.contains(text.as_str()) {
+                continue;
+            }
+            let phase = if turn.final_answer.as_deref() == Some(text.as_str()) {
+                "final_answer"
+            } else {
+                "commentary"
+            };
+            turn.agent_messages.push(AgentMsg {
+                text: text.clone(),
+                phase: if phase == "final_answer" {
+                    Some("final_answer".to_string())
+                } else {
+                    None
+                },
+                timestamp: String::new(),
+                is_reasoning: false,
+                order: *index,
+            });
+        }
+        if final_from_item.contains(&tid) && !final_from_complete.contains(&tid) {
+            // The whole reply sequence came from response_items: the conversation's real
+            // conclusion is its LAST reply, not the first one seen on the wire.
+            if let Some((_, last)) = items.last() {
+                turn.final_answer = Some(last.clone());
+            }
+        } else if !turn.agent_messages.is_empty() && turn.final_answer.is_none() {
+            turn.final_answer = turn
+                .agent_messages
+                .iter()
+                .rev()
+                .find(|m| !m.is_reasoning)
+                .map(|m| m.text.clone());
+        }
+    }
+
     let mut result: Vec<CodexTurn> = turns.into_values().collect();
     result.sort_by_key(|t| t.started_at.unwrap_or(0));
     result
@@ -280,6 +346,7 @@ fn call_id_of(entry: &RawEntry) -> Option<String> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event_msg(
     entry: &RawEntry,
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
@@ -288,6 +355,7 @@ fn handle_event_msg(
     has_task_started: bool,
     synthetic_counter: &mut u32,
     index: usize,
+    final_from_complete: &mut HashSet<String>,
 ) {
     let payload = &entry.payload;
     let msg_type = match payload.get("type").and_then(|t| t.as_str()) {
@@ -453,6 +521,7 @@ fn handle_event_msg(
                     .filter(|s| !s.is_empty())
                 {
                     turn.final_answer = Some(last_msg.to_string());
+                    final_from_complete.insert(turn_id.clone());
                 }
                 turn.completed_at = payload
                     .get("completed_at")
@@ -817,6 +886,9 @@ fn handle_response_item(
     turns: &mut indexmap::IndexMap<String, CodexTurn>,
     current_turn_id: &Option<String>,
     tool_builders: &mut HashMap<String, ToolCallBuilder>,
+    assistant_items: &mut HashMap<String, Vec<(usize, String)>>,
+    final_from_item: &mut HashSet<String>,
+    stream_index: usize,
 ) {
     let payload = if entry.entry_type == "response_item" {
         &entry.payload
@@ -1166,16 +1238,37 @@ fn handle_response_item(
             }
         }
 
-        // Handle assistant message response_items. This includes schema-validated JSON content
-        // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where `content`
-        // is a JSON object rather than a plain string.
-        "message" if payload.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+        // Handle message response_items. This includes schema-validated JSON content
+        // from `codex exec resume --output-schema` (Codex v0.132.0+, PR #23123) where
+        // `content` is a JSON object rather than a plain string.
+        //
+        // role=user: Codex v0.149+ no longer emits user_message event_msgs — the prompt
+        // arrives only as this response_item. Fill the turn's user_message if absent.
+        // role=assistant: remember every reply text; the merge step below turns them
+        // into visible transcript messages unless an event already carried them.
+        "message"
+            if payload.get("role").and_then(|v| v.as_str()) == Some("user")
+                || payload.get("role").and_then(|v| v.as_str()) == Some("assistant") =>
+        {
+            let is_user = payload.get("role").and_then(|v| v.as_str()) == Some("user");
+            let text = extract_item_content(payload);
+            if text.is_empty() {
+                return;
+            }
             if let Some(turn) = turns.get_mut(tid) {
-                if turn.final_answer.is_none() {
-                    let text = extract_item_content(payload);
-                    if !text.is_empty() {
-                        turn.final_answer = Some(text);
+                if is_user {
+                    if turn.user_message.is_none() {
+                        turn.user_message = Some(text);
                     }
+                } else {
+                    if turn.final_answer.is_none() {
+                        turn.final_answer = Some(text.clone());
+                        final_from_item.insert(tid.to_string());
+                    }
+                    assistant_items
+                        .entry(tid.to_string())
+                        .or_default()
+                        .push((stream_index, text));
                 }
             }
         }
@@ -3990,9 +4083,53 @@ mod tests {
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
         assert_eq!(turn.status, super::TurnStatus::Complete);
-        assert_eq!(turn.agent_messages.len(), 1);
-        assert_eq!(turn.agent_messages[0].text, "Processing your request.");
+        // Both replies are visible: the response_item assistant message ("Hello") and
+        // the event-derived one ("Processing your request.").
+        assert_eq!(turn.agent_messages.len(), 2);
+        let texts: Vec<&str> = turn
+            .agent_messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(texts.contains(&"Hello"));
+        assert!(texts.contains(&"Processing your request."));
         assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn v0149_transcript_from_response_item_messages_only() {
+        // Codex v0.149+: user prompts and assistant replies exist ONLY as response_item
+        // "message" entries (roles user/assistant); user_message / agent_message events
+        // are gone. The turn must still get its prompt, visible replies, and final answer.
+        let lines = [
+            r#"{"timestamp":"2026-08-22T10:00:00Z","type":"session_meta","payload":{"id":"v0149","timestamp":"2026-08-22T10:00:00Z","cwd":"/project","cli_version":"0.149.0"}}"#,
+            r#"{"timestamp":"2026-08-22T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1","started_at":1787378163}}"#,
+            r#"{"timestamp":"2026-08-22T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Посмотри на задачи"}]}}"#,
+            r#"{"timestamp":"2026-08-22T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Соберу контекст"}]}}"#,
+            r#"{"timestamp":"2026-08-22T10:00:04Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"думаю"}]}}"#,
+            r#"{"timestamp":"2026-08-22T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Итоговый ответ"}]}}"#,
+            r#"{"timestamp":"2026-08-22T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1750593606.0,"total_tokens":900}}"#,
+        ];
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|line| crate::parser::entry::RawEntry::parse(line))
+            .collect();
+        let turns = build_turns(&parsed);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(
+            turn.user_message.as_deref(),
+            Some("Посмотри на задачи"),
+            "role=user message must fill the turn prompt"
+        );
+        assert_eq!(turn.final_answer.as_deref(), Some("Итоговый ответ"));
+        let non_reasoning: Vec<&str> = turn
+            .agent_messages
+            .iter()
+            .filter(|m| !m.is_reasoning)
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(non_reasoning, vec!["Соберу контекст", "Итоговый ответ"]);
     }
 
     // Codex v0.142.2 (PR #28360): turn_id field added to ResponseItem metadata.
