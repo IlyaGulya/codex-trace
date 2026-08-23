@@ -4,15 +4,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::discover::CodexSessionInfo;
+use super::discover::{CodexSessionInfo, ScanBookmark};
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// One cached session, keyed by its absolute file path.
 #[derive(Serialize, Deserialize)]
 struct CachedEntry {
     mtime_ns: u128,
     size: u64,
+    /// How far into the file `info` has been scanned, plus stream state.
+    bookmark: ScanBookmark,
     info: CodexSessionInfo,
 }
 
@@ -70,12 +72,29 @@ impl PersistentCache {
         Some(info)
     }
 
-    pub fn put(&mut self, path: &str, mtime: SystemTime, size: u64, info: CodexSessionInfo) {
+    /// Return any cached entry for `path` regardless of freshness, together with its
+    /// scan bookmark. Used to resume incremental enrichment of actively-growing files.
+    pub fn get_stale(&self, path: &str) -> Option<(CodexSessionInfo, ScanBookmark)> {
+        let entry = self.data.entries.get(path)?;
+        let mut info = entry.info.clone();
+        info.is_ongoing = false;
+        Some((info, entry.bookmark.clone()))
+    }
+
+    pub fn put(
+        &mut self,
+        path: &str,
+        mtime: SystemTime,
+        size: u64,
+        bookmark: ScanBookmark,
+        info: CodexSessionInfo,
+    ) {
         self.data.entries.insert(
             path.to_string(),
             CachedEntry {
                 mtime_ns: mtime_nanos(mtime),
                 size,
+                bookmark,
                 info,
             },
         );
@@ -155,11 +174,20 @@ mod tests {
             },
         };
         let mtime = UNIX_EPOCH + std::time::Duration::from_secs(100);
-        cache.put("/x/rollout.jsonl", mtime, 42, sample_info("abc"));
+        let bookmark = ScanBookmark {
+            bytes: 42,
+            stream_ongoing: true,
+            has_session_end: false,
+        };
+        cache.put("/x/rollout.jsonl", mtime, 42, bookmark, sample_info("abc"));
 
         let hit = cache.get("/x/rollout.jsonl", mtime, 42).unwrap();
         assert_eq!(hit.id, "abc");
         assert!(!hit.is_ongoing, "cached entries are never ongoing");
+
+        let (stale_info, stale_bm) = cache.get_stale("/x/rollout.jsonl").unwrap();
+        assert_eq!(stale_info.id, "abc");
+        assert_eq!(stale_bm.bytes, 42);
     }
 
     #[test]
@@ -172,7 +200,13 @@ mod tests {
             },
         };
         let mtime = UNIX_EPOCH + std::time::Duration::from_secs(100);
-        cache.put("/x/rollout.jsonl", mtime, 42, sample_info("abc"));
+        cache.put(
+            "/x/rollout.jsonl",
+            mtime,
+            42,
+            ScanBookmark::default(),
+            sample_info("abc"),
+        );
 
         assert!(cache.get("/x/rollout.jsonl", mtime, 43).is_none());
         assert!(cache
@@ -183,6 +217,8 @@ mod tests {
             )
             .is_none());
         assert!(cache.get("/other.jsonl", mtime, 42).is_none());
+        // But the stale entry is still retrievable for incremental resumption.
+        assert!(cache.get_stale("/x/rollout.jsonl").is_some());
     }
 
     #[test]
@@ -190,19 +226,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sub").join("c.json");
         let mtime = UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let bookmark = ScanBookmark {
+            bytes: 1234,
+            stream_ongoing: true,
+            has_session_end: false,
+        };
         {
             let mut cache = PersistentCache::load_from(path.clone());
             assert!(cache.get("/x/rollout.jsonl", mtime, 42).is_none());
-            cache.put("/x/rollout.jsonl", mtime, 42, sample_info("abc"));
+            cache.put(
+                "/x/rollout.jsonl",
+                mtime,
+                42,
+                bookmark.clone(),
+                sample_info("abc"),
+            );
             cache.save();
         }
         assert!(path.exists());
 
         // Reload from disk: the fresh cache must be written with the current version
-        // and the entry must round-trip (with is_ongoing cleared).
+        // and the entry (including its scan bookmark) must round-trip.
         let cache = PersistentCache::load_from(path);
         let hit = cache.get("/x/rollout.jsonl", mtime, 42).expect("cache hit");
         assert_eq!(hit.id, "abc");
         assert!(!hit.is_ongoing);
+        let (_, loaded_bm) = cache.get_stale("/x/rollout.jsonl").unwrap();
+        assert_eq!(loaded_bm, bookmark);
     }
 }

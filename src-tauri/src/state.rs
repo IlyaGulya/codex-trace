@@ -29,6 +29,25 @@ struct DiscoveryState {
     generation: u64,
     sessions: Vec<CodexSessionInfo>,
     dirty: bool,
+    /// When the directory was last actually rescanned; used to rate-limit watcher-driven
+    /// rescans while a Codex process is actively appending to session files.
+    last_rescan: Option<std::time::Instant>,
+}
+
+/// Minimum interval between full header rescans of the sessions directory. An actively
+/// written rollout file triggers the picker watcher on every append; without this bound
+/// each append would re-scan every file and re-parse the (potentially huge) active one.
+#[cfg(test)]
+const MIN_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::ZERO;
+#[cfg(not(test))]
+const MIN_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One session that needs its deferred metadata recomputed.
+enum EnrichJob {
+    /// No usable previous scan — parse from the beginning.
+    Full(CodexSessionInfo),
+    /// A previous scan exists; resume parsing just past its bookmark.
+    Incremental(CodexSessionInfo, discover::ScanBookmark),
 }
 
 pub struct AppState {
@@ -169,30 +188,53 @@ impl AppState {
         dir: &str,
         app: &Option<AppHandle>,
     ) -> Result<Vec<CodexSessionInfo>, String> {
-        let (sessions, to_enrich, generation) = {
+        let (sessions, jobs, generation) = {
             let mut guard = self.discovery.lock().map_err(|e| e.to_string())?;
             if guard.dir == dir && !guard.dirty {
                 return Ok(guard.sessions.clone());
             }
 
             let path = std::path::Path::new(dir);
-            let headers = discover::discover_sessions_fast(path)?;
+            // Scope the header scan to the reduced, low-priority pool so it never
+            // saturates every core while the UI is rendering.
+            let headers = self
+                .enrich_pool
+                .install(|| discover::discover_sessions_fast(path))?;
 
-            // Serve unchanged files from the persistent cache so a cold start doesn't
-            // re-scan gigabytes of JSONL; collect only the files that need a full scan.
+            // Classify each file: unchanged files are served straight from cache,
+            // actively-growing files resume incrementally from their scan bookmark,
+            // and everything else gets a full background scan.
             let cache = self.cache.lock().map_err(|e| e.to_string())?;
             let mut sessions = Vec::with_capacity(headers.len());
-            let mut to_enrich = Vec::new();
+            let mut jobs: Vec<EnrichJob> = Vec::new();
             for header in headers {
-                let hit = std::fs::metadata(&header.path).ok().and_then(|m| {
-                    let mtime = m.modified().ok()?;
-                    cache.get(&header.path, mtime, m.len())
+                let meta = std::fs::metadata(&header.path).ok();
+                if let Some(m) = meta.as_ref() {
+                    if let Ok(mtime) = m.modified() {
+                        if let Some(full) = cache.get(&header.path, mtime, m.len()) {
+                            sessions.push(full);
+                            continue;
+                        }
+                    }
+                }
+
+                let resumable = meta.as_ref().and_then(|m| {
+                    let stale = cache.get_stale(&header.path)?;
+                    // Only plain (seekable) files can skip their scanned prefix, and
+                    // the file must not have shrunk below that position.
+                    (header.path.ends_with(".jsonl") && m.len() >= stale.1.bytes).then_some(stale)
                 });
-                match hit {
-                    Some(full) => sessions.push(full),
+
+                match resumable {
+                    Some((stale_info, bookmark)) => {
+                        let mut shown = stale_info.clone();
+                        shown.is_ongoing = false;
+                        sessions.push(shown);
+                        jobs.push(EnrichJob::Incremental(stale_info, bookmark));
+                    }
                     None => {
                         sessions.push(header.clone());
-                        to_enrich.push(header);
+                        jobs.push(EnrichJob::Full(header));
                     }
                 }
             }
@@ -208,15 +250,16 @@ impl AppState {
             guard.generation = generation;
             guard.sessions = sessions.clone();
             guard.dirty = false;
-            (sessions, to_enrich, generation)
+            guard.last_rescan = Some(std::time::Instant::now());
+            (sessions, jobs, generation)
         };
 
         // Everything was served from the cache — nothing to scan, no refresh needed.
-        if to_enrich.is_empty() {
+        if jobs.is_empty() {
             return Ok(sessions);
         }
 
-        self.spawn_enrichment(dir.to_string(), app.clone(), generation, to_enrich);
+        self.spawn_enrichment(app.clone(), generation, jobs);
         Ok(sessions)
     }
 
@@ -230,14 +273,13 @@ impl AppState {
 
     fn spawn_enrichment(
         self: &Arc<Self>,
-        _dir: String,
         app: Option<AppHandle>,
         generation: u64,
-        to_enrich: Vec<CodexSessionInfo>,
+        jobs: Vec<EnrichJob>,
     ) {
         let state = self.clone();
         let pool = self.enrich_pool.clone();
-        let total = to_enrich.len();
+        let total = jobs.len();
 
         std::thread::spawn(move || {
             let scanned = Arc::new(AtomicUsize::new(0));
@@ -245,10 +287,27 @@ impl AppState {
             // `install` scopes the parallel loop to the reduced-size pool so enrichment
             // never saturates all logical CPUs.
             pool.install(|| {
-                to_enrich.par_iter().for_each(|info| {
-                    let mut enriched = info.clone();
-                    let path = PathBuf::from(&info.path);
-                    discover::enrich_session_info(&mut enriched, &path);
+                jobs.into_par_iter().for_each(|job| {
+                    // Resume from the previous scan position when possible so an
+                    // actively-appended rollout only has its new tail parsed.
+                    let (enriched, bookmark) = match job {
+                        EnrichJob::Full(header) => {
+                            let path = PathBuf::from(&header.path);
+                            let mut info = header;
+                            let bm = discover::enrich_session_info(&mut info, &path);
+                            (info, bm)
+                        }
+                        EnrichJob::Incremental(seed, bookmark) => {
+                            let path = PathBuf::from(&seed.path);
+                            let mut info = seed;
+                            let bm =
+                                discover::enrich_session_incremental(&mut info, &path, &bookmark)
+                                    .unwrap_or_else(|| {
+                                        discover::enrich_session_info(&mut info, &path)
+                                    });
+                            (info, bm)
+                        }
+                    };
 
                     let done = scanned.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -267,11 +326,19 @@ impl AppState {
                         }
                     }
 
-                    // Persist this file's result so the next cold start skips it.
+                    // Persist this file's result (and its resume position) so both the
+                    // next cold start and the next incremental pass skip what's done.
+                    let path = PathBuf::from(&enriched.path);
                     if let Ok(meta) = std::fs::metadata(&path) {
                         if let Ok(mtime) = meta.modified() {
                             if let Ok(mut cache) = state.cache.lock() {
-                                cache.put(&enriched.path, mtime, meta.len(), enriched.clone());
+                                cache.put(
+                                    &enriched.path,
+                                    mtime,
+                                    meta.len(),
+                                    bookmark,
+                                    enriched.clone(),
+                                );
                             }
                         }
                     }

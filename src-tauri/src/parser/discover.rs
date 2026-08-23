@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::BufRead;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -94,11 +95,13 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<CodexSessionInfo>, S
     }
 
     let files = collect_session_files(sessions_dir)?;
+    let titles = super::titles::load_thread_titles();
     let mut infos: Vec<CodexSessionInfo> = files
         .par_iter()
         .filter_map(|p| scan_session_file(p))
         .collect();
 
+    apply_thread_titles(&mut infos, &titles);
     sort_sessions(&mut infos);
     mark_inline_workers(&mut infos);
 
@@ -115,11 +118,13 @@ pub fn discover_sessions_fast(sessions_dir: &Path) -> Result<Vec<CodexSessionInf
     }
 
     let files = collect_session_files(sessions_dir)?;
+    let titles = super::titles::load_thread_titles();
     let mut infos: Vec<CodexSessionInfo> = files
         .par_iter()
         .filter_map(|p| scan_session_header(p))
         .collect();
 
+    apply_thread_titles(&mut infos, &titles);
     sort_sessions(&mut infos);
     // Inline-worker marking depends on spawned_worker_ids, which only exist after the
     // full enrichment scan — leave it for the enrichment pass.
@@ -194,7 +199,6 @@ fn sort_sessions(infos: &mut [CodexSessionInfo]) {
 
 /// Second pass: mark inline workers — sessions whose id appears in any parent's spawned_worker_ids.
 pub fn mark_inline_workers(infos: &mut [CodexSessionInfo]) {
-    use std::collections::HashSet;
     let inline_worker_ids: HashSet<String> = infos
         .iter()
         .flat_map(|s| s.spawned_worker_ids.iter().cloned())
@@ -202,6 +206,26 @@ pub fn mark_inline_workers(infos: &mut [CodexSessionInfo]) {
     for info in infos {
         if inline_worker_ids.contains(&info.id) {
             info.is_inline_worker = true;
+        }
+    }
+}
+
+/// Fill in display titles from the Codex state database for sessions whose JSONL
+/// carries no `thread_name_updated` event (modern CLIs write titles only to SQLite).
+pub fn apply_thread_titles(infos: &mut [CodexSessionInfo], titles: &HashMap<String, String>) {
+    if titles.is_empty() {
+        return;
+    }
+    for info in infos {
+        if info
+            .thread_name
+            .as_deref()
+            .map(|t| t.trim().is_empty())
+            .unwrap_or(true)
+        {
+            if let Some(title) = titles.get(&info.id) {
+                info.thread_name = Some(title.clone());
+            }
         }
     }
 }
@@ -398,191 +422,259 @@ pub fn scan_session_header(path: &Path) -> Option<CodexSessionInfo> {
     })
 }
 
-/// Full scan: fill in the deferred fields (`model`, `thread_name`, `turn_count`,
-/// `total_tokens`, `end_time`, `is_ongoing`, `spawned_worker_ids`, `is_archived`) on an
-/// already-header-parsed [`CodexSessionInfo`].
+/// Resume point for incremental enrichment: how far into the file the previous scan
+/// progressed plus the stream-state needed to keep order-dependent fields correct.
 ///
-/// Streams the file line-by-line (decompressing zstd transparently) so peak memory stays
-/// bounded to a single line, and parses each line with a lightweight [`RawValue`]-based
-/// struct so only the handful of fields we care about are materialised.
-pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
-    let Ok(reader) = open_session_reader(path) else {
+/// Rollout files are append-only, so a scan that stopped at `bytes` can later resume
+/// from exactly there instead of re-reading the whole (potentially hundreds-of-MB) file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScanBookmark {
+    /// Bytes of the file already covered (guaranteed to sit on a line boundary).
+    pub bytes: u64,
+    /// Whether the event stream implied an ongoing turn as of `bytes`.
+    pub stream_ongoing: bool,
+    /// Whether an explicit `session_end` marker was seen up to `bytes`.
+    pub has_session_end: bool,
+}
+
+/// Order-dependent aggregates carried across incremental scans. Every update rule only
+/// inspects the current value, so carrying the struct across chunks reproduces a full
+/// scan byte-for-byte.
+struct ScanState {
+    turn_count: u32,
+    model: Option<String>,
+    thread_name: Option<String>,
+    total_tokens: Option<u64>,
+    end_time: Option<String>,
+    spawned_worker_ids: Vec<String>,
+    pending_spawn_call_ids: HashSet<String>,
+    is_ongoing: bool,
+    has_session_end: bool,
+    is_archived: bool,
+}
+
+impl ScanState {
+    fn fresh(seed_archived: bool) -> Self {
+        Self {
+            turn_count: 0,
+            model: None,
+            thread_name: None,
+            total_tokens: None,
+            end_time: None,
+            spawned_worker_ids: Vec::new(),
+            pending_spawn_call_ids: HashSet::new(),
+            is_ongoing: true,
+            has_session_end: false,
+            is_archived: seed_archived,
+        }
+    }
+
+    fn resume(info: &CodexSessionInfo, bookmark: &ScanBookmark) -> Self {
+        Self {
+            turn_count: info.turn_count,
+            model: info.model.clone(),
+            thread_name: info.thread_name.clone(),
+            total_tokens: info.total_tokens,
+            end_time: info.end_time.clone(),
+            spawned_worker_ids: info.spawned_worker_ids.clone(),
+            pending_spawn_call_ids: HashSet::new(),
+            is_ongoing: bookmark.stream_ongoing,
+            has_session_end: bookmark.has_session_end,
+            is_archived: info.is_archived,
+        }
+    }
+}
+
+/// Apply one complete JSONL line to the running scan state. Malformed or irrelevant
+/// lines are ignored, matching the historical full-scan behaviour.
+fn apply_line(state: &mut ScanState, line: &str) {
+    if line.trim().is_empty() {
         return;
+    }
+    let head: LineHead = match serde_json::from_str(line) {
+        Ok(h) => h,
+        Err(_) => return,
     };
-    let mut lines = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty());
+    let Some(t) = head.typ else { return };
 
-    // Skip the header line (already parsed).
-    if lines.next().is_none() {
-        return;
-    }
-
-    let mut turn_count: u32 = 0;
-    let mut model: Option<String> = None;
-    let mut thread_name: Option<String> = None;
-    let mut total_tokens: Option<u64> = None;
-    let mut end_time: Option<String> = None;
-    let mut spawned_worker_ids: Vec<String> = Vec::new();
-    let mut pending_spawn_call_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut is_ongoing = true;
-    let mut has_session_end = false;
-    let mut is_archived = info.is_archived;
-
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let head: LineHead = match serde_json::from_str(&line) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        let Some(t) = head.typ else { continue };
-
-        match t {
-            "session_end" => {
-                has_session_end = true;
-                is_ongoing = false;
-                if end_time.is_none() {
-                    end_time = head.timestamp.map(|s| s.to_string());
-                }
+    match t {
+        "session_end" => {
+            state.has_session_end = true;
+            state.is_ongoing = false;
+            if state.end_time.is_none() {
+                state.end_time = head.timestamp.map(|s| s.to_string());
             }
-            // Codex v0.136.0: archive/unarchive commands append these events.
-            // The last event wins so a session can be toggled multiple times.
-            "session_archived" => is_archived = true,
-            "session_unarchived" => is_archived = false,
-            "event_msg" => {
-                let Some(payload) = head.payload else {
-                    continue;
-                };
-                let Ok(p) = serde_json::from_str::<EventMsgPayload>(payload.get()) else {
-                    continue;
-                };
-                match p.typ {
-                    Some("task_started") => {
-                        turn_count += 1;
-                        if !has_session_end {
-                            is_ongoing = true;
-                        }
-                        end_time = None;
+        }
+        // Codex v0.136.0: archive/unarchive commands append these events.
+        // The last event wins so a session can be toggled multiple times.
+        "session_archived" => state.is_archived = true,
+        "session_unarchived" => state.is_archived = false,
+        "event_msg" => {
+            let Some(payload) = head.payload else {
+                return;
+            };
+            let Ok(p) = serde_json::from_str::<EventMsgPayload>(payload.get()) else {
+                return;
+            };
+            match p.typ {
+                Some("task_started") => {
+                    state.turn_count += 1;
+                    if !state.has_session_end {
+                        state.is_ongoing = true;
                     }
-                    Some("user_message") if turn_count == 0 => {
-                        turn_count += 1;
-                        if !has_session_end {
-                            is_ongoing = true;
-                        }
-                        end_time = None;
+                    state.end_time = None;
+                }
+                Some("user_message") if state.turn_count == 0 => {
+                    state.turn_count += 1;
+                    if !state.has_session_end {
+                        state.is_ongoing = true;
                     }
-                    Some("task_complete") => {
-                        is_ongoing = false;
-                        end_time = p.completed_at.and_then(|ts| {
-                            use chrono::{DateTime, Utc};
-                            DateTime::<Utc>::from_timestamp(ts as i64, 0).map(|dt| dt.to_rfc3339())
+                    state.end_time = None;
+                }
+                Some("task_complete") => {
+                    state.is_ongoing = false;
+                    state.end_time = p.completed_at.and_then(|ts| {
+                        use chrono::{DateTime, Utc};
+                        DateTime::<Utc>::from_timestamp(ts as i64, 0).map(|dt| dt.to_rfc3339())
+                    });
+                    if state.end_time.is_none() {
+                        state.end_time = head.timestamp.map(|s| s.to_string());
+                    }
+                    // Codex v0.128.0: task_complete may carry token totals as a fallback
+                    // when no token_count event was seen.
+                    if state.total_tokens.is_none() {
+                        state.total_tokens = p.total_tokens.or_else(|| {
+                            let pt = p.prompt_tokens?;
+                            let ct = p.completion_tokens?;
+                            Some(pt + ct)
                         });
-                        if end_time.is_none() {
-                            end_time = head.timestamp.map(|s| s.to_string());
-                        }
-                        // Codex v0.128.0: task_complete may carry
-                        // prompt_tokens/completion_tokens/total_tokens. Use as fallback
-                        // when no token_count event was seen.
-                        if total_tokens.is_none() {
-                            total_tokens = p.total_tokens.or_else(|| {
-                                let pt = p.prompt_tokens?;
-                                let ct = p.completion_tokens?;
-                                Some(pt + ct)
-                            });
-                        }
-                    }
-                    Some("turn_aborted") => {
-                        is_ongoing = false;
-                        end_time = head.timestamp.map(|s| s.to_string());
-                    }
-                    Some("token_budget_abort") | Some("inference_stream_cancelled") => {
-                        // v0.142.0+: budget exhausted or inference cancelled — turn is done.
-                        // v0.143.0 reliably preserves these on disk during shutdown.
-                        is_ongoing = false;
-                        end_time = head.timestamp.map(|s| s.to_string());
-                    }
-                    Some("token_count") => {
-                        if let Some(info) = p.info {
-                            if let Some(ttu) = info.total_token_usage {
-                                total_tokens = ttu.total_tokens;
-                            }
-                        }
-                    }
-                    Some("thread_name_updated") => {
-                        if let Some(name) = p.thread_name {
-                            thread_name = Some(name.to_string());
-                        }
-                    }
-                    Some("collab_agent_spawn_end") => {
-                        // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
-                        if let Some(new_id) = p.new_thread_id.or(p.new_session_id) {
-                            push_unique(&mut spawned_worker_ids, new_id.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "response_item" => {
-                let Some(payload) = head.payload else {
-                    continue;
-                };
-                let Ok(p) = serde_json::from_str::<ResponseItemPayload>(payload.get()) else {
-                    continue;
-                };
-                match p.typ {
-                    Some("function_call") if p.name == Some("spawn_agent") => {
-                        if let Some(call_id) = p.call_id {
-                            pending_spawn_call_ids.insert(call_id.to_string());
-                        }
-                    }
-                    Some("function_call_output") => {
-                        let Some(call_id) = p.call_id else {
-                            continue;
-                        };
-                        if !pending_spawn_call_ids.contains(call_id) {
-                            continue;
-                        }
-                        let Ok(out) = serde_json::from_str::<OutputOnly>(payload.get()) else {
-                            continue;
-                        };
-                        let Some(output) = out.output.as_ref().and_then(output_text) else {
-                            continue;
-                        };
-                        if let Some(spawn) = parse_spawn_agent_output(&output) {
-                            push_unique(&mut spawned_worker_ids, spawn.agent_id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "turn_context" => {
-                let Some(payload) = head.payload else {
-                    continue;
-                };
-                // Always overwrite — spec says "most recent turn_context.payload.model"
-                if let Ok(tc) = serde_json::from_str::<TurnContextPayload>(payload.get()) {
-                    if let Some(m) = tc.model {
-                        model = Some(m.to_string());
                     }
                 }
+                Some("turn_aborted") => {
+                    state.is_ongoing = false;
+                    state.end_time = head.timestamp.map(|s| s.to_string());
+                }
+                Some("token_budget_abort") | Some("inference_stream_cancelled") => {
+                    // v0.142.0+: budget exhausted or inference cancelled — turn is done.
+                    state.is_ongoing = false;
+                    state.end_time = head.timestamp.map(|s| s.to_string());
+                }
+                Some("token_count") => {
+                    if let Some(info) = p.info {
+                        if let Some(ttu) = info.total_token_usage {
+                            state.total_tokens = ttu.total_tokens;
+                        }
+                    }
+                }
+                Some("thread_name_updated") => {
+                    if let Some(name) = p.thread_name {
+                        state.thread_name = Some(name.to_string());
+                    }
+                }
+                Some("collab_agent_spawn_end") => {
+                    // v0.131.0+ (PR #22268): field renamed new_thread_id → new_session_id
+                    if let Some(new_id) = p.new_thread_id.or(p.new_session_id) {
+                        push_unique(&mut state.spawned_worker_ids, new_id.to_string());
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        "response_item" => {
+            let Some(payload) = head.payload else {
+                return;
+            };
+            let Ok(p) = serde_json::from_str::<ResponseItemPayload>(payload.get()) else {
+                return;
+            };
+            match p.typ {
+                Some("function_call") if p.name == Some("spawn_agent") => {
+                    if let Some(call_id) = p.call_id {
+                        state.pending_spawn_call_ids.insert(call_id.to_string());
+                    }
+                }
+                Some("function_call_output") => {
+                    let Some(call_id) = p.call_id else { return };
+                    if !state.pending_spawn_call_ids.contains(call_id) {
+                        return;
+                    }
+                    let Ok(out) = serde_json::from_str::<OutputOnly>(payload.get()) else {
+                        return;
+                    };
+                    let Some(output) = out.output.as_ref().and_then(output_text) else {
+                        return;
+                    };
+                    if let Some(spawn) = parse_spawn_agent_output(&output) {
+                        push_unique(&mut state.spawned_worker_ids, spawn.agent_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "turn_context" => {
+            let Some(payload) = head.payload else {
+                return;
+            };
+            // Always overwrite — spec says "most recent turn_context.payload.model"
+            if let Ok(tc) = serde_json::from_str::<TurnContextPayload>(payload.get()) {
+                if let Some(m) = tc.model {
+                    state.model = Some(m.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Stream lines from `reader`, applying them to `state`. Returns bytes consumed.
+///
+/// With `resume_safe` (incremental passes) a trailing chunk without a newline means the
+/// writer is mid-append: those bytes stay unconsumed so the next pass re-reads the
+/// completed line exactly once. Full passes (`resume_safe == false`) consume and parse
+/// the tail regardless — a torn line simply fails JSON parsing and is ignored.
+fn scan_lines(
+    reader: &mut dyn BufRead,
+    mut offset: u64,
+    state: &mut ScanState,
+    resume_safe: bool,
+) -> std::io::Result<u64> {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let complete = buf.ends_with('\n');
+        if !complete && resume_safe {
+            break;
+        }
+        offset += n as u64;
+        apply_line(state, &buf);
+        if !complete {
+            break;
         }
     }
+    Ok(offset)
+}
 
+/// Write scan results back onto `info`, applying the ongoing/freshness heuristics.
+/// `bytes` is placed into the returned bookmark alongside the stream state.
+fn finalize_into(
+    info: &mut CodexSessionInfo,
+    st: ScanState,
+    path: &Path,
+    bytes: u64,
+) -> ScanBookmark {
     // Sessions with no turns have no active task — not ongoing regardless of event stream.
-    if turn_count == 0 {
+    let mut is_ongoing = st.is_ongoing;
+    if st.turn_count == 0 {
         is_ongoing = false;
     }
 
     // Validate with file mtime: sessions last modified more than 60 seconds ago
     // cannot be actively processing a turn, regardless of missing task_complete events.
-    // Many older CLI versions didn't emit task_complete, causing false positives otherwise.
-    if is_ongoing && !has_session_end {
+    if is_ongoing && !st.has_session_end {
         const ONGOING_THRESHOLD_SECS: u64 = 60;
         if let Ok(metadata) = fs::metadata(path) {
             if let Ok(modified) = metadata.modified() {
@@ -595,14 +687,72 @@ pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) {
         }
     }
 
-    info.model = model;
-    info.thread_name = thread_name;
-    info.turn_count = turn_count;
-    info.total_tokens = total_tokens;
-    info.end_time = end_time;
+    info.model = st.model;
+    // Only overwrite when the stream actually carried a name — the header may already
+    // hold a title resolved from Codex's state database.
+    if st.thread_name.is_some() {
+        info.thread_name = st.thread_name;
+    }
+    info.turn_count = st.turn_count;
+    info.total_tokens = st.total_tokens;
+    info.end_time = st.end_time;
     info.is_ongoing = is_ongoing;
-    info.is_archived = is_archived;
-    info.spawned_worker_ids = spawned_worker_ids;
+    info.is_archived = st.is_archived;
+    info.spawned_worker_ids = st.spawned_worker_ids;
+
+    ScanBookmark {
+        bytes,
+        stream_ongoing: st.is_ongoing,
+        has_session_end: st.has_session_end,
+    }
+}
+
+/// Full scan: fill in the deferred fields (`model`, `thread_name`, `turn_count`,
+/// `total_tokens`, `end_time`, `is_ongoing`, `spawned_worker_ids`, `is_archived`) on an
+/// already-header-parsed [`CodexSessionInfo`], and report how far the scan got.
+///
+/// Streams the file line-by-line (decompressing zstd transparently) so peak memory stays
+/// bounded to a single line, and parses each line with lightweight [`RawValue`]-based
+/// structs so only the handful of fields we care about are materialised.
+pub fn enrich_session_info(info: &mut CodexSessionInfo, path: &Path) -> ScanBookmark {
+    let empty = ScanBookmark::default();
+    let Ok(mut reader) = open_session_reader(path) else {
+        return empty;
+    };
+    let mut state = ScanState::fresh(info.is_archived);
+    match scan_lines(&mut reader, 0, &mut state, false) {
+        Ok(bytes) => finalize_into(info, state, path, bytes),
+        Err(_) => empty,
+    }
+}
+
+/// Incremental variant of [`enrich_session_info`]: resumes from `bookmark.bytes`,
+/// seeding the aggregates from `info` itself, so only newly-appended bytes are parsed.
+///
+/// Returns `None` when resumption is impossible (compressed files can't seek, the file
+/// was truncated/rewritten, or IO failed) — the caller should fall back to a full scan.
+pub fn enrich_session_incremental(
+    info: &mut CodexSessionInfo,
+    path: &Path,
+    bookmark: &ScanBookmark,
+) -> Option<ScanBookmark> {
+    use std::io::{Seek, SeekFrom};
+
+    // Only plain files can seek past the already-scanned prefix.
+    if !path.to_str()?.ends_with(".jsonl") {
+        return None;
+    }
+    let meta = fs::metadata(path).ok()?;
+    if u128::from(meta.len()) < u128::from(bookmark.bytes) || bookmark.bytes == 0 {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(bookmark.bytes)).ok()?;
+    let mut reader = BufReader::new(file);
+
+    let mut state = ScanState::resume(info, bookmark);
+    let bytes = scan_lines(&mut reader, bookmark.bytes, &mut state, true).ok()?;
+    Some(finalize_into(info, state, path, bytes))
 }
 
 /// Full scan of a single file: header + enrichment. Used by [`discover_sessions`].
@@ -745,6 +895,97 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn enrich_session_incremental_resumes_exactly_once() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("rollout-2026-05-07T00-00-00-incr.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"id":"incr","timestamp":"2026-05-07T00:00:00Z"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let mut info = scan_session_header(&path).unwrap();
+        let bm1 = enrich_session_info(&mut info, &path);
+        assert_eq!(info.turn_count, 1);
+        assert!(bm1.bytes > 0);
+
+        // Codex appends a completion event.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-05-07T00:00:02Z","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t1","completed_at":1746576002.0,"total_tokens":77}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        // Incremental pass sees only the tail.
+        let mut info2 = scan_session_header(&path).unwrap();
+        info2.turn_count = info.turn_count;
+        info2.model = info.model.clone();
+        info2.total_tokens = info.total_tokens;
+        info2.end_time = info.end_time.clone();
+        info2.is_archived = info.is_archived;
+        let bm2 =
+            enrich_session_incremental(&mut info2, &path, &bm1).expect("resumable plain file");
+        assert_eq!(info2.turn_count, 1, "no double counting across passes");
+        assert_eq!(info2.total_tokens, Some(77));
+        assert!(info2.end_time.is_some());
+        assert!(!bm2.stream_ongoing);
+
+        // A repeated incremental pass over the same position is a no-op.
+        let mut info3 = info2.clone();
+        let bm3 = enrich_session_incremental(&mut info3, &path, &bm2).expect("resumable");
+        assert_eq!(info3.turn_count, 1);
+        assert!(bm3.bytes >= bm2.bytes);
+
+        // And a full scan of the appended file agrees with the incremental result.
+        let mut info4 = scan_session_header(&path).unwrap();
+        enrich_session_info(&mut info4, &path);
+        assert_eq!(info4.turn_count, info2.turn_count);
+        assert_eq!(info4.total_tokens, info2.total_tokens);
+    }
+
+    #[test]
+    fn apply_thread_titles_fills_missing_names_only() {
+        let tmp = tempdir().unwrap();
+        let day_dir = tmp.path().join("2026/05/07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-05-07T00-00-00-titled.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-05-07T00:00:00Z","type":"session_meta","payload":{"id":"titled","timestamp":"2026-05-07T00:00:00Z","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2026-05-07T00:00:01Z","type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"From JSONL"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let mut sessions = discover_sessions_fast(tmp.path()).unwrap();
+        let titled = sessions.iter_mut().find(|s| s.id == "titled").unwrap();
+
+        let mut titles = HashMap::new();
+        titles.insert("titled".to_string(), "From state DB".to_string());
+
+        apply_thread_titles(std::slice::from_mut(titled), &titles);
+        // The header itself had no name yet, so the DB title fills in…
+        assert_eq!(titled.thread_name.as_deref(), Some("From state DB"));
+
+        // …but an explicit JSONL name always wins.
+        titled.thread_name = Some("From JSONL".to_string());
+        apply_thread_titles(std::slice::from_mut(titled), &titles);
+        assert_eq!(titled.thread_name.as_deref(), Some("From JSONL"));
+    }
 
     #[test]
     fn discover_sessions_fast_returns_header_without_full_scan() {

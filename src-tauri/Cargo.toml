@@ -35,6 +35,7 @@ uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
 regex = "1"
 rayon = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
